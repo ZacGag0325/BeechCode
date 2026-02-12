@@ -36,6 +36,7 @@ src("00_master_pipeline.R")
 # ---- 1) Run modular analyses (they load outputs/v1/objects/*.rds) ----
 src("scripts/01_clonality.R")
 src("scripts/02_hwe.R")
+src("scripts/03_structure_all_plots_S2N_bySite.R")
 src("scripts/04_amova.R")
 src("scripts/05_pca_dapc.R")
 

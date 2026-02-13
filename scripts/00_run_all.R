@@ -40,4 +40,7 @@ src("scripts/03_structure_all_plots_S2N_bySite.R")
 src("scripts/04_amova.R")
 src("scripts/05_pca_dapc.R")
 
+# ---- 2) Extended analyses (safe runner; skips missing modules) ----
+src("scripts/10_run_extended_suite.R")
+
 cat("\n✅ ALL DONE.\nCheck outputs in: ", file.path(PROJECT_ROOT, "outputs", "v1"), "\n", sep = "")

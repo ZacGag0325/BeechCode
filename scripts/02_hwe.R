@@ -1,3 +1,4 @@
+# scripts/02_hwe.R
 ############################################################
 # scripts/02_hwe.R
 # Hardy-Weinberg tests by Site + global (MLG vs MLL)
@@ -13,15 +14,12 @@ suppressPackageStartupMessages({
   library(pegas)
 })
 
-# Make the script runnable from RStudio/Terminal regardless of working directory
 find_project_root <- function() {
   candidates <- c(getwd(), normalizePath(file.path(getwd(), ".."), mustWork = FALSE))
-  
   cmd_file <- sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE))
   if (length(cmd_file) > 0 && nzchar(cmd_file[1])) {
     candidates <- c(candidates, dirname(normalizePath(cmd_file[1], mustWork = FALSE)))
   }
-  
   for (start in unique(candidates)) {
     cur <- normalizePath(start, mustWork = FALSE)
     repeat {
@@ -31,7 +29,6 @@ find_project_root <- function() {
       cur <- parent
     }
   }
-  
   stop("Cannot find project root containing scripts/_load_objects.R. Open BeechCode project first.")
 }
 
@@ -49,9 +46,12 @@ safe_genind2loci_df <- function(gpop, sep = "/") {
   gdf <- adegenet::genind2df(gpop, sep = sep)
   gdf <- as.data.frame(lapply(gdf, function(col) {
     x <- trimws(as.character(col))
-    x[x %in% c("", "NA", "NaN", "0", "0/0", "NA/NA")] <- NA
+    x[x %in% c("", "NA", "NaN", "0", "0/0", "NA/NA", "-")] <- NA
     ok <- is.na(x) | grepl("^[^/]+/[^/]+$", x)
     x[!ok] <- NA
+    x <- ifelse(is.na(x), NA_character_, vapply(strsplit(x, "/", fixed = TRUE), function(z) {
+      paste(sort(z), collapse = "/")
+    }, character(1)))
     factor(x)
   }), check.names = FALSE, stringsAsFactors = FALSE)
   gdf
@@ -62,98 +62,94 @@ extract_hw_pvals <- function(ht) {
     pv <- ht$p.value
     return(list(pvals = as.numeric(pv), locus = names(pv)))
   }
-  
   if (is.matrix(ht) || is.data.frame(ht)) {
     pmat <- as.matrix(ht)
     cn <- tolower(colnames(pmat))
-    col_pick <- which(
-      cn %in% c("p.value", "pvalue", "p", "pval", "pvals") |
-        grepl("^pr", cn) |
-        grepl("p\\s*value", cn)
-    )
+    col_pick <- which(cn %in% c("p.value", "pvalue", "p", "pval", "pvals") |
+                        grepl("^pr", cn) |
+                        grepl("p\\s*value", cn))
     if (length(col_pick) == 0) col_pick <- ncol(pmat)
     pvals <- suppressWarnings(as.numeric(pmat[, col_pick[1]]))
     locus <- rownames(pmat)
     return(list(pvals = pvals, locus = locus))
   }
-  
   pv <- suppressWarnings(as.numeric(ht))
   list(pvals = pv, locus = names(ht))
 }
 
+locus_reason <- function(x, min_n = MIN_N) {
+  xv <- as.character(x)
+  xv <- xv[!is.na(xv) & nzchar(xv)]
+  if (length(xv) < min_n) return(paste0("too_few_non_missing_genotypes (n<", min_n, ")"))
+  if (any(!grepl("^[^/]+/[^/]+$", xv))) return("invalid_genotype_format")
+  alleles <- unique(unlist(strsplit(xv, "/", fixed = TRUE), use.names = FALSE))
+  if (length(alleles) <= 1) return("monomorphic_locus")
+  NA_character_
+}
+
 run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
-  n_s <- nInd(genind_obj)
+  loci <- adegenet::locNames(genind_obj)
+  n_s <- adegenet::nInd(genind_obj)
   if (n_s < min_n) {
     return(tibble(
       Site = label,
-      Locus = locNames(genind_obj),
+      Locus = loci,
       p_value = NA_real_,
       n_inds = n_s,
+      n_non_missing = 0L,
       reason = paste0("too_few_individuals (n<", min_n, ")")
     ))
   }
   
   gdf <- safe_genind2loci_df(genind_obj, sep = "/")
   
-  gdf_chr <- unlist(lapply(gdf, as.character), use.names = FALSE)
-  allele_counts_seen <- sapply(gdf_chr, function(z) {
-    if (is.na(z) || z == "") return(NA_integer_)
-    length(strsplit(as.character(z), "/", fixed = TRUE)[[1]])
-  })
-  
-  all_diploid_for_pegas <- all(is.na(allele_counts_seen) | allele_counts_seen == 2)
-  B_use <- if (all_diploid_for_pegas) HWE_B else 0
-  
-  loci_obj <- pegas::as.loci(gdf)
-  ht <- tryCatch(
-    pegas::hw.test(loci_obj, B = B_use),
-    error = function(e) e
+  base_tbl <- tibble(
+    Site = label,
+    Locus = loci,
+    n_inds = n_s,
+    n_non_missing = vapply(gdf, function(x) sum(!is.na(x)), integer(1)),
+    reason = vapply(gdf, locus_reason, character(1), min_n = min_n)
   )
   
-  if (inherits(ht, "error")) {
-    return(tibble(
-      Site = label,
-      Locus = locNames(genind_obj),
+  testable <- base_tbl %>% filter(is.na(reason))
+  if (nrow(testable) == 0) {
+    return(base_tbl %>% mutate(p_value = NA_real_) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
+  }
+  
+  loci_obj <- tryCatch(pegas::as.loci(gdf[, testable$Locus, drop = FALSE]), error = function(e) e)
+  if (inherits(loci_obj, "error")) {
+    return(base_tbl %>% mutate(
       p_value = NA_real_,
-      n_inds = n_s,
-      reason = paste("hw.test error:", ht$message)
-    ))
+      reason = ifelse(is.na(reason), paste("as.loci_conversion_error:", loci_obj$message), reason)
+    ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
+  }
+  
+  ht <- tryCatch(pegas::hw.test(loci_obj, B = HWE_B), error = function(e) e)
+  if (inherits(ht, "error")) {
+    return(base_tbl %>% mutate(
+      p_value = NA_real_,
+      reason = ifelse(is.na(reason), paste("hw.test_error:", ht$message), reason)
+    ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
   ex <- extract_hw_pvals(ht)
-  pvals <- ex$pvals
-  locus_names <- ex$locus
-  
-  if (length(pvals) == 0) {
-    return(tibble(
-      Site = label,
-      Locus = locNames(genind_obj),
+  ptab <- tibble(Locus = ex$locus %||% character(0), p_value = as.numeric(ex$pvals))
+  if (nrow(ptab) == 0) {
+    return(base_tbl %>% mutate(
       p_value = NA_real_,
-      n_inds = n_s,
-      reason = "no_pvalues_returned"
-    ))
+      reason = ifelse(is.na(reason), "no_pvalues_returned", reason)
+    ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
-  if (is.null(locus_names) || length(locus_names) != length(pvals)) {
-    locus_names <- paste0("Locus_", seq_along(pvals))
-  }
-  
-  expected_loci <- locNames(genind_obj)
-  ptab <- tibble(Locus = locus_names, p_value = as.numeric(pvals))
-  
-  tibble(
-    Site = label,
-    Locus = expected_loci,
-    n_inds = n_s
-  ) %>%
+  out <- base_tbl %>%
     left_join(ptab, by = "Locus") %>%
-    mutate(
-      reason = case_when(
-        is.na(p_value) ~ "p_value_missing_from_test",
-        TRUE ~ NA_character_
-      )
-    )
+    mutate(reason = ifelse(is.na(reason) & is.na(p_value), "p_value_missing_from_test", reason)) %>%
+    select(Site, Locus, p_value, n_inds, n_non_missing, reason)
+  
+  out
 }
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
 
 sites <- levels(pop(gi))
 cat("Sites in pop(gi):\n")
@@ -207,8 +203,8 @@ hwe_global_mlg <- run_hwe_global(gi, "GLOBAL_MLG")
 hwe_global_mll <- run_hwe_global(gi_mll, "GLOBAL_MLL")
 
 hwe_compare <- full_join(
-  hwe_global_mlg %>% select(Locus, p_MLG = p_value),
-  hwe_global_mll %>% select(Locus, p_MLL = p_value),
+  hwe_global_mlg %>% select(Locus, p_MLG = p_value, reason_MLG = reason),
+  hwe_global_mll %>% select(Locus, p_MLL = p_value, reason_MLL = reason),
   by = "Locus"
 ) %>%
   mutate(

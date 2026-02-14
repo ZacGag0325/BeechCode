@@ -106,40 +106,75 @@ get_mlg_vec <- function(x) {
        as.character(packageVersion("poppr")))
 }
 
-### Helper: compute MLL directly from a distance matrix + threshold ----
-mll_from_dist <- function(distmat, threshold) {
+### Helper: version-robust MLL assignment through poppr::mll ----
+mll_safe <- function(genind_obj, distmat, threshold) {
+  if (!inherits(genind_obj, "genind")) stop("mll_safe(): genind_obj must be a genind object")
   if (!is.matrix(distmat)) distmat <- as.matrix(distmat)
-  n <- nrow(distmat)
-  if (n != ncol(distmat)) stop("distmat must be square")
-  
-  distmat <- pmin(distmat, t(distmat), na.rm = TRUE)
-  distmat[is.na(distmat)] <- Inf
-  diag(distmat) <- Inf
-  
-  adj <- lapply(seq_len(n), function(i) which(distmat[i, ] <= threshold))
-  
-  comp <- integer(n)
-  cid <- 0L
-  
-  for (i in seq_len(n)) {
-    if (comp[i] != 0L) next
-    cid <- cid + 1L
-    stack <- i
-    comp[i] <- cid
-    
-    while (length(stack) > 0) {
-      v <- stack[[length(stack)]]
-      stack <- stack[-length(stack)]
-      nei <- adj[[v]]
-      for (u in nei) {
-        if (comp[u] == 0L) {
-          comp[u] <- cid
-          stack <- c(stack, u)
-        }
-      }
-    }
+  if (nrow(distmat) != ncol(distmat)) stop("mll_safe(): distance matrix must be square")
+  if (nrow(distmat) != adegenet::nInd(genind_obj)) {
+    stop("mll_safe(): nrow(distmat)=", nrow(distmat),
+         " does not match nInd(genind_obj)=", adegenet::nInd(genind_obj))
   }
-  comp
+  
+  f <- formals(poppr::mll)
+  f_names <- names(f)
+  if (is.null(f_names)) f_names <- character(0)
+  
+  dist_arg <- if ("distmat" %in% f_names) "distmat" else if ("dist.mat" %in% f_names) "dist.mat" else NULL
+  thr_arg  <- if ("threshold" %in% f_names) "threshold" else if ("epsilon" %in% f_names) "epsilon" else NULL
+  
+  if (is.null(dist_arg) || is.null(thr_arg)) {
+    stop(
+      "Unable to call poppr::mll() with this version of poppr. ",
+      "Expected args for distance and threshold were not found. ",
+      "poppr version: ", as.character(utils::packageVersion("poppr")), "; ",
+      "formals(poppr::mll): ", paste(f_names, collapse = ", ")
+    )
+  }
+  
+  gc <- tryCatch(poppr::as.genclone(genind_obj), error = function(e) NULL)
+  if (is.null(gc)) {
+    stop("mll_safe(): could not coerce genind to genclone for poppr::mll().")
+  }
+  
+  args <- list(gc)
+  args[[dist_arg]] <- distmat
+  args[[thr_arg]] <- threshold
+  
+  res <- tryCatch(do.call(poppr::mll, args), error = function(e) e)
+  if (inherits(res, "error")) {
+    stop(
+      "poppr::mll() failed. poppr version: ", as.character(utils::packageVersion("poppr")),
+      "; used args: ", paste(c(dist_arg, thr_arg), collapse = ", "),
+      "; message: ", conditionMessage(res)
+    )
+  }
+  
+  mll_vec <- NULL
+  if (is.numeric(res) && length(res) == adegenet::nInd(genind_obj)) {
+    mll_vec <- res
+  } else if (inherits(res, "genclone") || inherits(res, "snpclone") || inherits(res, "genind")) {
+    mll_vec <- tryCatch(get_mlg_vec(res), error = function(e) NULL)
+  }
+  if (is.null(mll_vec)) {
+    mll_vec <- tryCatch(get_mlg_vec(gc), error = function(e) NULL)
+  }
+  if (is.null(mll_vec) || length(mll_vec) != adegenet::nInd(genind_obj)) {
+    stop("mll_safe(): poppr::mll() did not yield a valid per-individual MLL vector.")
+  }
+  
+  # Guardrail: if everything stayed exactly equal to naive MLG, fail loudly.
+  naive_mlg <- get_mlg_vec(genind_obj)
+  if (identical(as.integer(factor(mll_vec)), as.integer(factor(naive_mlg)))) {
+    stop(
+      "mll_safe(): MLL assignments are identical to naive MLG for all individuals. ",
+      "This often indicates mll() call/signature mismatch or ineffective threshold. ",
+      "threshold=", threshold,
+      "; poppr version=", as.character(utils::packageVersion("poppr"))
+    )
+  }
+  
+  as.integer(factor(mll_vec))
 }
 
 ### Helper: make genotype df safe for pegas::as.loci + hw.test ----
@@ -424,7 +459,7 @@ replen <- rep(2, nLoc(gi))
 bruvo  <- poppr::bruvo.dist(gi, replen = replen)
 bruvo_mat <- as.matrix(bruvo)
 
-mll_id  <- mll_from_dist(bruvo_mat, threshold = chosen_thresh)
+mll_id  <- mll_safe(gi, distmat = bruvo_mat, threshold = chosen_thresh)
 mll_lab <- sprintf("MLL_%03d", mll_id)
 
 df_ids <- data.frame(
@@ -656,12 +691,16 @@ meta_out <- field2 %>%
 
 saveRDS(meta_out, file.path(OBJ_DIR, "meta.rds"))
 
-if (exists("gi_mll") && inherits(gi_mll, "genind")) {
-  saveRDS(gi_mll, file.path(OBJ_DIR, "gi_mll.rds"))
+if (!(exists("gi_mll") && inherits(gi_mll, "genind"))) {
+  gi_mll <- subset_one_rep_per_group_per_site(gi, df_ids, label_col = "MLL")
 }
+if (!inherits(gi_mll, "genind") || adegenet::nInd(gi_mll) < 1) {
+  stop("Could not build gi_mll for object saving.")
+}
+saveRDS(gi_mll, file.path(OBJ_DIR, "gi_mll.rds"))
 
 cat("Saved objects in: ", OBJ_DIR, "\n", sep = "")
-cat(" - gi.rds\n - df_ids.rds\n - meta.rds\n - gi_mll.rds (if created)\n")
+cat(" - gi.rds\n - df_ids.rds\n - meta.rds\n - gi_mll.rds\n")
 
 hr("PIPELINE COMPLETE")
 cat("Key outputs written to:\n- ", RUN_OUT, "\n", sep = "")

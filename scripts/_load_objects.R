@@ -1,22 +1,34 @@
+# scripts/_load_objects.R
 ############################################################
 # scripts/_load_objects.R
 # Loads gi/df_ids/meta/gi_mll from outputs/v1/objects
 ############################################################
 
-suppressPackageStartupMessages(library(here))
 suppressPackageStartupMessages(library(adegenet))
 
-FALLBACK_ROOT <- file.path(path.expand("~"), "Desktop", "BeechCode")
-candidate_root <- here::here()
-
-if (dir.exists(file.path(candidate_root, "data", "raw"))) {
-  PROJECT_ROOT <- candidate_root
-} else if (dir.exists(file.path(FALLBACK_ROOT, "data", "raw"))) {
-  PROJECT_ROOT <- FALLBACK_ROOT
-  setwd(PROJECT_ROOT)
-} else {
-  stop("Can't find project root. Open BeechCode.Rproj or set FALLBACK_ROOT.")
+find_project_root <- function() {
+  candidates <- c(getwd(), normalizePath(file.path(getwd(), ".."), mustWork = FALSE))
+  
+  cmd_file <- sub("^--file=", "", grep("^--file=", commandArgs(), value = TRUE))
+  if (length(cmd_file) > 0 && nzchar(cmd_file[1])) {
+    candidates <- c(candidates, dirname(normalizePath(cmd_file[1], mustWork = FALSE)))
+  }
+  
+  for (start in unique(candidates)) {
+    cur <- normalizePath(start, mustWork = FALSE)
+    repeat {
+      if (file.exists(file.path(cur, "scripts", "_load_objects.R"))) return(cur)
+      parent <- dirname(cur)
+      if (identical(parent, cur)) break
+      cur <- parent
+    }
+  }
+  
+  stop("Cannot find project root containing scripts/_load_objects.R. Open BeechCode project first.")
 }
+
+PROJECT_ROOT <- find_project_root()
+setwd(PROJECT_ROOT)
 
 RUN_TAG <- "v1"
 RUN_OUT <- file.path(PROJECT_ROOT, "outputs", RUN_TAG)
@@ -25,8 +37,11 @@ OBJ_DIR <- file.path(RUN_OUT, "objects")
 need <- c("gi.rds", "df_ids.rds", "meta.rds", "gi_mll.rds")
 missing <- need[!file.exists(file.path(OBJ_DIR, need))]
 if (length(missing) > 0) {
-  stop("Missing saved objects in: ", OBJ_DIR, "\nMissing: ", paste(missing, collapse = ", "),
-       "\nFix: run 00_master_pipeline.R (with SAVE SHARED OBJECTS block) first.")
+  stop(
+    "Missing saved objects in: ", OBJ_DIR,
+    "\nMissing: ", paste(missing, collapse = ", "),
+    "\nFix: run 00_master_pipeline.R first so outputs/v1/objects is fully created."
+  )
 }
 
 gi     <- readRDS(file.path(OBJ_DIR, "gi.rds"))

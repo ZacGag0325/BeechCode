@@ -106,75 +106,72 @@ get_mlg_vec <- function(x) {
        as.character(packageVersion("poppr")))
 }
 
-### Helper: version-robust MLL assignment through poppr::mll ----
-mll_safe <- function(genind_obj, distmat, threshold) {
-  if (!inherits(genind_obj, "genind")) stop("mll_safe(): genind_obj must be a genind object")
-  if (!is.matrix(distmat)) distmat <- as.matrix(distmat)
-  if (nrow(distmat) != ncol(distmat)) stop("mll_safe(): distance matrix must be square")
-  if (nrow(distmat) != adegenet::nInd(genind_obj)) {
-    stop("mll_safe(): nrow(distmat)=", nrow(distmat),
-         " does not match nInd(genind_obj)=", adegenet::nInd(genind_obj))
+### Helper: deterministic relabeling of cluster IDs ----
+relabel_mll_ids <- function(raw_id, sample_ids) {
+  stopifnot(length(raw_id) == length(sample_ids))
+  tmp <- data.frame(
+    raw_id = as.integer(raw_id),
+    sample_id = as.character(sample_ids),
+    stringsAsFactors = FALSE
+  )
+  
+  map <- tmp %>%
+    group_by(raw_id) %>%
+    summarise(
+      cluster_size = n(),
+      first_sample = min(sample_id),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(cluster_size), first_sample, raw_id) %>%
+    mutate(stable_id = row_number())
+  
+  out <- map$stable_id[match(tmp$raw_id, map$raw_id)]
+  if (any(is.na(out))) stop("Failed to relabel MLL cluster IDs deterministically.")
+  as.integer(out)
+}
+
+### Helper: build deterministic MLL from Bruvo distances + threshold ----
+make_mll_from_bruvo <- function(genind_obj, threshold) {
+  bruvo <- poppr::bruvo.dist(genind_obj)
+  bruvo_mat <- as.matrix(bruvo)
+  
+  if (!is.matrix(bruvo_mat) || nrow(bruvo_mat) != ncol(bruvo_mat)) {
+    stop("Invalid Bruvo distance matrix: expected square matrix.")
+  }
+  if (nrow(bruvo_mat) != adegenet::nInd(genind_obj)) {
+    stop("Invalid Bruvo distance matrix: nrow does not match nInd(genind).")
+  }
+  if (any(is.na(bruvo_mat))) {
+    stop("Invalid Bruvo distance matrix: contains NA values.")
+  }
+  if (any(!is.finite(bruvo_mat))) {
+    stop("Invalid Bruvo distance matrix: contains non-finite values.")
   }
   
-  f <- formals(poppr::mll)
-  f_names <- names(f)
-  if (is.null(f_names)) f_names <- character(0)
+  rn <- rownames(bruvo_mat)
+  cn <- colnames(bruvo_mat)
+  ids <- adegenet::indNames(genind_obj)
   
-  dist_arg <- if ("distmat" %in% f_names) "distmat" else if ("dist.mat" %in% f_names) "dist.mat" else NULL
-  thr_arg  <- if ("threshold" %in% f_names) "threshold" else if ("epsilon" %in% f_names) "epsilon" else NULL
-  
-  if (is.null(dist_arg) || is.null(thr_arg)) {
-    stop(
-      "Unable to call poppr::mll() with this version of poppr. ",
-      "Expected args for distance and threshold were not found. ",
-      "poppr version: ", as.character(utils::packageVersion("poppr")), "; ",
-      "formals(poppr::mll): ", paste(f_names, collapse = ", ")
-    )
+  if (is.null(rn) || is.null(cn) || !identical(rn, cn)) {
+    stop("Bruvo matrix row/column names are missing or inconsistent.")
+  }
+  if (!setequal(rn, ids)) {
+    stop("Bruvo matrix sample names do not match indNames(genind).")
   }
   
-  gc <- tryCatch(poppr::as.genclone(genind_obj), error = function(e) NULL)
-  if (is.null(gc)) {
-    stop("mll_safe(): could not coerce genind to genclone for poppr::mll().")
-  }
+  bruvo_mat <- bruvo_mat[ids, ids, drop = FALSE]
+  bruvo_mat <- (bruvo_mat + t(bruvo_mat)) / 2
+  diag(bruvo_mat) <- 0
   
-  args <- list(gc)
-  args[[dist_arg]] <- distmat
-  args[[thr_arg]] <- threshold
+  hc <- stats::hclust(stats::as.dist(bruvo_mat), method = "average")
+  raw_id <- stats::cutree(hc, h = threshold)
+  stable_id <- relabel_mll_ids(raw_id, sample_ids = ids)
   
-  res <- tryCatch(do.call(poppr::mll, args), error = function(e) e)
-  if (inherits(res, "error")) {
-    stop(
-      "poppr::mll() failed. poppr version: ", as.character(utils::packageVersion("poppr")),
-      "; used args: ", paste(c(dist_arg, thr_arg), collapse = ", "),
-      "; message: ", conditionMessage(res)
-    )
-  }
-  
-  mll_vec <- NULL
-  if (is.numeric(res) && length(res) == adegenet::nInd(genind_obj)) {
-    mll_vec <- res
-  } else if (inherits(res, "genclone") || inherits(res, "snpclone") || inherits(res, "genind")) {
-    mll_vec <- tryCatch(get_mlg_vec(res), error = function(e) NULL)
-  }
-  if (is.null(mll_vec)) {
-    mll_vec <- tryCatch(get_mlg_vec(gc), error = function(e) NULL)
-  }
-  if (is.null(mll_vec) || length(mll_vec) != adegenet::nInd(genind_obj)) {
-    stop("mll_safe(): poppr::mll() did not yield a valid per-individual MLL vector.")
-  }
-  
-  # Guardrail: if everything stayed exactly equal to naive MLG, fail loudly.
-  naive_mlg <- get_mlg_vec(genind_obj)
-  if (identical(as.integer(factor(mll_vec)), as.integer(factor(naive_mlg)))) {
-    stop(
-      "mll_safe(): MLL assignments are identical to naive MLG for all individuals. ",
-      "This often indicates mll() call/signature mismatch or ineffective threshold. ",
-      "threshold=", threshold,
-      "; poppr version=", as.character(utils::packageVersion("poppr"))
-    )
-  }
-  
-  as.integer(factor(mll_vec))
+  list(
+    bruvo_mat = bruvo_mat,
+    mll_id = stable_id,
+    mll_label = paste0("MLL", stable_id)
+  )
 }
 
 ### Helper: make genotype df safe for pegas::as.loci + hw.test ----
@@ -455,15 +452,14 @@ hr("STEP 9) MLG/MLL")
 
 mlg_vec <- get_mlg_vec(gi)
 
-replen <- rep(2, nLoc(gi))
-bruvo  <- poppr::bruvo.dist(gi, replen = replen)
-bruvo_mat <- as.matrix(bruvo)
-
-mll_id  <- mll_safe(gi, distmat = bruvo_mat, threshold = chosen_thresh)
-mll_lab <- sprintf("MLL_%03d", mll_id)
+mll_obj <- make_mll_from_bruvo(gi, threshold = chosen_thresh)
+bruvo_mat <- mll_obj$bruvo_mat
+mll_id <- mll_obj$mll_id
+mll_lab <- mll_obj$mll_label
 
 df_ids <- data.frame(
   ind  = indNames(gi),
+  Nom_Labo_Échantillons = indNames(gi),
   Site = pop(gi),
   MLG  = sprintf("MLG_%03d", as.integer(factor(mlg_vec))),
   MLL  = mll_lab,
@@ -480,6 +476,15 @@ show_tbl(df_ids, "df_ids (first rows)", n = 12)
 
 cat("\nUnique MLG:", length(unique(df_ids$MLG)),
     " | Unique MLL:", length(unique(df_ids$MLL)), "\n")
+
+
+if (length(unique(df_ids$MLL)) > length(unique(df_ids$MLG))) {
+  stop("Invalid MLL assignment: number of MLL exceeds number of MLG.")
+}
+if (length(unique(df_ids$MLL)) == length(unique(df_ids$MLG))) {
+  cat("\n[WARNING] MLL count equals MLG count at threshold=", chosen_thresh,
+      ". This can be biologically real but indicates no cluster collapsing.\n", sep = "")
+}
 
 print_clone_groups(df_ids, "MLL", title = "CLONE CHECK (MLL groups)")
 print_clone_groups(df_ids, "MLG", title = "CLONE CHECK (MLG groups)")
@@ -704,3 +709,4 @@ cat(" - gi.rds\n - df_ids.rds\n - meta.rds\n - gi_mll.rds\n")
 
 hr("PIPELINE COMPLETE")
 cat("Key outputs written to:\n- ", RUN_OUT, "\n", sep = "")
+

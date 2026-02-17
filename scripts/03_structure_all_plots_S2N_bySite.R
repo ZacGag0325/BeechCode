@@ -342,4 +342,3 @@ message("Saved grind PDF: ", grind_pdf)
 message("Saved grind PNG: ", grind_png)
 message("Saved grind log: ", grind_log)
 
-message("DONE. Outputs in: ", PLOT_DIR)

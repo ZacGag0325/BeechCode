@@ -43,12 +43,6 @@ MIN_N <- 8
 
 safe_genind2loci_df <- function(gpop, sep = "/") {
   gdf <- adegenet::genind2df(gpop, sep = sep)
-  loci <- adegenet::locNames(gpop)
-  missing_loci <- setdiff(loci, colnames(gdf))
-  if (length(missing_loci) > 0) {
-    stop("genind2df() is missing locus columns: ", paste(missing_loci, collapse = ", "))
-  }
-  gdf <- gdf[, loci, drop = FALSE]
   gdf <- as.data.frame(lapply(gdf, function(col) {
     x <- trimws(as.character(col))
     x[x %in% c("", "NA", "NaN", "0", "0/0", "NA/NA", "-")] <- NA
@@ -80,6 +74,15 @@ extract_hw_pvals <- function(ht) {
   }
   pv <- suppressWarnings(as.numeric(ht))
   list(pvals = pv, locus = names(ht))
+}
+
+
+all_diploid_genotypes <- function(df_loci) {
+  vals <- unlist(df_loci, use.names = FALSE)
+  vals <- as.character(vals)
+  vals <- vals[!is.na(vals) & nzchar(vals)]
+  if (length(vals) == 0) return(FALSE)
+  all(grepl("^[^/]+/[^/]+$", vals))
 }
 
 locus_reason <- function(x, min_n = MIN_N) {
@@ -114,15 +117,12 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
   }
   gdf <- gdf[, loci, drop = FALSE]
   
-  n_non_missing <- vapply(loci, function(loc) sum(!is.na(gdf[[loc]])), integer(1))
-  reason_vec <- vapply(loci, function(loc) locus_reason(gdf[[loc]], min_n = min_n), character(1))
-  
   base_tbl <- tibble(
     Site = label,
     Locus = loci,
     n_inds = n_s,
-    n_non_missing = n_non_missing,
-    reason = reason_vec
+    n_non_missing = vapply(gdf[loci], function(x) sum(!is.na(x)), integer(1)),
+    reason = vapply(gdf[loci], locus_reason, character(1), min_n = min_n)
   )
   
   testable <- base_tbl %>% filter(is.na(reason))
@@ -130,7 +130,7 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
     return(base_tbl %>% mutate(p_value = NA_real_) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
-  loci_obj <- tryCatch(pegas::as.loci(gdf[, testable$Locus, drop = FALSE]), error = function(e) e)
+  loci_obj <- tryCatch(pegas::as.loci(gdf[, testable$Locus, drop = FALSE], col.pop = NULL), error = function(e) e)
   if (inherits(loci_obj, "error")) {
     return(base_tbl %>% mutate(
       p_value = NA_real_,
@@ -138,7 +138,13 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
     ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
-  ht <- tryCatch(pegas::hw.test(loci_obj, B = HWE_B), error = function(e) e)
+  diploid_ok <- all_diploid_genotypes(gdf[, testable$Locus, drop = FALSE])
+  B_use <- if (isTRUE(diploid_ok)) HWE_B else 0
+  if (!isTRUE(diploid_ok)) {
+    cat("[HWE] Note:", label, "contains non-diploid/ambiguous genotypes for tested loci; using exact test without Monte Carlo (B=0).\n")
+  }
+  
+  ht <- tryCatch(pegas::hw.test(loci_obj, B = B_use), error = function(e) e)
   if (inherits(ht, "error")) {
     return(base_tbl %>% mutate(
       p_value = NA_real_,

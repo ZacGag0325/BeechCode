@@ -31,6 +31,8 @@ find_project_root <- function() {
   stop("Cannot find project root containing scripts/_load_objects.R. Open BeechCode project first.")
 }
 
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
 setwd(find_project_root())
 source(file.path("scripts", "_load_objects.R"))
 
@@ -76,7 +78,6 @@ extract_hw_pvals <- function(ht) {
   list(pvals = pv, locus = names(ht))
 }
 
-
 all_diploid_genotypes <- function(df_loci) {
   vals <- unlist(df_loci, use.names = FALSE)
   vals <- as.character(vals)
@@ -110,7 +111,6 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
   }
   
   gdf <- safe_genind2loci_df(genind_obj, sep = "/")
-  
   missing_loci <- setdiff(loci, colnames(gdf))
   if (length(missing_loci) > 0) {
     stop("HWE input error: missing loci in genotype table for ", label, ": ", paste(missing_loci, collapse = ", "))
@@ -169,8 +169,6 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
   out
 }
 
-`%||%` <- function(a, b) if (!is.null(a)) a else b
-
 sites <- levels(pop(gi))
 cat("Sites in pop(gi):\n")
 print(sites)
@@ -192,8 +190,10 @@ hwe_by_site <- hwe_by_site %>%
   group_by(Site) %>%
   mutate(
     p_adj_bh = p.adjust(p_value, method = "BH"),
+    p_adj_bonf = p.adjust(p_value, method = "bonferroni"),
     sig_p05 = !is.na(p_value) & p_value < HWE_ALPHA,
-    sig_bh05 = !is.na(p_adj_bh) & p_adj_bh < HWE_ALPHA
+    sig_bh05 = !is.na(p_adj_bh) & p_adj_bh < HWE_ALPHA,
+    sig_bonf05 = !is.na(p_adj_bonf) & p_adj_bonf < HWE_ALPHA
   ) %>%
   ungroup()
 
@@ -205,6 +205,7 @@ hwe_site_summary <- hwe_by_site %>%
     loci_tested = sum(!is.na(p_value)),
     n_sig_p05 = sum(sig_p05, na.rm = TRUE),
     n_sig_bh05 = sum(sig_bh05, na.rm = TRUE),
+    n_sig_bonf05 = sum(sig_bonf05, na.rm = TRUE),
     n_NA = sum(is.na(p_value)),
     .groups = "drop"
   )
@@ -214,8 +215,10 @@ run_hwe_global <- function(genind_obj, label) {
   out %>%
     mutate(
       p_adj_bh = p.adjust(p_value, method = "BH"),
+      p_adj_bonf = p.adjust(p_value, method = "bonferroni"),
       sig_p05 = !is.na(p_value) & p_value < HWE_ALPHA,
-      sig_bh05 = !is.na(p_adj_bh) & p_adj_bh < HWE_ALPHA
+      sig_bh05 = !is.na(p_adj_bh) & p_adj_bh < HWE_ALPHA,
+      sig_bonf05 = !is.na(p_adj_bonf) & p_adj_bonf < HWE_ALPHA
     )
 }
 
@@ -223,13 +226,17 @@ hwe_global_mlg <- run_hwe_global(gi, "GLOBAL_MLG")
 hwe_global_mll <- run_hwe_global(gi_mll, "GLOBAL_MLL")
 
 hwe_compare <- full_join(
-  hwe_global_mlg %>% select(Locus, p_MLG = p_value, reason_MLG = reason),
-  hwe_global_mll %>% select(Locus, p_MLL = p_value, reason_MLL = reason),
+  hwe_global_mlg %>% select(Locus, p_MLG = p_value, p_MLG_bh = p_adj_bh, p_MLG_bonf = p_adj_bonf, reason_MLG = reason),
+  hwe_global_mll %>% select(Locus, p_MLL = p_value, p_MLL_bh = p_adj_bh, p_MLL_bonf = p_adj_bonf, reason_MLL = reason),
   by = "Locus"
 ) %>%
   mutate(
     sig_MLG = !is.na(p_MLG) & p_MLG < HWE_ALPHA,
-    sig_MLL = !is.na(p_MLL) & p_MLL < HWE_ALPHA
+    sig_MLL = !is.na(p_MLL) & p_MLL < HWE_ALPHA,
+    sig_MLG_bh = !is.na(p_MLG_bh) & p_MLG_bh < HWE_ALPHA,
+    sig_MLL_bh = !is.na(p_MLL_bh) & p_MLL_bh < HWE_ALPHA,
+    sig_MLG_bonf = !is.na(p_MLG_bonf) & p_MLG_bonf < HWE_ALPHA,
+    sig_MLL_bonf = !is.na(p_MLL_bonf) & p_MLL_bonf < HWE_ALPHA
   )
 
 cat("\n--- HWE NA reasons (by site) ---\n")

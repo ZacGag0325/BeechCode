@@ -1,6 +1,7 @@
+# filename: scripts/02_hwe.R
 ############################################################
 # scripts/02_hwe.R
-# Hardy-Weinberg tests by Site + global (MLG vs MLL)
+# Hardy-Weinberg tests by Site + global (clone-corrected)
 ############################################################
 
 options(repos = c(CRAN = "https://cloud.r-project.org"))
@@ -38,6 +39,10 @@ source(file.path("scripts", "_load_objects.R"))
 
 OUTDIR <- file.path(RUN_OUT, "hwe_only")
 dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+# Use clone-corrected dataset for independence-assuming analyses
+gi_use <- gi_mll
+
 
 HWE_ALPHA <- 0.05
 HWE_B <- 10000
@@ -169,12 +174,12 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
   out
 }
 
-sites <- levels(pop(gi))
-cat("Sites in pop(gi):\n")
+sites <- levels(pop(gi_use))
+cat("Sites in pop(gi_mll):\n")
 print(sites)
 
 hwe_by_site <- lapply(sites, function(s) {
-  gi_s <- gi[pop(gi) == s, , drop = FALSE]
+  gi_s <- gi_use[pop(gi_use) == s, , drop = FALSE]
   out <- run_hwe_for_genind(gi_s, label = s)
   cat(
     "[HWE] Site", s,
@@ -236,22 +241,7 @@ run_hwe_global <- function(genind_obj, label) {
     add_hwe_summary_cols(alpha = HWE_ALPHA)
 }
 
-hwe_global_mlg <- run_hwe_global(gi, "GLOBAL_MLG")
-hwe_global_mll <- run_hwe_global(gi_mll, "GLOBAL_MLL")
-
-hwe_compare <- full_join(
-  hwe_global_mlg %>% select(Locus, p_MLG = p_value, p_MLG_bh = p_adj_bh, p_MLG_bonf = p_adj_bonf, reason_MLG = reason),
-  hwe_global_mll %>% select(Locus, p_MLL = p_value, p_MLL_bh = p_adj_bh, p_MLL_bonf = p_adj_bonf, reason_MLL = reason),
-  by = "Locus"
-) %>%
-  mutate(
-    sig_MLG = !is.na(p_MLG) & p_MLG < HWE_ALPHA,
-    sig_MLL = !is.na(p_MLL) & p_MLL < HWE_ALPHA,
-    sig_MLG_bh = !is.na(p_MLG_bh) & p_MLG_bh < HWE_ALPHA,
-    sig_MLL_bh = !is.na(p_MLL_bh) & p_MLL_bh < HWE_ALPHA,
-    sig_MLG_bonf = !is.na(p_MLG_bonf) & p_MLG_bonf < HWE_ALPHA,
-    sig_MLL_bonf = !is.na(p_MLL_bonf) & p_MLL_bonf < HWE_ALPHA
-  )
+hwe_global <- run_hwe_global(gi_use, "GLOBAL_MLL")
 
 cat("\n--- HWE NA reasons (by site) ---\n")
 print(hwe_by_site %>% filter(is.na(p_value)) %>% count(reason, sort = TRUE), n = 50)
@@ -261,8 +251,7 @@ print(hwe_site_summary, n = Inf)
 
 write.csv(hwe_by_site, file.path(OUTDIR, "hwe_by_site_by_locus.csv"), row.names = FALSE)
 write.csv(hwe_site_summary, file.path(OUTDIR, "hwe_site_summary.csv"), row.names = FALSE)
-write.csv(hwe_global_mlg, file.path(OUTDIR, "hwe_global_mlg.csv"), row.names = FALSE)
-write.csv(hwe_global_mll, file.path(OUTDIR, "hwe_global_mll.csv"), row.names = FALSE)
-write.csv(hwe_compare, file.path(OUTDIR, "hwe_global_compare_mlg_vs_mll.csv"), row.names = FALSE)
+write.csv(hwe_global, file.path(OUTDIR, "hwe_global_mll.csv"), row.names = FALSE)
 
 cat("DONE HWE. Outputs in: ", OUTDIR, "\n", sep = "")
+

@@ -46,6 +46,21 @@ INPUTS_DIR <- file.path(PROJECT_ROOT, "inputs")
 dir.create(INPUTS_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(RUN_OUT, showWarnings = FALSE, recursive = TRUE)
 
+resolve_file <- function(candidates, label) {
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) {
+    stop("Missing required ", label, ". Checked:\n- ", paste(candidates, collapse = "\n- "))
+  }
+  if (length(existing) > 1) {
+    info <- file.info(existing)$mtime
+    pick <- existing[order(info, decreasing = TRUE)][1]
+    message("Multiple matches found for ", label, ":\n- ", paste(existing, collapse = "\n- "), "\nSelected newest: ", pick)
+    return(pick)
+  }
+  message("Resolved ", label, " from: ", existing[1])
+  existing[1]
+}
+
 need_files <- c(
   file.path(RUN_OUT, "matrix_genetic_distance_nei.csv"),
   file.path(RUN_OUT, "matrix_geographic_distance_km.csv"),
@@ -61,6 +76,28 @@ if (length(missing_inputs) > 0) {
   )
 }
 
+# Defensive diploid handling: some upstream objects may store ploidy as a vector.
+# We derive a single TRUE/FALSE flag for if() conditions to prevent
+# "the condition has length > 1" errors when package internals expect scalar logic.
+ploidy_vec <- tryCatch(as.numeric(adegenet::ploidy(gi)), error = function(e) rep(NA_real_, adegenet::nInd(gi)))
+diploid_vec <- (ploidy_vec == 2)
+if (anyNA(diploid_vec)) {
+  message("Found NA ploidy values; treating NA as FALSE when summarising diploid status.")
+}
+diploid_flag <- all(replace(diploid_vec, is.na(diploid_vec), FALSE))
+if (length(diploid_vec) > 1) {
+  message("Diploid status evaluated across individuals with all(diploid_vec, na.rm = FALSE): ", diploid_flag)
+}
+
+gi_work <- gi
+if (length(ploidy_vec) > 1 && length(unique(ploidy_vec[!is.na(ploidy_vec)])) > 1) {
+  warning("Mixed ploidy detected in gi. Coercing ploidy to 2 for downstream diploid-only metrics.")
+  adegenet::ploidy(gi_work) <- rep(2L, adegenet::nInd(gi_work))
+} else if (length(ploidy_vec) > 0 && all(is.na(ploidy_vec))) {
+  warning("Could not determine ploidy from gi. Assuming diploid (2) for downstream metrics.")
+  adegenet::ploidy(gi_work) <- rep(2L, adegenet::nInd(gi_work))
+}
+
 read_matrix_csv <- function(path) {
   mat_df <- read.csv(path, check.names = FALSE, row.names = 1)
   mat <- as.matrix(mat_df)
@@ -74,8 +111,10 @@ read_matrix_csv <- function(path) {
   mat
 }
 
-nei_mat <- read_matrix_csv(file.path(RUN_OUT, "matrix_genetic_distance_nei.csv"))
-geo_mat <- read_matrix_csv(file.path(RUN_OUT, "matrix_geographic_distance_km.csv"))
+nei_path <- resolve_file(c(file.path(RUN_OUT, "matrix_genetic_distance_nei.csv")), "Nei distance matrix")
+geo_path <- resolve_file(c(file.path(RUN_OUT, "matrix_geographic_distance_km.csv")), "geographic distance matrix")
+nei_mat <- read_matrix_csv(nei_path)
+geo_mat <- read_matrix_csv(geo_path)
 
 if (!identical(rownames(nei_mat), rownames(geo_mat))) {
   stop("Site names do not match between Nei and geographic distance matrices in outputs/v1.")
@@ -87,7 +126,8 @@ meta_candidates <- c(
   file.path(PROJECT_ROOT, "data", "processed", "site_metadata.csv"),
   file.path(PROJECT_ROOT, "data", "raw", "site_metadata.csv")
 )
-meta_path <- meta_candidates[file.exists(meta_candidates)][1]
+meta_existing <- meta_candidates[file.exists(meta_candidates)]
+meta_path <- if (length(meta_existing) > 0) resolve_file(meta_candidates, "site metadata") else NA_character_
 
 if (is.na(meta_path) || !nzchar(meta_path)) {
   meta_path <- file.path(INPUTS_DIR, "site_metadata.csv")
@@ -252,7 +292,8 @@ if (inherits(ibe_error, "error")) {
 }
 
 # B) Allelic richness vs elevation
-ar_site <- read.csv(file.path(RUN_OUT, "allelic_richness_site_summary.csv"), stringsAsFactors = FALSE, check.names = FALSE)
+ar_path <- resolve_file(c(file.path(RUN_OUT, "allelic_richness_site_summary.csv")), "allelic richness site summary")
+ar_site <- read.csv(ar_path, stringsAsFactors = FALSE, check.names = FALSE)
 ar_name_candidates <- names(ar_site)[tolower(names(ar_site)) %in% c("mean_allelic_richness", "allelic_richness", "ar_mean", "mean_ar")]
 if (length(ar_name_candidates) == 0) {
   numeric_cols <- names(ar_site)[sapply(ar_site, is.numeric)]
@@ -306,7 +347,7 @@ if (all(is.na(ar_df$elevation_m))) {
 }
 
 # C) Pairwise FST (Weir & Cockerham)
-hf <- hierfstat::genind2hierfstat(gi)
+hf <- hierfstat::genind2hierfstat(gi_work)
 fst_raw <- hierfstat::pairwise.WCfst(hf[, -1, drop = FALSE], hf[, 1])
 fst_mat <- as.matrix(fst_raw)
 fst_mat <- (fst_mat + t(fst_mat)) / 2
@@ -344,7 +385,7 @@ ggsave(file.path(RUN_OUT, "pairwise_fst_heatmap.jpeg"), p_fst, width = 8.5, heig
 # D) Private alleles per site
 private_counts <- NULL
 if ("private_alleles" %in% getNamespaceExports("poppr")) {
-  pa_try <- tryCatch(poppr::private_alleles(gi, count.alleles = TRUE), error = function(e) NULL)
+  pa_try <- tryCatch(poppr::private_alleles(gi_work, count.alleles = TRUE), error = function(e) NULL)
   if (is.data.frame(pa_try) && all(c("population", "count") %in% names(pa_try))) {
     private_counts <- pa_try %>%
       transmute(Site = as.character(population), private_alleles_total = as.numeric(count))
@@ -352,9 +393,9 @@ if ("private_alleles" %in% getNamespaceExports("poppr")) {
 }
 
 if (is.null(private_counts)) {
-  allele_tab <- adegenet::tab(gi, freq = FALSE, NA.method = "zero")
-  loci_map <- as.character(adegenet::locFac(gi))
-  site_fac <- as.character(pop(gi))
+  allele_tab <- adegenet::tab(gi_work, freq = FALSE, NA.method = "zero")
+  loci_map <- as.character(adegenet::locFac(gi_work))
+  site_fac <- as.character(pop(gi_work))
   allele_presence <- sapply(split(seq_len(ncol(allele_tab)), loci_map), function(cols) {
     loc_dat <- allele_tab[, cols, drop = FALSE]
     present <- sapply(unique(site_fac), function(s) {
@@ -389,7 +430,7 @@ if (is.null(private_counts)) {
   )
 }
 
-site_n <- as.data.frame(table(as.character(pop(gi))), stringsAsFactors = FALSE)
+site_n <- as.data.frame(table(as.character(pop(gi_work))), stringsAsFactors = FALSE)
 names(site_n) <- c("Site", "n_individuals")
 private_out <- site_n %>%
   left_join(private_counts, by = "Site") %>%
@@ -468,7 +509,7 @@ if (all(is.na(site_meta$elevation_m))) {
 }
 
 # F) HWE p-value adjustments
-hwe_path <- file.path(RUN_OUT, "hwe_by_site_by_locus.csv")
+hwe_path <- resolve_file(c(file.path(RUN_OUT, "hwe_by_site_by_locus.csv")), "HWE by-site-by-locus table")
 hwe_df <- read.csv(hwe_path, stringsAsFactors = FALSE, check.names = FALSE)
 adjusted_path <- file.path(RUN_OUT, "hwe_by_site_by_locus_adjusted.csv")
 notes_path <- file.path(RUN_OUT, "hwe_adjustment_notes.txt")

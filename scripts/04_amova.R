@@ -1,6 +1,7 @@
+# filename: scripts/04_amova.R
 ############################################################
 # scripts/04_amova.R
-# AMOVA among Sites (+ permutation test)
+# AMOVA among Sites (+ permutation test) using clone-corrected dataset
 ############################################################
 
 options(repos = c(CRAN = "https://cloud.r-project.org"))
@@ -34,19 +35,19 @@ if (!exists("RUN_OUT", inherits = FALSE)) {
 
 OBJ_DIR <- file.path(RUN_OUT, "objects")
 
-if (!exists("gi", inherits = FALSE) || !exists("df_ids", inherits = FALSE)) {
-  need <- c("gi.rds", "df_ids.rds")
+if (!exists("gi_mll", inherits = FALSE) || !exists("df_ids", inherits = FALSE)) {
+  need <- c("gi_mll.rds", "df_ids.rds")
   missing <- need[!file.exists(file.path(OBJ_DIR, need))]
   if (length(missing) > 0) {
     stop(
       "Missing saved objects in ", OBJ_DIR, ". Missing file(s): ",
       paste(missing, collapse = ", "),
-      ". Ensure gi and df_ids are in memory or create these files first."
+      ". Ensure gi_mll and df_ids are in memory or create these files first."
     )
   }
   
-  if (!exists("gi", inherits = FALSE)) {
-    gi <- readRDS(file.path(OBJ_DIR, "gi.rds"))
+  if (!exists("gi_mll", inherits = FALSE)) {
+    gi_mll <- readRDS(file.path(OBJ_DIR, "gi_mll.rds"))
   }
   if (!exists("df_ids", inherits = FALSE)) {
     df_ids <- readRDS(file.path(OBJ_DIR, "df_ids.rds"))
@@ -72,7 +73,8 @@ for (nm in c("Site", "Latitude")) {
   if (!nm %in% names(df_ids)) stop("df_ids must contain a '", nm, "' column.")
 }
 
-ids_gi <- indNames(gi)
+gi_use <- gi_mll
+ids_gi <- indNames(gi_use)
 ids_df <- as.character(df_ids[[id_col]])
 
 if (anyDuplicated(ids_df) > 0) {
@@ -102,12 +104,12 @@ if (!identical(ids_gi, ids_df)) {
 }
 
 # Ensure pop is Site (consistent)
-pop(gi) <- as.factor(df_ids$Site)
+pop(gi_use) <- as.factor(df_ids$Site)
 
 # -----------------------------------------------------------------------------
 # Existing AMOVA by Site
 # -----------------------------------------------------------------------------
-am <- poppr::poppr.amova(gi, ~Site, within = TRUE)
+am <- poppr::poppr.amova(gi_use, ~Site, within = TRUE)
 print(am)
 
 set.seed(123)
@@ -153,16 +155,16 @@ if (any(is.na(map_idx))) {
 df_ids$Region_NS <- factor(site_to_region$Region_NS[map_idx], levels = c("South", "North"))
 
 # Build hierarchy in gi
-strata(gi) <- data.frame(
+strata(gi_use) <- data.frame(
   Region_NS = df_ids$Region_NS,
   Site = df_ids$Site,
   row.names = ids_gi,
   stringsAsFactors = FALSE
 )
-setPop(gi) <- ~Site
+setPop(gi_use) <- ~Site
 
 # Hierarchical AMOVA and permutation test
-am_ns <- poppr::poppr.amova(gi, ~Region_NS/Site, within = TRUE)
+am_ns <- poppr::poppr.amova(gi_use, ~Region_NS/Site, within = TRUE)
 print(am_ns)
 
 cat("\nVariance components and percentages (Region_NS/Site):\n")

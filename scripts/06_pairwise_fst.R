@@ -1,6 +1,7 @@
+# filename: scripts/06_pairwise_fst.R
 ############################################################
 # scripts/06_pairwise_fst.R
-# Pairwise Jost's D by Site (with permutation p-values)
+# Pairwise Jost's D by Site (clone-corrected; with permutation p-values)
 ############################################################
 
 options(repos = c(CRAN = "https://cloud.r-project.org"))
@@ -44,12 +45,13 @@ source(file.path("scripts", "_load_objects.R"))
 OUTDIR <- file.path(RUN_OUT, "fst_only")
 dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 
-if (!inherits(gi, "genind")) stop("Object 'gi' must be a genind object.")
-if (nPop(gi) < 2) stop("Need at least 2 populations (sites) to compute pairwise Jost's D.")
+gi_use <- gi_mll
+if (!inherits(gi_use, "genind")) stop("Object 'gi_mll' must be a genind object.")
+if (nPop(gi_use) < 2) stop("Need at least 2 populations (sites) to compute pairwise Jost's D.")
 
-site_factor <- as.factor(pop(gi))
+site_factor <- as.factor(pop(gi_use))
 levels(site_factor) <- normalize_site(levels(site_factor))
-pop(gi) <- site_factor
+pop(gi_use) <- site_factor
 site_levels <- levels(site_factor)
 
 min_n_per_site <- 2L
@@ -93,7 +95,7 @@ get_pair_reason <- function(genind_pair, s1, s2, min_n = min_n_per_site) {
 
 # A) Core pairwise Jost's D matrix using mmod::pairwise_D
 jost_mat_raw <- tryCatch(
-  mmod::pairwise_D(gi),
+  mmod::pairwise_D(gi_use),
   error = function(e) e
 )
 if (inherits(jost_mat_raw, "error")) {
@@ -135,7 +137,7 @@ for (k in seq_len(nrow(pair_idx))) {
   s2 <- colnames(jost_mat)[pair_idx[k, 2]]
   d_obs <- jost_mat[s1, s2]
   
-  pair_gi <- gi[pop(gi) %in% c(s1, s2), , drop = FALSE]
+  pair_gi <- gi_use[pop(gi_use) %in% c(s1, s2), , drop = FALSE]
   pop(pair_gi) <- droplevels(as.factor(pop(pair_gi)))
   
   reason <- get_pair_reason(pair_gi, s1, s2)

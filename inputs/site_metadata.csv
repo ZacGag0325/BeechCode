@@ -1,0 +1,17 @@
+# Required columns for downstream analyses:
+# Site, latitude, longitude, elevation_m, Region_NS
+# Region_NS values should be North or South.
+# Fill elevation_m to enable elevation-based analyses (IBE and elevation regressions).
+"Site","latitude","longitude","elevation_m","Region_NS"
+"ALB",NA,NA,NA,"South"
+"AMC",NA,NA,NA,"South"
+"CPF",NA,NA,NA,"North"
+"IKJ",NA,NA,NA,"South"
+"IKO",NA,NA,NA,"South"
+"LDF",NA,NA,NA,"North"
+"LGG",NA,NA,NA,"South"
+"LGR",NA,NA,NA,"South"
+"ML1",NA,NA,NA,"North"
+"ML2",NA,NA,NA,"North"
+"ML3",NA,NA,NA,"North"
+"PLI",NA,NA,NA,"North"

@@ -210,6 +210,19 @@ hwe_site_summary <- hwe_by_site %>%
     .groups = "drop"
   )
 
+
+add_hwe_summary_cols <- function(tbl, alpha = HWE_ALPHA) {
+  n_sig_p05 <- sum(!is.na(tbl$p_value) & tbl$p_value < alpha, na.rm = TRUE)
+  n_sig_bh05 <- sum(!is.na(tbl$p_adj_bh) & tbl$p_adj_bh < alpha, na.rm = TRUE)
+  n_sig_bonf05 <- sum(!is.na(tbl$p_adj_bonf) & tbl$p_adj_bonf < alpha, na.rm = TRUE)
+  tbl %>%
+    mutate(
+      n_sig_p05 = n_sig_p05,
+      n_sig_bh05 = n_sig_bh05,
+      n_sig_bonf05 = n_sig_bonf05
+    )
+}
+
 run_hwe_global <- function(genind_obj, label) {
   out <- run_hwe_for_genind(genind_obj, label = label)
   out %>%
@@ -219,7 +232,8 @@ run_hwe_global <- function(genind_obj, label) {
       sig_p05 = !is.na(p_value) & p_value < HWE_ALPHA,
       sig_bh05 = !is.na(p_adj_bh) & p_adj_bh < HWE_ALPHA,
       sig_bonf05 = !is.na(p_adj_bonf) & p_adj_bonf < HWE_ALPHA
-    )
+    ) %>%
+    add_hwe_summary_cols(alpha = HWE_ALPHA)
 }
 
 hwe_global_mlg <- run_hwe_global(gi, "GLOBAL_MLG")

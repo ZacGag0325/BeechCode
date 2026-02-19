@@ -53,7 +53,6 @@ extended_scripts <- c(
   "scripts/06_pairwise_fst.R",
   "scripts/07_allelic_richness.R",
   "scripts/08_ibs_ibd.R",
-  "scripts/09_isolation_by_distance.R",
   "scripts/11_isolation_by_distance.R"
 )
 

@@ -42,5 +42,6 @@ src("scripts/05_pca_dapc.R")
 
 # ---- 2) Extended analyses (safe runner; skips missing modules) ----
 src("scripts/10_run_extended_suite.R")
+src("scripts/12_environment_and_additional_metrics.R")
 
 cat("\n✅ ALL DONE.\nCheck outputs in: ", file.path(PROJECT_ROOT, "outputs", "v1"), "\n", sep = "")

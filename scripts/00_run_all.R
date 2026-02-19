@@ -1,3 +1,4 @@
+# filename: scripts/00_run_all.R
 ############################################################
 # scripts/00_run_all.R
 # One-click runner: master pipeline + all analysis modules
@@ -34,6 +35,7 @@ src <- function(path) {
 src("00_master_pipeline.R")
 
 # ---- 1) Run modular analyses (they load outputs/v1/objects/*.rds) ----
+src("scripts/01_clone_correction.R")
 src("scripts/01_clonality.R")
 src("scripts/02_hwe.R")
 src("scripts/03_structure_all_plots_S2N_bySite.R")

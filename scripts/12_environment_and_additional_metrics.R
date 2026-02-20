@@ -46,10 +46,15 @@ INPUTS_DIR <- file.path(PROJECT_ROOT, "inputs")
 dir.create(INPUTS_DIR, showWarnings = FALSE, recursive = TRUE)
 dir.create(RUN_OUT, showWarnings = FALSE, recursive = TRUE)
 
-resolve_file <- function(candidates, label) {
+resolve_file <- function(candidates, label, required = TRUE) {
   existing <- candidates[file.exists(candidates)]
   if (length(existing) == 0) {
-    stop("Missing required ", label, ". Checked:\n- ", paste(candidates, collapse = "\n- "))
+    if (required) {
+      stop("Missing required ", label, ". Checked:\n- ", paste(candidates, collapse = "\n- "))
+    } else {
+      message("Optional input missing: ", label)
+      return(NA_character_)
+    }
   }
   if (length(existing) > 1) {
     info <- file.info(existing)$mtime
@@ -61,19 +66,10 @@ resolve_file <- function(candidates, label) {
   existing[1]
 }
 
-need_files <- c(
-  file.path(RUN_OUT, "matrix_genetic_distance_nei.csv"),
-  file.path(RUN_OUT, "matrix_geographic_distance_km.csv"),
-  file.path(RUN_OUT, "allelic_richness_site_summary.csv"),
-  file.path(RUN_OUT, "hwe_by_site_by_locus.csv")
-)
-missing_inputs <- need_files[!file.exists(need_files)]
-if (length(missing_inputs) > 0) {
-  stop(
-    "Missing required input files. Expected in outputs/v1:\n- ",
-    paste(missing_inputs, collapse = "\n- "),
-    "\nRun the prior pipeline steps first."
-  )
+# Note: some downstream analyses are optional. Missing optional files are handled
+# with graceful skip messages instead of stopping the entire pipeline.
+if (!file.exists(file.path(RUN_OUT, "hwe_by_site_by_locus.csv"))) {
+  stop("Missing required input: outputs/v1/hwe_by_site_by_locus.csv")
 }
 
 # Defensive diploid handling: some upstream objects may store ploidy as a vector.
@@ -111,15 +107,24 @@ read_matrix_csv <- function(path) {
   mat
 }
 
-nei_path <- resolve_file(c(file.path(RUN_OUT, "matrix_genetic_distance_nei.csv")), "Nei distance matrix")
-geo_path <- resolve_file(c(file.path(RUN_OUT, "matrix_geographic_distance_km.csv")), "geographic distance matrix")
-nei_mat <- read_matrix_csv(nei_path)
-geo_mat <- read_matrix_csv(geo_path)
+nei_path <- resolve_file(c(file.path(RUN_OUT, "matrix_genetic_distance_nei.csv")), "Nei distance matrix", required = FALSE)
+geo_path <- resolve_file(c(file.path(RUN_OUT, "matrix_geographic_distance_km.csv")), "geographic distance matrix", required = FALSE)
 
-if (!identical(rownames(nei_mat), rownames(geo_mat))) {
-  stop("Site names do not match between Nei and geographic distance matrices in outputs/v1.")
+has_dist_mats <- !is.na(nei_path) && !is.na(geo_path)
+if (has_dist_mats) {
+  nei_mat <- read_matrix_csv(nei_path)
+  geo_mat <- read_matrix_csv(geo_path)
+  
+  if (!identical(rownames(nei_mat), rownames(geo_mat))) {
+    stop("Site names do not match between Nei and geographic distance matrices in outputs/v1.")
+  }
+  site_names <- rownames(nei_mat)
+} else {
+  message("Distance matrices not found; skipping Mantel/IBE distance-based steps.")
+  nei_mat <- NULL
+  geo_mat <- NULL
+  site_names <- sort(unique(as.character(pop(gi_work))))
 }
-site_names <- rownames(nei_mat)
 
 meta_candidates <- c(
   file.path(INPUTS_DIR, "site_metadata.csv"),
@@ -276,73 +281,91 @@ run_ibe <- function() {
   )
 }
 
-ibe_error <- tryCatch({
-  run_ibe()
-  NULL
-}, error = function(e) e)
-if (inherits(ibe_error, "error")) {
+if (has_dist_mats) {
+  ibe_error <- tryCatch({
+    run_ibe()
+    NULL
+  }, error = function(e) e)
+  if (inherits(ibe_error, "error")) {
+    writeLines(
+      c("IBE skipped due to missing/invalid elevation metadata:", conditionMessage(ibe_error)),
+      con = file.path(RUN_OUT, "mantel_elevation_results.txt")
+    )
+    writeLines(
+      c("IBE partial Mantel skipped due to missing/invalid elevation metadata:", conditionMessage(ibe_error)),
+      con = file.path(RUN_OUT, "mantel_partial_elev_given_geo.txt")
+    )
+  }
+} else {
   writeLines(
-    c("IBE skipped due to missing/invalid elevation metadata:", conditionMessage(ibe_error)),
+    "IBE skipped: matrix_genetic_distance_nei.csv and/or matrix_geographic_distance_km.csv not found.",
     con = file.path(RUN_OUT, "mantel_elevation_results.txt")
   )
   writeLines(
-    c("IBE partial Mantel skipped due to missing/invalid elevation metadata:", conditionMessage(ibe_error)),
+    "Partial Mantel skipped: distance matrix inputs not found.",
     con = file.path(RUN_OUT, "mantel_partial_elev_given_geo.txt")
   )
 }
 
 # B) Allelic richness vs elevation
-ar_path <- resolve_file(c(file.path(RUN_OUT, "allelic_richness_site_summary.csv")), "allelic richness site summary")
-ar_site <- read.csv(ar_path, stringsAsFactors = FALSE, check.names = FALSE)
-ar_name_candidates <- names(ar_site)[tolower(names(ar_site)) %in% c("mean_allelic_richness", "allelic_richness", "ar_mean", "mean_ar")]
-if (length(ar_name_candidates) == 0) {
-  numeric_cols <- names(ar_site)[sapply(ar_site, is.numeric)]
-  numeric_cols <- setdiff(numeric_cols, c("n", "n_ind", "n_individuals"))
-  ar_col <- numeric_cols[1]
-} else {
-  ar_col <- ar_name_candidates[1]
-}
-if (is.na(ar_col) || !nzchar(ar_col) || !(ar_col %in% names(ar_site))) {
-  stop("Could not identify allelic richness column in outputs/v1/allelic_richness_site_summary.csv")
-}
-if (!("Site" %in% names(ar_site))) stop("allelic_richness_site_summary.csv must include a Site column.")
-
-ar_df <- ar_site %>%
-  mutate(Site = as.character(Site)) %>%
-  left_join(site_meta %>% select(Site, elevation_m), by = "Site") %>%
-  mutate(allelic_richness = suppressWarnings(as.numeric(.data[[ar_col]])))
-
-if (all(is.na(ar_df$elevation_m))) {
+ar_path <- resolve_file(c(file.path(RUN_OUT, "allelic_richness_site_summary.csv")), "allelic richness site summary", required = FALSE)
+if (is.na(ar_path)) {
   writeLines(
-    "Skipped ar_vs_elevation: elevation_m is missing for all sites in metadata.",
+    "Skipped ar_vs_elevation: allelic_richness_site_summary.csv not found.",
     con = file.path(RUN_OUT, "ar_vs_elevation_stats.txt")
   )
 } else {
-  use_ar <- ar_df %>% filter(!is.na(elevation_m), !is.na(allelic_richness))
-  if (nrow(use_ar) < 3) {
+  ar_site <- read.csv(ar_path, stringsAsFactors = FALSE, check.names = FALSE)
+  ar_name_candidates <- names(ar_site)[tolower(names(ar_site)) %in% c("mean_allelic_richness", "allelic_richness", "ar_mean", "mean_ar")]
+  if (length(ar_name_candidates) == 0) {
+    numeric_cols <- names(ar_site)[sapply(ar_site, is.numeric)]
+    numeric_cols <- setdiff(numeric_cols, c("n", "n_ind", "n_individuals"))
+    ar_col <- numeric_cols[1]
+  } else {
+    ar_col <- ar_name_candidates[1]
+  }
+  if (is.na(ar_col) || !nzchar(ar_col) || !(ar_col %in% names(ar_site))) {
+    stop("Could not identify allelic richness column in outputs/v1/allelic_richness_site_summary.csv")
+  }
+  if (!("Site" %in% names(ar_site))) stop("allelic_richness_site_summary.csv must include a Site column.")
+  
+  ar_df <- ar_site %>%
+    mutate(Site = as.character(Site)) %>%
+    left_join(site_meta %>% select(Site, elevation_m), by = "Site") %>%
+    mutate(allelic_richness = suppressWarnings(as.numeric(.data[[ar_col]])))
+  
+  if (all(is.na(ar_df$elevation_m))) {
     writeLines(
-      "Skipped ar_vs_elevation: fewer than 3 sites with both elevation_m and allelic richness.",
+      "Skipped ar_vs_elevation: elevation_m is missing for all sites in metadata.",
       con = file.path(RUN_OUT, "ar_vs_elevation_stats.txt")
     )
   } else {
-    p_ar <- ggplot(use_ar, aes(x = elevation_m, y = allelic_richness)) +
-      geom_point(size = 2.5, alpha = 0.9, color = "#1b9e77") +
-      geom_smooth(method = "lm", se = TRUE, color = "#d95f02", fill = "#fdcc8a", linewidth = 0.9) +
-      theme_minimal(base_size = 12) +
-      labs(x = "Elevation (m)", y = "Allelic richness", title = "Allelic richness vs elevation")
-    ggsave(file.path(RUN_OUT, "ar_vs_elevation.jpeg"), p_ar, width = 8, height = 6, dpi = 350)
-    
-    pear <- cor.test(use_ar$allelic_richness, use_ar$elevation_m, method = "pearson")
-    spear <- cor.test(use_ar$allelic_richness, use_ar$elevation_m, method = "spearman", exact = FALSE)
-    writeLines(
-      c(
-        "Allelic richness vs elevation correlations",
-        paste0("n_sites_used: ", nrow(use_ar)),
-        paste0("Pearson r: ", unname(pear$estimate), "; p-value: ", pear$p.value),
-        paste0("Spearman rho: ", unname(spear$estimate), "; p-value: ", spear$p.value)
-      ),
-      con = file.path(RUN_OUT, "ar_vs_elevation_stats.txt")
-    )
+    use_ar <- ar_df %>% filter(!is.na(elevation_m), !is.na(allelic_richness))
+    if (nrow(use_ar) < 3) {
+      writeLines(
+        "Skipped ar_vs_elevation: fewer than 3 sites with both elevation_m and allelic richness.",
+        con = file.path(RUN_OUT, "ar_vs_elevation_stats.txt")
+      )
+    } else {
+      p_ar <- ggplot(use_ar, aes(x = elevation_m, y = allelic_richness)) +
+        geom_point(size = 2.5, alpha = 0.9, color = "#1b9e77") +
+        geom_smooth(method = "lm", se = TRUE, color = "#d95f02", fill = "#fdcc8a", linewidth = 0.9) +
+        theme_minimal(base_size = 12) +
+        labs(x = "Elevation (m)", y = "Allelic richness", title = "Allelic richness vs elevation")
+      ggsave(file.path(RUN_OUT, "ar_vs_elevation.jpeg"), p_ar, width = 8, height = 6, dpi = 350)
+      
+      pear <- cor.test(use_ar$allelic_richness, use_ar$elevation_m, method = "pearson")
+      spear <- cor.test(use_ar$allelic_richness, use_ar$elevation_m, method = "spearman", exact = FALSE)
+      writeLines(
+        c(
+          "Allelic richness vs elevation correlations",
+          paste0("n_sites_used: ", nrow(use_ar)),
+          paste0("Pearson r: ", unname(pear$estimate), "; p-value: ", pear$p.value),
+          paste0("Spearman rho: ", unname(spear$estimate), "; p-value: ", spear$p.value)
+        ),
+        con = file.path(RUN_OUT, "ar_vs_elevation_stats.txt")
+      )
+    }
   }
 }
 

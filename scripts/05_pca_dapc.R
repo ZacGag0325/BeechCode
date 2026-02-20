@@ -1,7 +1,7 @@
 ############################################################
 # scripts/05_pca_dapc.R
 # PCA + DAPC (non-interactive) to compare with STRUCTURE
-# Fix: handle K=2 (only 1 LD axis) without crashing
+# Fix: handle constant allele columns before PCA/DAPC
 ############################################################
 
 options(repos = c(CRAN = "https://cloud.r-project.org"))
@@ -18,8 +18,17 @@ source("scripts/_load_objects.R")
 OUTDIR <- file.path(RUN_OUT, "pca_dapc_only")
 dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 
+# Prefer clone-corrected object when available
+if (exists("gi_mll", inherits = FALSE)) {
+  gi_use <- gi_mll
+  gi_label <- "gi_mll"
+} else {
+  gi_use <- gi
+  gi_label <- "gi"
+}
+
 # Ensure pop is Site (consistent)
-pop(gi) <- as.factor(df_ids$Site[match(indNames(gi), df_ids$ind)])
+pop(gi_use) <- as.factor(df_ids$Site[match(indNames(gi_use), df_ids$ind)])
 
 save_plot <- function(p, filename, w = 7, h = 5) {
   ggsave(file.path(OUTDIR, filename), p, width = w, height = h, dpi = 200)
@@ -47,22 +56,46 @@ get_ld_df <- function(dapc_obj) {
 }
 
 ############################################################
-# 1) PCA (allele freq table -> prcomp)
+# 1) PCA (allele table -> prcomp)
 ############################################################
-cat("\n[PCA] Building PCA from allele frequency table...\n")
+cat("\n[PCA] Building PCA from allele table using ", gi_label, "...\n", sep = "")
 
-X <- adegenet::tab(gi, freq = TRUE, NA.method = "mean")  # individuals x alleles
-X <- scale(X)
+X <- adegenet::tab(gi_use, NA.method = "mean")
 
-pca <- prcomp(X, center = TRUE, scale. = FALSE)
+# Remove constant columns (zero variance) because prcomp cannot rescale them.
+# This directly fixes: "cannot rescale a constant/zero column to unit variance".
+keep_cols <- apply(X, 2, function(col) stats::var(col, na.rm = TRUE) > 0)
+message("Removing ", sum(!keep_cols), " constant columns out of ", length(keep_cols))
+X <- X[, keep_cols, drop = FALSE]
 
-pc <- as.data.frame(pca$x[, 1:2, drop = FALSE])
+write.csv(
+  data.frame(removed_cols = sum(!keep_cols)),
+  file.path(RUN_OUT, "pca_removed_constant_columns.csv"),
+  row.names = FALSE
+)
+
+# Impute any residual NA with column means for stable PCA/DAPC computations.
+if (anyNA(X)) {
+  message("Imputing remaining NA values with column means")
+  for (j in seq_len(ncol(X))) {
+    if (anyNA(X[, j])) {
+      X[is.na(X[, j]), j] <- mean(X[, j], na.rm = TRUE)
+    }
+  }
+}
+
+stopifnot(ncol(X) > 1)
+
+pca_res <- prcomp(X, center = TRUE, scale. = FALSE)
+message("PCA completed: ", nrow(X), " individuals × ", ncol(X), " variables")
+
+pc <- as.data.frame(pca_res$x[, 1:2, drop = FALSE])
 pc$ind  <- rownames(pc)
-pc$Site <- pop(gi)
+pc$Site <- pop(gi_use)
 
-keep_cols <- intersect(names(df_ids), c("ind", "Latitude", "Longitude"))
-if (length(keep_cols) > 0) {
-  pc <- merge(pc, df_ids[, keep_cols, drop = FALSE], by = "ind", all.x = TRUE)
+keep_meta_cols <- intersect(names(df_ids), c("ind", "Latitude", "Longitude"))
+if (length(keep_meta_cols) > 0) {
+  pc <- merge(pc, df_ids[, keep_meta_cols, drop = FALSE], by = "ind", all.x = TRUE)
 }
 
 p_pca12 <- ggplot(pc, aes(x = PC1, y = PC2, color = Site)) +
@@ -90,14 +123,19 @@ write.csv(pc, file.path(OUTDIR, "PCA_scores_PC1_PC2.csv"), row.names = FALSE)
 ############################################################
 cat("\n[DAPC] Running DAPC supervised by Site...\n")
 
-max_pca <- min(60, nInd(gi) - 1)
-n_pca  <- min(30, max_pca)
-n_da   <- min(nPop(gi) - 1, 10)
+grp_site <- as.factor(pop(gi_use))
+if (any(is.na(grp_site))) {
+  stop("DAPC grouping factor contains NA values in pop(gi_use).")
+}
 
-dapc_site <- adegenet::dapc(gi, pop(gi), n.pca = n_pca, n.da = n_da)
+max_pca <- min(60, nrow(X) - 1, ncol(X) - 1)
+n_pca <- min(30, max_pca)
+n_da <- min(nlevels(grp_site) - 1, 10)
+
+dapc_site <- adegenet::dapc(X, grp_site, n.pca = n_pca, n.da = n_da, scale = FALSE)
 
 dapc_df <- get_ld_df(dapc_site)
-dapc_df$Site <- pop(gi)[match(dapc_df$ind, indNames(gi))]
+dapc_df$Site <- grp_site[match(dapc_df$ind, rownames(X))]
 
 # If LD2 exists, do 2D; otherwise do 1D
 if (all(is.na(dapc_df$LD2))) {
@@ -139,20 +177,22 @@ cat("\n[DAPC] Unsupervised find.clusters with K_BEST=", K_BEST, "...\n", sep = "
 
 fc <- tryCatch(
   adegenet::find.clusters(
-    gi,
+    X,
     max.n.clust = 20,
     n.pca = N_PCA_FC,
     choose.n.clust = FALSE,
-    n.clust = K_BEST
+    n.clust = K_BEST,
+    scale = FALSE
   ),
   error = function(e) {
     tryCatch(
       adegenet::find.clusters(
-        gi,
+        X,
         max.n.clust = 20,
         n.pca = N_PCA_FC,
         choose.n.clust = FALSE,
-        k = K_BEST
+        k = K_BEST,
+        scale = FALSE
       ),
       error = function(e2) {
         message("[DAPC] find.clusters failed (signature mismatch). Skipping unsupervised DAPC.\n  ",
@@ -167,11 +207,11 @@ if (!is.null(fc)) {
   # For K=2, n.da max is 1
   n_da_k <- min(K_BEST - 1, 10)
   
-  dapc_k <- adegenet::dapc(gi, fc$grp, n.pca = N_PCA_FC, n.da = n_da_k)
+  dapc_k <- adegenet::dapc(X, fc$grp, n.pca = N_PCA_FC, n.da = n_da_k, scale = FALSE)
   
   dk <- get_ld_df(dapc_k)
-  dk$Cluster <- as.factor(fc$grp)[match(dk$ind, indNames(gi))]
-  dk$Site    <- pop(gi)[match(dk$ind, indNames(gi))]
+  dk$Cluster <- as.factor(fc$grp)[match(dk$ind, rownames(X))]
+  dk$Site <- grp_site[match(dk$ind, rownames(X))]
   
   # Plot: if only LD1 exists (K=2), make a 1D jitter plot
   if (all(is.na(dk$LD2))) {

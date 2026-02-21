@@ -74,6 +74,13 @@ read_best_excel_sheet <- function(path) {
   sheets <- readxl::excel_sheets(path)
   if (length(sheets) == 0) stop("Excel file has no sheets: ", path)
   
+  # Prefer explicit arbre sheet when present (tree/stand structure source).
+  if ("arbre" %in% sheets) {
+    df <- read_tabular(path, sheet = "arbre")
+    message_info("Excel detected; selected sheet: arbre (explicit stand structure source)")
+    return(df)
+  }
+  
   best_score <- -Inf
   best_sheet <- sheets[1]
   best_df <- NULL
@@ -149,37 +156,42 @@ if (selected_ext %in% c("xlsx", "xls")) {
 if (nrow(raw_df) == 0) stop("Selected dataset is empty: ", selected_file)
 
 # 2) Detect columns + clean ---------------------------------------------------
+# arbre sheet variables (French labels):
+# - Site: site identifier
+# - Dhp_cm: DBH (diameter at breast height, cm)
+# - Espece: species code
+# - Etat: status (V = vivant/alive, M = mort/dead)
 site_col <- find_best_column(raw_df, c("site", "population", "pop", "site_id", "population_id", "stand", "plot"))
-dbh_col <- find_best_column(raw_df, c("dbh", "dbh_cm", "diameter", "diameter_cm", "d130", "cap", "dhp", "dhp_tige"))
+dbh_col <- find_best_column(raw_df, c("dbh", "dbh_cm", "diameter", "diameter_cm", "d130", "cap", "dhp", "dhp_tige", "dhp_cm"))
 height_col <- find_best_column(raw_df, c("height", "ht", "height_m", "tree_height"))
-status_col <- find_best_column(raw_df, c("status", "alive_dead", "vital_status", "state"))
+status_col <- find_best_column(raw_df, c("status", "alive_dead", "vital_status", "state", "etat"))
 species_col <- find_best_column(raw_df, c("species", "taxon", "sp", "species_name", "espece"))
-regen_col <- find_best_column(raw_df, c("regeneration_class", "regen", "size_class", "stage", "life_stage", "class"))
 area_col <- find_best_column(raw_df, c("plot_area", "area", "area_ha", "sample_area", "site_area"))
 
 if (is.null(site_col)) stop("No Site-like column detected.")
 if (is.null(dbh_col)) stop("No DBH-like column detected.")
+if (is.null(status_col)) {
+  stop("No Status-like column detected in arbre sheet. Expected a column like 'Etat' (V/M).")
+}
 
 message_info("Detected columns:")
 message_info("  Site: ", site_col)
 message_info("  DBH: ", dbh_col)
 message_info("  Height: ", ifelse(is.null(height_col), "<missing>", height_col))
-message_info("  Status: ", ifelse(is.null(status_col), "<missing>", status_col))
+message_info("  Status: ", status_col)
 message_info("  Species: ", ifelse(is.null(species_col), "<missing>", species_col))
-message_info("  Regeneration class: ", ifelse(is.null(regen_col), "<missing>", regen_col))
 message_info("  Area: ", ifelse(is.null(area_col), "<missing>", area_col))
 
 df <- raw_df %>%
   mutate(
     Site = as.factor(.data[[site_col]]),
     DBH = suppressWarnings(readr::parse_number(as.character(.data[[dbh_col]]))),
-    DBH_invalid = is.na(DBH) | DBH < 0
+    DBH_invalid = is.na(DBH) | DBH < 0,
+    Status = as.character(.data[[status_col]])
   )
 
 if (!is.null(height_col)) df <- df %>% mutate(Height = suppressWarnings(readr::parse_number(as.character(.data[[height_col]]))))
-if (!is.null(status_col)) df <- df %>% mutate(Status = as.character(.data[[status_col]]))
 if (!is.null(species_col)) df <- df %>% mutate(Species = as.character(.data[[species_col]]))
-if (!is.null(regen_col)) df <- df %>% mutate(Regeneration_Class = as.character(.data[[regen_col]]))
 if (!is.null(area_col)) df <- df %>% mutate(Area = suppressWarnings(readr::parse_number(as.character(.data[[area_col]]))))
 
 invalid_n <- sum(df$DBH_invalid, na.rm = TRUE)
@@ -197,6 +209,8 @@ basic_summary <- df %>%
   group_by(Site) %>%
   summarize(
     N_individuals = n(),
+    N_alive = sum(stringr::str_to_upper(stringr::str_squish(Status)) %in% c("V", "ALIVE"), na.rm = TRUE),
+    N_dead = sum(stringr::str_to_upper(stringr::str_squish(Status)) %in% c("M", "DEAD"), na.rm = TRUE),
     Mean_DBH = mean(DBH[!DBH_invalid], na.rm = TRUE),
     SD_DBH = sd(DBH[!DBH_invalid], na.rm = TRUE),
     Median_DBH = median(DBH[!DBH_invalid], na.rm = TRUE),
@@ -225,35 +239,6 @@ dbh_dist <- df_valid_dbh %>%
 
 readr::write_csv(dbh_dist, file.path(out_dir, "dbh_class_distribution_by_site.csv"))
 
-if (!is.null(regen_col)) {
-  regen_tbl <- df %>%
-    mutate(
-      Regen_group = normalize_name(Regeneration_Class),
-      Regen_group = case_when(
-        stringr::str_detect(Regen_group, "seed") ~ "seedling",
-        stringr::str_detect(Regen_group, "sap") ~ "sapling",
-        stringr::str_detect(Regen_group, "adult|mature|tree") ~ "adult",
-        TRUE ~ Regen_group
-      )
-    ) %>%
-    group_by(Site, Regen_group) %>%
-    summarize(n_individuals = n(), .groups = "drop") %>%
-    group_by(Site) %>%
-    mutate(prop_percent = 100 * n_individuals / sum(n_individuals)) %>%
-    ungroup()
-} else {
-  message_warn("No regeneration class detected. Using DBH < 10 cm as regeneration.")
-  regen_tbl <- df_valid_dbh %>%
-    mutate(Regen_group = ifelse(DBH < 10, "regeneration", "adult")) %>%
-    group_by(Site, Regen_group) %>%
-    summarize(n_individuals = n(), .groups = "drop") %>%
-    group_by(Site) %>%
-    mutate(prop_percent = 100 * n_individuals / sum(n_individuals)) %>%
-    ungroup()
-}
-
-readr::write_csv(regen_tbl, file.path(out_dir, "regeneration_summary_by_site.csv"))
-
 if (!is.null(species_col)) {
   species_tbl <- df %>%
     mutate(
@@ -275,20 +260,98 @@ if (!is.null(species_col)) {
   message_warn("Species column missing; skipping species composition output.")
 }
 
-regen_wide <- regen_tbl %>%
-  select(Site, Regen_group, prop_percent) %>%
-  mutate(metric = paste0("regen_prop_", normalize_name(Regen_group), "_pct")) %>%
-  select(-Regen_group) %>%
-  pivot_wider(names_from = metric, values_from = prop_percent, values_fill = 0)
+# 4) Regeneration tables from dedicated 'regeneration' sheet -----------------
+regen_total_by_site <- NULL
+regen_by_site_species <- NULL
+regen_by_site_subplot_species <- NULL
 
-pub_ready <- basic_summary %>%
-  mutate(mean_dbh_sd = ifelse(is.na(Mean_DBH), NA_character_, paste0(round(Mean_DBH, 2), " ± ", round(SD_DBH, 2)))) %>%
-  left_join(regen_wide, by = "Site") %>%
-  select(Site, N_individuals, mean_dbh_sd, Median_DBH, Min_DBH, Max_DBH, pct_missing_DBH, Stem_density, starts_with("regen_prop_"))
+if (selected_ext %in% c("xlsx", "xls")) {
+  sheets <- readxl::excel_sheets(selected_file)
+  if (!("regeneration" %in% sheets)) {
+    message_warn("Sheet 'regeneration' not found in Excel file. Regeneration tables will be skipped.")
+  } else {
+    regen_raw <- read_tabular(selected_file, sheet = "regeneration")
+    
+    req_regen <- c("Site", "Espece", "Compte")
+    miss_regen <- setdiff(req_regen, names(regen_raw))
+    if (length(miss_regen) > 0) {
+      stop("Sheet 'regeneration' is missing required column(s): ", paste(miss_regen, collapse = ", "),
+           ". Expected at least: Site, Espece, Compte.")
+    }
+    
+    if (!("Id_spa" %in% names(regen_raw))) {
+      message_warn("Column 'Id_spa' not found in regeneration sheet; subplot table will use NA for Id_spa.")
+      regen_raw <- regen_raw %>% mutate(Id_spa = NA_character_)
+    }
+    
+    regen_df <- regen_raw %>%
+      transmute(
+        Site = as.factor(Site),
+        Id_spa = as.character(Id_spa),
+        Espece = as.character(Espece),
+        Compte = suppressWarnings(readr::parse_number(as.character(Compte)))
+      ) %>%
+      mutate(Compte = ifelse(is.na(Compte), 0, Compte))
+    
+    # Site consistency checks between arbre and regeneration
+    site_arbre <- sort(unique(as.character(df$Site)))
+    site_regen <- sort(unique(as.character(regen_df$Site)))
+    
+    only_arbre <- setdiff(site_arbre, site_regen)
+    only_regen <- setdiff(site_regen, site_arbre)
+    
+    if (length(only_arbre) > 0) {
+      message_warn("Sites present in arbre but missing in regeneration: ", paste(only_arbre, collapse = ", "))
+    }
+    if (length(only_regen) > 0) {
+      message_warn("Sites present in regeneration but missing in arbre: ", paste(only_regen, collapse = ", "))
+    }
+    
+    regen_total_by_site <- regen_df %>%
+      group_by(Site) %>%
+      summarize(regeneration_total_compte = sum(Compte, na.rm = TRUE), .groups = "drop")
+    
+    regen_by_site_species <- regen_df %>%
+      group_by(Site, Espece) %>%
+      summarize(regeneration_compte = sum(Compte, na.rm = TRUE), .groups = "drop")
+    
+    regen_by_site_subplot_species <- regen_df %>%
+      group_by(Site, Id_spa, Espece) %>%
+      summarize(regeneration_compte = sum(Compte, na.rm = TRUE), .groups = "drop")
+    
+    readr::write_csv(regen_total_by_site, file.path(out_dir, "regeneration_total_by_site.csv"))
+    readr::write_csv(regen_by_site_species, file.path(out_dir, "regeneration_by_site_species.csv"))
+    readr::write_csv(regen_by_site_subplot_species, file.path(out_dir, "regeneration_by_site_subplot_species.csv"))
+    
+    message_info("Regeneration tables created from sheet 'regeneration'.")
+  }
+} else {
+  message_warn("Selected dataset is not an Excel workbook; regeneration sheet workflow skipped.")
+}
+
+# Keep publication-ready output consistent with pipeline, now using regeneration sheet totals.
+if (!is.null(regen_total_by_site)) {
+  pub_ready <- basic_summary %>%
+    left_join(regen_total_by_site, by = "Site") %>%
+    mutate(
+      regeneration_total_compte = replace_na(regeneration_total_compte, 0),
+      mean_dbh_sd = ifelse(is.na(Mean_DBH), NA_character_, paste0(round(Mean_DBH, 2), " ± ", round(SD_DBH, 2)))
+    ) %>%
+    select(Site, N_individuals, N_alive, N_dead, mean_dbh_sd, Median_DBH, Min_DBH, Max_DBH, pct_missing_DBH, Stem_density, regeneration_total_compte)
+} else {
+  pub_ready <- basic_summary %>%
+    mutate(mean_dbh_sd = ifelse(is.na(Mean_DBH), NA_character_, paste0(round(Mean_DBH, 2), " ± ", round(SD_DBH, 2)))) %>%
+    select(Site, N_individuals, N_alive, N_dead, mean_dbh_sd, Median_DBH, Min_DBH, Max_DBH, pct_missing_DBH, Stem_density)
+}
 
 readr::write_csv(pub_ready, file.path(out_dir, "publication_ready_site_table.csv"))
 
-# 4) Short suggestions linking to genetic results ----------------------------
+# Additional clear filename requested
+stand_structure_tree_tables <- basic_summary %>%
+  left_join(dbh_dist %>% select(Site, DBH_class, n_individuals, prop_percent), by = "Site")
+readr::write_csv(stand_structure_tree_tables, file.path(out_dir, "stand_structure_tree_tables.csv"))
+
+# 5) Short suggestions linking to genetic results -----------------------------
 message_info("Suggested links with genetics:")
 message_info(" - Join site stand metrics with clonality (MLG/MLL richness) by Site.")
 message_info(" - Model He / allelic richness as a function of regeneration structure.")

@@ -1,21 +1,23 @@
-
 ############################################################
 # scripts/11_isolation_by_distance.R
-# Isolation by Distance (population-level)
+# Isolation by Distance (population-level Mantel: Nei vs geographic)
 ############################################################
 
 options(repos = c(CRAN = "https://cloud.r-project.org"))
-pkgs <- c("adegenet", "dplyr", "tidyr", "tibble", "ggplot2", "vegan", "geosphere")
+pkgs <- c("readxl", "dplyr", "tibble", "tidyr", "stringr", "adegenet", "poppr", "vegan", "geosphere", "ggplot2")
 for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
 
 suppressPackageStartupMessages({
-  library(adegenet)
+  library(readxl)
   library(dplyr)
-  library(tidyr)
   library(tibble)
-  library(ggplot2)
+  library(tidyr)
+  library(stringr)
+  library(adegenet)
+  library(poppr)
   library(vegan)
   library(geosphere)
+  library(ggplot2)
 })
 
 set.seed(123)
@@ -38,219 +40,300 @@ find_project_root <- function() {
   stop("Cannot find project root containing scripts/_load_objects.R. Open BeechCode project first.")
 }
 
-normalize_site <- function(x) toupper(trimws(as.character(x)))
+normalize_site <- function(x) {
+  x <- str_to_upper(str_squish(as.character(x)))
+  x[nchar(x) == 0] <- NA_character_
+  x
+}
 
-extract_site_coords <- function(df, source_name = "unknown") {
-  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(NULL)
-  
-  nms <- names(df)
-  nms_low <- tolower(nms)
-  
-  site_col <- nms[match(TRUE, nms_low %in% c("site", "population", "pop", "site_code", "code_site"), nomatch = 0)]
-  lat_col <- nms[match(TRUE, nms_low %in% c("latitude", "lat"), nomatch = 0)]
-  lon_col <- nms[match(TRUE, nms_low %in% c("longitude", "lon", "long", "lng"), nomatch = 0)]
-  
-  if (length(site_col) == 0 || length(lat_col) == 0 || length(lon_col) == 0 || !nzchar(site_col) || !nzchar(lat_col) || !nzchar(lon_col)) {
-    return(NULL)
+read_required_sheet <- function(path, sheet, required_cols) {
+  out <- readxl::read_xlsx(path, sheet = sheet)
+  miss <- setdiff(required_cols, names(out))
+  if (length(miss) > 0) {
+    stop("Sheet '", sheet, "' in ", basename(path), " is missing columns: ", paste(miss, collapse = ", "))
   }
-  
-  # optional grouping column for partial Mantel
-  region_col <- nms[match(TRUE, nms_low %in% c("region_ns", "region", "north_south", "group", "zone"), nomatch = 0)]
-  
-  out <- tibble(
-    Site_raw = as.character(df[[site_col]]),
-    Latitude = suppressWarnings(as.numeric(df[[lat_col]])),
-    Longitude = suppressWarnings(as.numeric(df[[lon_col]])),
-    source = source_name
-  )
-  
-  out$Region_NS <- if (length(region_col) > 0 && nzchar(region_col)) as.character(df[[region_col]]) else NA_character_
-  out$Site_norm <- normalize_site(out$Site_raw)
   out
 }
 
-setwd(find_project_root())
+find_existing_nei_matrix <- function(path) {
+  sh <- readxl::excel_sheets(path)
+  nei_sheet <- sh[str_detect(str_to_lower(sh), "nei")]
+  if (length(nei_sheet) > 0) {
+    return(list(found = TRUE, reason = paste0("Sheet name suggests Nei matrix: ", paste(nei_sheet, collapse = ", "))))
+  }
+  list(found = FALSE, reason = "No sheet name indicates a precomputed Nei matrix in the input workbooks.")
+}
+
+PROJECT_ROOT <- find_project_root()
+setwd(PROJECT_ROOT)
 source(file.path("scripts", "_load_objects.R"))
 
+RUN_OUT <- if (exists("RUN_OUT", inherits = TRUE)) get("RUN_OUT", inherits = TRUE) else file.path(PROJECT_ROOT, "outputs", "v1")
 OUTDIR <- file.path(RUN_OUT, "ibd_only")
 dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
 
-if (!inherits(gi, "genind")) stop("Object 'gi' must be a genind object.")
-site_levels <- normalize_site(levels(pop(gi)))
-levels(pop(gi)) <- site_levels
+# Input paths requested by user
+field_xlsx <- "/mnt/data/donnees_modifiees_west_summer2024 copie.xlsx"
+geno_xlsx <- "/mnt/data/poppr.xlsx"
 
-if (length(site_levels) < 2) stop("Need at least 2 populations/sites in pop(gi) to run IBD.")
+if (!file.exists(field_xlsx)) stop("Field workbook not found: ", field_xlsx)
+if (!file.exists(geno_xlsx)) stop("Genotype workbook not found: ", geno_xlsx)
 
-site_lookup <- tibble(Site = site_levels, Site_norm = site_levels)
+# -----------------------------------------------------------------------------
+# Variable dictionary (French -> English)
+# -----------------------------------------------------------------------------
+# point_prisme: prism point orientation (N, SE, or SO)
+# valeur_prisme: prism inclusion class (2 = tree inside plot; 1 = tree on boundary)
+# espece: 3-letter botanical species code
+# DHP_cm: DBH (diameter at breast height) in cm
+# etat: tree status (V = alive, M = dead)
+# MCH: beech bark disease presence/absence for Fagus grandifolia (P/A; NA for others)
+# p_rec_MCH: percent stem covered by MCH (class)
+# dep_MCH: decline class (1/2/3)
+# mo: organic layer thickness
+# surface: charcoal presence/absence (P/A)
+# r_utilise: radius used around prism point (e.g., 3.57 m)
+# compte: regeneration/sapling count per species in subplot
+# id_spa: regeneration subplot id (starts North, then clockwise)
+# id_tige: sampled stem id (1-24 per site)
+# dhp_tige: DBH for each sampled stem
+# point_gps: GPS coordinates for each sampled stem
+# strate: canopy stratum (inf/moy/sup)
 
-meta_coords <- extract_site_coords(meta, "meta")
-df_ids_coords <- extract_site_coords(df_ids, "df_ids")
-coord_candidates <- bind_rows(meta_coords, df_ids_coords)
+# -----------------------------------------------------------------------------
+# 1) Read and standardize required sheets/columns
+# -----------------------------------------------------------------------------
+field_genetique <- read_required_sheet(
+  field_xlsx,
+  "genetique",
+  c("Site", "Id_tige", "Dhp_tige", "Name_terrain", "Nom_Labo_Échantillons", "Geometrytype", "Latitude", "Longitude", "Elevation", "Geoidoffset")
+) %>%
+  transmute(
+    Site = as.character(Site),
+    Nom_Labo_Échantillons = as.character(Nom_Labo_Échantillons),
+    Latitude = suppressWarnings(as.numeric(Latitude)),
+    Longitude = suppressWarnings(as.numeric(Longitude))
+  )
 
-if (nrow(coord_candidates) == 0) {
-  stop("Could not find Site + Latitude + Longitude columns in loaded objects (meta/df_ids).")
-}
+# Read other sheets (structure check + cleaning readiness)
+field_arbre <- read_required_sheet(field_xlsx, "arbre", c("Site", "Point_prisme", "Valeur_prisme", "Espece", "Dhp_cm", "Etat", "Mch", "P_rec_mch", "Dep_mch", "St_tige", "Nb_tiges_ha"))
+field_gaule <- read_required_sheet(field_xlsx, "gaule", c("Site", "Point_prisme", "R_utilise", "Espece", "Dhp_cm", "Etat", "Mch", "P_rec_mch", "Dep_mch"))
+field_regen <- read_required_sheet(field_xlsx, "regeneration", c("Site", "Id_spa", "Espece", "Compte"))
+field_veg <- read_required_sheet(field_xlsx, "vegetation", c("Site", "Espece", "Nombre"))
+field_sol <- read_required_sheet(field_xlsx, "sol", c("Site", "Id_spa", "Mo", "Surface"))
+field_dict <- read_required_sheet(field_xlsx, "dictionnaire", names(readxl::read_xlsx(field_xlsx, sheet = "dictionnaire", n_max = 0)))
 
-coord_summary <- coord_candidates %>%
-  filter(!is.na(Site_norm) & nzchar(Site_norm)) %>%
-  inner_join(site_lookup, by = "Site_norm") %>%
-  filter(!is.na(Latitude), !is.na(Longitude)) %>%
+geno_ind <- read_required_sheet(geno_xlsx, "Genotypes-Indiv.", c("Nom_Labo_Échantillons", "Numéro_Population"))
+legend_sites <- read_required_sheet(geno_xlsx, "Légende-Sites", c("Numéro_Population", "Nom_Terrain"))
+
+# -----------------------------------------------------------------------------
+# 2) Build one coordinate per Site (centroids from genetique sheet)
+# -----------------------------------------------------------------------------
+site_centroids <- field_genetique %>%
+  mutate(Site = normalize_site(Site)) %>%
+  filter(!is.na(Site)) %>%
   group_by(Site) %>%
   summarise(
     Latitude = mean(Latitude, na.rm = TRUE),
     Longitude = mean(Longitude, na.rm = TRUE),
-    Region_NS = dplyr::first(Region_NS[!is.na(Region_NS) & nzchar(trimws(Region_NS))]),
-    n_rows = n(),
-    source = paste(sort(unique(source)), collapse = ","),
+    n_stems_with_gps = sum(!is.na(Latitude) & !is.na(Longitude)),
     .groups = "drop"
+  ) %>%
+  mutate(
+    Latitude = ifelse(is.nan(Latitude), NA_real_, Latitude),
+    Longitude = ifelse(is.nan(Longitude), NA_real_, Longitude)
   )
 
-coord_summary <- site_lookup %>%
-  select(Site) %>%
-  left_join(coord_summary, by = "Site")
+# -----------------------------------------------------------------------------
+# 3) Build genind from poppr-style Excel and compute Nei distance by population
+# -----------------------------------------------------------------------------
+legend_clean <- legend_sites %>%
+  transmute(
+    Numéro_Population = as.character(Numéro_Population),
+    Site = normalize_site(Nom_Terrain)
+  ) %>%
+  filter(!is.na(Numéro_Population), !is.na(Site)) %>%
+  distinct(Numéro_Population, .keep_all = TRUE)
 
-missing_sites <- coord_summary$Site[is.na(coord_summary$Latitude) | is.na(coord_summary$Longitude)]
-if (length(missing_sites) > 0) {
-  stop("Missing Latitude/Longitude for sites: ", paste(missing_sites, collapse = ", "))
+geno_clean <- geno_ind %>%
+  mutate(
+    Nom_Labo_Échantillons = as.character(Nom_Labo_Échantillons),
+    Numéro_Population = as.character(`Numéro_Population`)
+  ) %>%
+  left_join(legend_clean, by = "Numéro_Population")
+
+locus_cols <- names(geno_clean)[str_detect(names(geno_clean), "_[12]$")]
+if (length(locus_cols) == 0) {
+  stop("No locus allele columns found (expected names like sfc_0036_1, sfc_0036_2).")
 }
 
-# optional derived Region_NS if absent
-if (all(is.na(coord_summary$Region_NS) | !nzchar(trimws(coord_summary$Region_NS)))) {
-  med_lat <- stats::median(coord_summary$Latitude, na.rm = TRUE)
-  coord_summary <- coord_summary %>%
-    mutate(Region_NS = ifelse(Latitude >= med_lat, "NORTH", "SOUTH"))
-  message("Region_NS not found in metadata; derived from median latitude.")
+loci_base <- unique(str_remove(locus_cols, "_[12]$"))
+allele_df <- data.frame(row.names = geno_clean$Nom_Labo_Échantillons, stringsAsFactors = FALSE)
+for (loc in loci_base) {
+  a1 <- paste0(loc, "_1")
+  a2 <- paste0(loc, "_2")
+  if (!all(c(a1, a2) %in% names(geno_clean))) next
+  allele_df[[loc]] <- paste0(as.character(geno_clean[[a1]]), "/", as.character(geno_clean[[a2]]))
 }
 
-coords <- coord_summary %>%
-  select(Site, Latitude, Longitude, Region_NS, n_rows, source)
+if (ncol(allele_df) == 0) stop("No paired loci (_1/_2) available to build genind object.")
 
-# Genetic distances (population-level Nei)
-nei_obj <- tryCatch(
-  adegenet::dist.genpop(adegenet::genind2genpop(gi), method = 1),
-  error = function(e) e
+if (anyDuplicated(rownames(allele_df)) > 0) {
+  keep <- !duplicated(rownames(allele_df))
+  allele_df <- allele_df[keep, , drop = FALSE]
+  geno_clean <- geno_clean[keep, , drop = FALSE]
+}
+
+gi_from_excel <- adegenet::df2genind(
+  X = allele_df,
+  sep = "/",
+  ploidy = 2,
+  ncode = 3,
+  ind.names = rownames(allele_df),
+  pop = as.factor(geno_clean$Site),
+  NA.char = c("NA", "NA/NA", "<NA>/<NA>", "-/-", "0/0")
 )
-if (inherits(nei_obj, "error")) stop("Could not compute genetic distances (Nei): ", nei_obj$message)
+
+# Drop individuals with missing population label after legend join
+missing_pop_inds <- which(is.na(pop(gi_from_excel)) | pop(gi_from_excel) == "NA")
+if (length(missing_pop_inds) > 0) gi_from_excel <- gi_from_excel[-missing_pop_inds]
+
+if (nInd(gi_from_excel) < 2) stop("Not enough individuals with mapped population labels.")
+
+gp <- adegenet::genind2genpop(gi_from_excel)
+nei_obj <- tryCatch(poppr::nei.dist(gp), error = function(e) e)
+if (inherits(nei_obj, "error")) {
+  nei_obj <- tryCatch(adegenet::dist.genpop(gp, method = 1), error = function(e) e)
+}
+if (inherits(nei_obj, "error")) stop("Could not compute Nei distance matrix: ", nei_obj$message)
 
 gen_mat <- as.matrix(nei_obj)
 rownames(gen_mat) <- normalize_site(rownames(gen_mat))
 colnames(gen_mat) <- normalize_site(colnames(gen_mat))
-
-gen_aligned <- matrix(NA_real_, nrow = length(site_levels), ncol = length(site_levels), dimnames = list(site_levels, site_levels))
-diag(gen_aligned) <- 0
-common <- intersect(site_levels, intersect(rownames(gen_mat), colnames(gen_mat)))
-if (length(common) >= 2) {
-  gen_aligned[common, common] <- gen_mat[common, common, drop = FALSE]
-}
-gen_mat <- (gen_aligned + t(gen_aligned)) / 2
+gen_mat <- (gen_mat + t(gen_mat)) / 2
 diag(gen_mat) <- 0
 
-# Geographic great-circle distances (km)
-coords <- coords %>% arrange(match(Site, site_levels))
-geo_m <- geosphere::distm(as.matrix(coords[, c("Longitude", "Latitude")]), fun = geosphere::distHaversine)
-geo_mat <- geo_m / 1000
-rownames(geo_mat) <- coords$Site
-colnames(geo_mat) <- coords$Site
-geo_mat <- (geo_mat + t(geo_mat)) / 2
-diag(geo_mat) <- 0
-geo_mat <- geo_mat[site_levels, site_levels, drop = FALSE]
-
-if (any(is.na(geo_mat[upper.tri(geo_mat)]))) {
-  stop("Geographic distance matrix contains NA off-diagonal values.")
+# Optional Bruvo at individual level (not used for population Mantel)
+bruvo_available <- FALSE
+if (inherits(gi_from_excel, "genind") && nInd(gi_from_excel) > 1) {
+  bruvo_available <- TRUE
 }
 
-pair_idx <- which(upper.tri(gen_mat, diag = FALSE), arr.ind = TRUE)
-pairs_tbl <- tibble(
-  site1 = rownames(gen_mat)[pair_idx[, 1]],
-  site2 = colnames(gen_mat)[pair_idx[, 2]],
-  geo_km = geo_mat[pair_idx],
-  gen_dist = gen_mat[pair_idx]
-)
+# -----------------------------------------------------------------------------
+# 4) Geographic matrix from centroid coordinates (great-circle, km)
+# -----------------------------------------------------------------------------
+coord_ok <- site_centroids %>% filter(!is.na(Latitude), !is.na(Longitude))
 
-scatter_df <- pairs_tbl %>% filter(is.finite(geo_km), is.finite(gen_dist))
-if (nrow(scatter_df) < 3) stop("Not enough complete pairwise comparisons for IBD (need at least 3).")
+# -----------------------------------------------------------------------------
+# 5) Align both matrices on the exact same site set/order + report dropped sites
+# -----------------------------------------------------------------------------
+sites_in_gen <- rownames(gen_mat)
+sites_in_geo <- coord_ok$Site
 
+all_sites <- sort(unique(c(sites_in_gen, sites_in_geo)))
+drop_tbl <- tibble(Site = all_sites) %>%
+  mutate(
+    has_genetic = Site %in% sites_in_gen,
+    has_coordinates = Site %in% sites_in_geo,
+    drop_reason = case_when(
+      has_genetic & has_coordinates ~ NA_character_,
+      !has_genetic & has_coordinates ~ "Missing genotypes/population mapping",
+      has_genetic & !has_coordinates ~ "Missing or invalid coordinates",
+      TRUE ~ "Missing both genetics and coordinates"
+    )
+  )
+
+sites_keep <- drop_tbl %>% filter(is.na(drop_reason)) %>% pull(Site)
+
+if (length(sites_keep) < 3) {
+  stop("Need at least 3 sites after alignment. Kept: ", length(sites_keep))
+}
+
+coord_keep <- coord_ok %>% filter(Site %in% sites_keep) %>% arrange(match(Site, sites_keep))
+geo_mat <- geosphere::distm(as.matrix(coord_keep[, c("Longitude", "Latitude")]), fun = geosphere::distHaversine) / 1000
+rownames(geo_mat) <- coord_keep$Site
+colnames(geo_mat) <- coord_keep$Site
+geo_mat <- (geo_mat + t(geo_mat)) / 2
+diag(geo_mat) <- 0
+
+gen_mat <- gen_mat[sites_keep, sites_keep, drop = FALSE]
+geo_mat <- geo_mat[sites_keep, sites_keep, drop = FALSE]
+
+if (!identical(rownames(gen_mat), rownames(geo_mat))) stop("Matrix row names are not aligned after filtering.")
+if (!identical(colnames(gen_mat), colnames(geo_mat))) stop("Matrix column names are not aligned after filtering.")
+if (any(is.na(gen_mat[upper.tri(gen_mat)]))) stop("Genetic matrix contains NA off-diagonal values.")
+if (any(is.na(geo_mat[upper.tri(geo_mat)]))) stop("Geographic matrix contains NA off-diagonal values.")
+
+# -----------------------------------------------------------------------------
+# 6) Mantel test + outputs
+# -----------------------------------------------------------------------------
 mantel_out <- vegan::mantel(
-  xdis = stats::as.dist(gen_mat),
-  ydis = stats::as.dist(geo_mat),
+  xdis = as.dist(gen_mat),
+  ydis = as.dist(geo_mat),
   method = "pearson",
   permutations = 9999
 )
 
-mantel_tbl <- tibble(
-  analysis = "mantel_nei_vs_geo",
-  statistic_r = as.numeric(mantel_out$statistic),
-  p_value = as.numeric(mantel_out$signif),
-  permutations = as.integer(mantel_out$permutations),
-  n_pairs_used = nrow(scatter_df)
+pair_idx <- which(upper.tri(gen_mat), arr.ind = TRUE)
+scatter_df <- tibble(
+  Site1 = rownames(gen_mat)[pair_idx[, 1]],
+  Site2 = colnames(gen_mat)[pair_idx[, 2]],
+  Geographic_km = geo_mat[pair_idx],
+  Nei_distance = gen_mat[pair_idx]
 )
 
-# Optional partial Mantel (only if >=2 non-empty groups)
-region_clean <- toupper(trimws(coords$Region_NS))
-region_ok <- !is.na(region_clean) & nzchar(region_clean)
-if (sum(region_ok) >= 2 && length(unique(region_clean[region_ok])) >= 2) {
-  reg_num <- as.numeric(factor(region_clean, levels = unique(region_clean)))
-  reg_dist <- as.matrix(dist(reg_num, diag = TRUE, upper = TRUE))
-  rownames(reg_dist) <- coords$Site
-  colnames(reg_dist) <- coords$Site
-  reg_dist <- reg_dist[site_levels, site_levels, drop = FALSE]
-  
-  partial_out <- tryCatch(
-    vegan::mantel.partial(
-      xdis = stats::as.dist(gen_mat),
-      ydis = stats::as.dist(geo_mat),
-      zdis = stats::as.dist(reg_dist),
-      method = "pearson",
-      permutations = 9999
-    ),
-    error = function(e) e
-  )
-  
-  if (!inherits(partial_out, "error")) {
-    mantel_tbl <- bind_rows(
-      mantel_tbl,
-      tibble(
-        analysis = "partial_mantel_nei_vs_geo_given_region",
-        statistic_r = as.numeric(partial_out$statistic),
-        p_value = as.numeric(partial_out$signif),
-        permutations = as.integer(partial_out$permutations),
-        n_pairs_used = nrow(scatter_df)
-      )
-    )
-  } else {
-    message("Partial Mantel skipped: ", partial_out$message)
-  }
-} else {
-  message("Partial Mantel skipped: Region_NS has <2 groups.")
-}
-
-p_scatter <- ggplot(scatter_df, aes(x = geo_km, y = gen_dist)) +
+p <- ggplot(scatter_df, aes(x = Geographic_km, y = Nei_distance)) +
   geom_point(size = 2, alpha = 0.9, color = "#1f78b4") +
   geom_smooth(method = "lm", se = TRUE, color = "#d7301f", fill = "#fcae91", linewidth = 0.9) +
   theme_minimal(base_size = 12) +
   labs(
-    title = "Isolation by Distance (Population-Level)",
+    title = "Mantel test at population level",
+    subtitle = paste0("r = ", signif(as.numeric(mantel_out$statistic), 4), ", p = ", signif(as.numeric(mantel_out$signif), 4)),
     x = "Geographic distance (km)",
     y = "Nei genetic distance"
   )
 
-ggsave(file.path(OUTDIR, "ibd_scatter_nei_vs_geo.png"), p_scatter, width = 8, height = 6, dpi = 300)
+ggsave(file.path(OUTDIR, "ibd_scatter_nei_vs_geo.png"), p, width = 8, height = 6, dpi = 300)
 
-write.csv(coords, file.path(OUTDIR, "site_coordinates_used.csv"), row.names = FALSE)
-write.csv(geo_mat, file.path(OUTDIR, "matrix_geographic_distance_km.csv"), row.names = TRUE)
-write.csv(gen_mat, file.path(OUTDIR, "matrix_genetic_distance_nei.csv"), row.names = TRUE)
-write.csv(pairs_tbl, file.path(OUTDIR, "ibd_pairwise_table.csv"), row.names = FALSE)
-write.csv(mantel_tbl, file.path(OUTDIR, "mantel_results.csv"), row.names = FALSE)
-
-writeLines(
-  c(
-    "Isolation-by-Distance (population-level)",
-    paste0("Sites: ", length(site_levels)),
-    paste0("Pairs used: ", nrow(scatter_df)),
-    paste0("Mantel r: ", signif(mantel_tbl$statistic_r[1], 4)),
-    paste0("Mantel p: ", signif(mantel_tbl$p_value[1], 4))
-  ),
-  con = file.path(OUTDIR, "mantel_results.txt")
+mantel_tbl <- tibble(
+  analysis = "mantel_nei_vs_geographic_km",
+  statistic_r = as.numeric(mantel_out$statistic),
+  p_value = as.numeric(mantel_out$signif),
+  permutations = as.integer(mantel_out$permutations),
+  n_sites = length(sites_keep),
+  n_pairs = nrow(scatter_df)
 )
 
-cat("DONE population-level IBD. Outputs in: ", OUTDIR, "\n", sep = "")
+nei_check_field <- find_existing_nei_matrix(field_xlsx)
+nei_check_geno <- find_existing_nei_matrix(geno_xlsx)
+nei_status <- tibble(
+  input_file = c(basename(field_xlsx), basename(geno_xlsx)),
+  nei_matrix_found = c(nei_check_field$found, nei_check_geno$found),
+  note = c(nei_check_field$reason, nei_check_geno$reason)
+)
+
+write.csv(site_centroids, file.path(OUTDIR, "site_centroids_from_genetique.csv"), row.names = FALSE)
+write.csv(geo_mat, file.path(OUTDIR, "matrix_geographic_distance_km.csv"), row.names = TRUE)
+write.csv(gen_mat, file.path(OUTDIR, "matrix_genetic_distance_nei.csv"), row.names = TRUE)
+write.csv(scatter_df, file.path(OUTDIR, "ibd_pairwise_table.csv"), row.names = FALSE)
+write.csv(mantel_tbl, file.path(OUTDIR, "mantel_results.csv"), row.names = FALSE)
+write.csv(drop_tbl %>% filter(!is.na(drop_reason)), file.path(OUTDIR, "dropped_sites_summary.csv"), row.names = FALSE)
+write.csv(nei_status, file.path(OUTDIR, "nei_matrix_input_check.csv"), row.names = FALSE)
+
+summary_lines <- c(
+  "Population-level Mantel workflow completed.",
+  paste0("Sites kept (both matrices): ", length(sites_keep)),
+  paste0("Sites dropped: ", sum(!is.na(drop_tbl$drop_reason))),
+  if (sum(!is.na(drop_tbl$drop_reason)) > 0) {
+    paste0("Dropped details: ", paste0(drop_tbl$Site[!is.na(drop_tbl$drop_reason)], " [", drop_tbl$drop_reason[!is.na(drop_tbl$drop_reason)], "]", collapse = "; "))
+  } else {
+    "Dropped details: none"
+  },
+  paste0("Mantel r = ", signif(as.numeric(mantel_out$statistic), 5), "; p = ", signif(as.numeric(mantel_out$signif), 5)),
+  paste0("Nei matrix pre-existing in inputs? ", ifelse(any(nei_status$nei_matrix_found), "Possibly yes (see nei_matrix_input_check.csv)", "No, computed from genotype loci.")),
+  paste0("Bruvo (individual-level) option available in script: ", bruvo_available, " (not used for this Mantel).")
+)
+writeLines(summary_lines, con = file.path(OUTDIR, "mantel_summary.txt"))
+
+cat(paste(summary_lines, collapse = "\n"), "\n")
+cat("Outputs written to: ", OUTDIR, "\n", sep = "")

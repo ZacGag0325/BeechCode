@@ -43,7 +43,12 @@ src("scripts/03_structure_all_plots_S2N_bySite.R")
 src("scripts/04_amova.R")
 src("scripts/05_pca_dapc.R")
 
-# ---- 2) Extended analyses (safe runner; skips missing modules) ----
+# ---- 2) Distance + diversity + Mantel/IBE (required order) ----
+src("scripts/06_distance_matrices.R")
+src("scripts/07_allelic_richness.R")
+src("scripts/11_isolation_by_distance.R")
+
+# ---- 3) Extended analyses (safe runner; skips missing modules) ----
 src("scripts/10_run_extended_suite.R")
 src("scripts/12_environment_and_additional_metrics.R")
 

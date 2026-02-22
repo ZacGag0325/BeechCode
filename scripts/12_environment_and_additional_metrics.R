@@ -72,26 +72,21 @@ if (!file.exists(file.path(RUN_OUT, "hwe_by_site_by_locus.csv"))) {
   stop("Missing required input: outputs/v1/hwe_by_site_by_locus.csv")
 }
 
-# Defensive diploid handling: some upstream objects may store ploidy as a vector.
-# We derive a single TRUE/FALSE flag for if() conditions to prevent
-# "the condition has length > 1" errors when package internals expect scalar logic.
-ploidy_vec <- tryCatch(as.numeric(adegenet::ploidy(gi)), error = function(e) rep(NA_real_, adegenet::nInd(gi)))
+# Defensive diploid handling with scalar logical for control flow
+ploidy_vec <- tryCatch(as.numeric(adegenet::ploidy(gi_mll)), error = function(e) rep(NA_real_, adegenet::nInd(gi_mll)))
 diploid_vec <- (ploidy_vec == 2)
+diploid_all <- isTRUE(all(diploid_vec, na.rm = TRUE))
 if (anyNA(diploid_vec)) {
-  message("Found NA ploidy values; treating NA as FALSE when summarising diploid status.")
+  message("Found NA ploidy values in gi_mll; diploid_all computed with na.rm = TRUE.")
 }
-diploid_flag <- all(replace(diploid_vec, is.na(diploid_vec), FALSE))
-if (length(diploid_vec) > 1) {
-  message("Diploid status evaluated across individuals with all(diploid_vec, na.rm = FALSE): ", diploid_flag)
-}
+message("Diploid check (gi_mll): all individuals diploid = ", diploid_all)
 
-gi_work <- gi
-if (length(ploidy_vec) > 1 && length(unique(ploidy_vec[!is.na(ploidy_vec)])) > 1) {
-  warning("Mixed ploidy detected in gi. Coercing ploidy to 2 for downstream diploid-only metrics.")
-  adegenet::ploidy(gi_work) <- rep(2L, adegenet::nInd(gi_work))
-} else if (length(ploidy_vec) > 0 && all(is.na(ploidy_vec))) {
-  warning("Could not determine ploidy from gi. Assuming diploid (2) for downstream metrics.")
-  adegenet::ploidy(gi_work) <- rep(2L, adegenet::nInd(gi_work))
+# Keep clone-corrected data as default working dataset
+# and only run diploid-only metrics when diploid_all is TRUE.
+gi_work <- gi_mll
+run_diploid_only <- diploid_all
+if (!run_diploid_only) {
+  warning("Detected non-diploid/mixed ploidy in gi_mll. Diploid-only steps will be skipped.")
 }
 
 read_matrix_csv <- function(path) {
@@ -370,40 +365,46 @@ if (is.na(ar_path)) {
 }
 
 # C) Pairwise FST (Weir & Cockerham)
-hf <- hierfstat::genind2hierfstat(gi_work)
-fst_raw <- hierfstat::pairwise.WCfst(hf[, -1, drop = FALSE], hf[, 1])
-fst_mat <- as.matrix(fst_raw)
-fst_mat <- (fst_mat + t(fst_mat)) / 2
-diag(fst_mat) <- 0
-
-if (!setequal(site_names, intersect(rownames(fst_mat), colnames(fst_mat)))) {
-  stop("Pairwise FST matrix site names do not match Nei/geographic matrix site names.")
+hf <- NULL
+if (run_diploid_only) {
+  hf <- hierfstat::genind2hierfstat(gi_work)
+  fst_raw <- hierfstat::pairwise.WCfst(hf[, -1, drop = FALSE], hf[, 1])
+  fst_mat <- as.matrix(fst_raw)
+  fst_mat <- (fst_mat + t(fst_mat)) / 2
+  diag(fst_mat) <- 0
+  
+  if (!setequal(site_names, intersect(rownames(fst_mat), colnames(fst_mat)))) {
+    stop("Pairwise FST matrix site names do not match Nei/geographic matrix site names.")
+  }
+  fst_mat <- fst_mat[site_names, site_names, drop = FALSE]
+  write.csv(fst_mat, file.path(RUN_OUT, "pairwise_fst_matrix.csv"), row.names = TRUE)
+  
+  fst_long <- as.data.frame(fst_mat) %>%
+    tibble::rownames_to_column("Site1") %>%
+    pivot_longer(-Site1, names_to = "Site2", values_to = "fst") %>%
+    filter(Site1 < Site2)
+  write.csv(fst_long, file.path(RUN_OUT, "pairwise_fst_long.csv"), row.names = FALSE)
+  
+  fst_plot_df <- as.data.frame(fst_mat) %>%
+    tibble::rownames_to_column("Site1") %>%
+    pivot_longer(-Site1, names_to = "Site2", values_to = "fst") %>%
+    mutate(
+      Site1 = factor(Site1, levels = site_order),
+      Site2 = factor(Site2, levels = site_order)
+    )
+  
+  p_fst <- ggplot(fst_plot_df, aes(x = Site1, y = Site2, fill = fst)) +
+    geom_tile(color = "white", linewidth = 0.1) +
+    scale_fill_gradient(low = "#f7fbff", high = "#08306b", na.value = "grey85") +
+    coord_equal() +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank()) +
+    labs(title = "Pairwise FST (Weir & Cockerham)", x = "Site", y = "Site", fill = "FST")
+  ggsave(file.path(RUN_OUT, "pairwise_fst_heatmap.jpeg"), p_fst, width = 8.5, height = 7.5, dpi = 350)
+} else {
+  message("Skipping diploid-only FST calculations (non-diploid ploidy detected).")
+  writeLines("Skipped pairwise FST: gi_mll is not fully diploid.", con = file.path(RUN_OUT, "pairwise_fst_notes.txt"))
 }
-fst_mat <- fst_mat[site_names, site_names, drop = FALSE]
-write.csv(fst_mat, file.path(RUN_OUT, "pairwise_fst_matrix.csv"), row.names = TRUE)
-
-fst_long <- as.data.frame(fst_mat) %>%
-  tibble::rownames_to_column("Site1") %>%
-  pivot_longer(-Site1, names_to = "Site2", values_to = "fst") %>%
-  filter(Site1 < Site2)
-write.csv(fst_long, file.path(RUN_OUT, "pairwise_fst_long.csv"), row.names = FALSE)
-
-fst_plot_df <- as.data.frame(fst_mat) %>%
-  tibble::rownames_to_column("Site1") %>%
-  pivot_longer(-Site1, names_to = "Site2", values_to = "fst") %>%
-  mutate(
-    Site1 = factor(Site1, levels = site_order),
-    Site2 = factor(Site2, levels = site_order)
-  )
-
-p_fst <- ggplot(fst_plot_df, aes(x = Site1, y = Site2, fill = fst)) +
-  geom_tile(color = "white", linewidth = 0.1) +
-  scale_fill_gradient(low = "#f7fbff", high = "#08306b", na.value = "grey85") +
-  coord_equal() +
-  theme_minimal(base_size = 11) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank()) +
-  labs(title = "Pairwise FST (Weir & Cockerham)", x = "Site", y = "Site", fill = "FST")
-ggsave(file.path(RUN_OUT, "pairwise_fst_heatmap.jpeg"), p_fst, width = 8.5, height = 7.5, dpi = 350)
 
 # D) Private alleles per site
 private_counts <- NULL
@@ -485,50 +486,55 @@ writeLines(
 
 # E) Heterozygosity by site
 # Estimator: hierfstat::basic.stats; Ho = observed heterozygosity, He = Hs within-pop expected heterozygosity.
-bs <- hierfstat::basic.stats(hf)
-ho_mat <- bs$Ho
-he_mat <- bs$Hs
-fis_mat <- bs$Fis
-
-het_df <- data.frame(
-  Site = colnames(ho_mat),
-  Ho_mean = colMeans(ho_mat, na.rm = TRUE),
-  He_mean = colMeans(he_mat, na.rm = TRUE),
-  FIS_mean = colMeans(fis_mat, na.rm = TRUE),
-  stringsAsFactors = FALSE
-) %>%
-  left_join(site_n, by = "Site") %>%
-  arrange(match(Site, site_order))
-
-write.csv(het_df, file.path(RUN_OUT, "heterozygosity_by_site.csv"), row.names = FALSE)
-
-het_long <- het_df %>%
-  select(Site, Ho_mean, He_mean) %>%
-  pivot_longer(cols = c(Ho_mean, He_mean), names_to = "Metric", values_to = "Value") %>%
-  mutate(Site = factor(Site, levels = site_order))
-
-p_het <- ggplot(het_long, aes(x = Site, y = Value, fill = Metric)) +
-  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
-  scale_fill_manual(values = c(Ho_mean = "#1b9e77", He_mean = "#7570b3")) +
-  theme_minimal(base_size = 12) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  labs(title = "Observed and expected heterozygosity by site", x = "Site", y = "Mean heterozygosity")
-ggsave(file.path(RUN_OUT, "Ho_He_by_site.jpeg"), p_het, width = 9, height = 6.5, dpi = 350)
-
-if (all(is.na(site_meta$elevation_m))) {
-  writeLines("Skipped He_vs_elevation: elevation_m is missing for all sites in metadata.", con = file.path(RUN_OUT, "He_vs_elevation.txt"))
-} else {
-  he_elev <- het_df %>% left_join(site_meta %>% select(Site, elevation_m), by = "Site") %>% filter(!is.na(elevation_m), !is.na(He_mean))
-  if (nrow(he_elev) >= 3) {
-    p_he <- ggplot(he_elev, aes(x = elevation_m, y = He_mean)) +
-      geom_point(size = 2.5, alpha = 0.9, color = "#386cb0") +
-      geom_smooth(method = "lm", se = TRUE, color = "#ef3b2c", fill = "#fcbba1", linewidth = 0.9) +
-      theme_minimal(base_size = 12) +
-      labs(x = "Elevation (m)", y = "Expected heterozygosity (He)", title = "He vs elevation")
-    ggsave(file.path(RUN_OUT, "He_vs_elevation.jpeg"), p_he, width = 8, height = 6, dpi = 350)
+if (run_diploid_only && !is.null(hf)) {
+  bs <- hierfstat::basic.stats(hf)
+  ho_mat <- bs$Ho
+  he_mat <- bs$Hs
+  fis_mat <- bs$Fis
+  
+  het_df <- data.frame(
+    Site = colnames(ho_mat),
+    Ho_mean = colMeans(ho_mat, na.rm = TRUE),
+    He_mean = colMeans(he_mat, na.rm = TRUE),
+    FIS_mean = colMeans(fis_mat, na.rm = TRUE),
+    stringsAsFactors = FALSE
+  ) %>%
+    left_join(site_n, by = "Site") %>%
+    arrange(match(Site, site_order))
+  
+  write.csv(het_df, file.path(RUN_OUT, "heterozygosity_by_site.csv"), row.names = FALSE)
+  
+  het_long <- het_df %>%
+    select(Site, Ho_mean, He_mean) %>%
+    pivot_longer(cols = c(Ho_mean, He_mean), names_to = "Metric", values_to = "Value") %>%
+    mutate(Site = factor(Site, levels = site_order))
+  
+  p_het <- ggplot(het_long, aes(x = Site, y = Value, fill = Metric)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    scale_fill_manual(values = c(Ho_mean = "#1b9e77", He_mean = "#7570b3")) +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "Observed and expected heterozygosity by site", x = "Site", y = "Mean heterozygosity")
+  ggsave(file.path(RUN_OUT, "Ho_He_by_site.jpeg"), p_het, width = 9, height = 6.5, dpi = 350)
+  
+  if (all(is.na(site_meta$elevation_m))) {
+    writeLines("Skipped He_vs_elevation: elevation_m is missing for all sites in metadata.", con = file.path(RUN_OUT, "He_vs_elevation.txt"))
   } else {
-    writeLines("Skipped He_vs_elevation: fewer than 3 sites with both He and elevation.", con = file.path(RUN_OUT, "He_vs_elevation.txt"))
+    he_elev <- het_df %>% left_join(site_meta %>% select(Site, elevation_m), by = "Site") %>% filter(!is.na(elevation_m), !is.na(He_mean))
+    if (nrow(he_elev) >= 3) {
+      p_he <- ggplot(he_elev, aes(x = elevation_m, y = He_mean)) +
+        geom_point(size = 2.5, alpha = 0.9, color = "#386cb0") +
+        geom_smooth(method = "lm", se = TRUE, color = "#ef3b2c", fill = "#fcbba1", linewidth = 0.9) +
+        theme_minimal(base_size = 12) +
+        labs(x = "Elevation (m)", y = "Expected heterozygosity (He)", title = "He vs elevation")
+      ggsave(file.path(RUN_OUT, "He_vs_elevation.jpeg"), p_he, width = 8, height = 6, dpi = 350)
+    } else {
+      writeLines("Skipped He_vs_elevation: fewer than 3 sites with both He and elevation.", con = file.path(RUN_OUT, "He_vs_elevation.txt"))
+    }
   }
+} else {
+  message("Skipping diploid-only heterozygosity calculations (non-diploid ploidy detected).")
+  writeLines("Skipped heterozygosity_by_site and He_vs_elevation: gi_mll is not fully diploid.", con = file.path(RUN_OUT, "heterozygosity_notes.txt"))
 }
 
 # F) HWE p-value adjustments

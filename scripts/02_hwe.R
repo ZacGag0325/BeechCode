@@ -91,6 +91,13 @@ all_diploid_genotypes <- function(df_loci) {
   all(grepl("^[^/]+/[^/]+$", vals))
 }
 
+
+ploidy_all_diploid <- function(genind_obj) {
+  pv <- tryCatch(as.numeric(adegenet::ploidy(genind_obj)), error = function(e) rep(NA_real_, adegenet::nInd(genind_obj)))
+  diploid_vec <- (pv == 2)
+  isTRUE(all(diploid_vec, na.rm = TRUE))
+}
+
 locus_reason <- function(x, min_n = MIN_N) {
   xv <- as.character(x)
   xv <- xv[!is.na(xv) & nzchar(xv)]
@@ -135,7 +142,15 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
     return(base_tbl %>% mutate(p_value = NA_real_) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
-  loci_obj <- tryCatch(pegas::as.loci(gdf[, testable$Locus, drop = FALSE], col.pop = NULL), error = function(e) e)
+  gdf_test <- gdf[, testable$Locus, drop = FALSE]
+  genotype_cols <- names(gdf_test)[vapply(gdf_test, function(x) {
+    vals <- as.character(x)
+    vals <- vals[!is.na(vals) & nzchar(vals)]
+    length(vals) == 0 || all(grepl("^[^/]+/[^/]+$", vals))
+  }, logical(1))]
+  gdf_test <- gdf_test[, genotype_cols, drop = FALSE]
+  
+  loci_obj <- tryCatch(pegas::as.loci(gdf_test, col.pop = NULL), error = function(e) e)
   if (inherits(loci_obj, "error")) {
     return(base_tbl %>% mutate(
       p_value = NA_real_,
@@ -143,13 +158,21 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
     ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
-  diploid_ok <- all_diploid_genotypes(gdf[, testable$Locus, drop = FALSE])
-  B_use <- if (isTRUE(diploid_ok)) HWE_B else 0
-  if (!isTRUE(diploid_ok)) {
-    cat("[HWE] Note:", label, "contains non-diploid/ambiguous genotypes for tested loci; using exact test without Monte Carlo (B=0).\n")
+  if ("pop" %in% colnames(loci_obj)) {
+    loci_obj <- loci_obj[, colnames(loci_obj) != "pop", drop = FALSE]
+    message("[HWE] Removed 'pop' column from loci object for ", label)
   }
   
-  ht <- tryCatch(pegas::hw.test(loci_obj, B = B_use), error = function(e) e)
+  diploid_data_ok <- all_diploid_genotypes(gdf_test)
+  diploid_all <- ploidy_all_diploid(genind_obj)
+  B_use <- if (isTRUE(diploid_data_ok) && isTRUE(diploid_all)) HWE_B else 0
+  if (!isTRUE(diploid_data_ok) || !isTRUE(diploid_all)) {
+    message("[HWE] ", label, ": non-diploid or ambiguous data/ploidy detected; running hw.test without Monte Carlo permutations.")
+  }
+  
+  ht <- tryCatch({
+    if (B_use > 0) pegas::hw.test(loci_obj, B = B_use) else pegas::hw.test(loci_obj)
+  }, error = function(e) e)
   if (inherits(ht, "error")) {
     return(base_tbl %>% mutate(
       p_value = NA_real_,
@@ -254,4 +277,3 @@ write.csv(hwe_site_summary, file.path(OUTDIR, "hwe_site_summary.csv"), row.names
 write.csv(hwe_global, file.path(OUTDIR, "hwe_global_mll.csv"), row.names = FALSE)
 
 cat("DONE HWE. Outputs in: ", OUTDIR, "\n", sep = "")
-

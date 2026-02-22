@@ -39,46 +39,120 @@ normalize_site <- function(x) {
   x
 }
 
-match_first_col <- function(df, patterns) {
-  nms <- names(df)
-  nms_low <- tolower(nms)
+normalize_name <- function(x) {
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT")
+  x[is.na(x)] <- ""
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("^_+|_+$", "", x)
+  x
+}
+
+build_name_map <- function(df) {
+  raw <- names(df)
+  norm <- normalize_name(raw)
+  names(raw) <- norm
+  raw
+}
+
+first_col_by_patterns <- function(df, patterns) {
+  nm <- build_name_map(df)
+  keys <- names(nm)
   for (pat in patterns) {
-    hit <- which(grepl(pat, nms_low, perl = TRUE))
-    if (length(hit) > 0) return(nms[hit[1]])
+    hit <- which(grepl(pat, keys, perl = TRUE))
+    if (length(hit) > 0) return(nm[keys[hit[1]]])
   }
   NA_character_
 }
 
-read_site_metadata <- function(meta_path) {
-  meta <- readr::read_csv(meta_path, show_col_types = FALSE)
-  if (!nrow(meta)) stop("site_metadata.csv is empty: ", meta_path)
+extract_site_coordinates <- function(df, source_label = "unknown") {
+  if (!is.data.frame(df) || nrow(df) == 0) {
+    return(list(ok = FALSE, reason = paste0(source_label, " is empty")))
+  }
   
-  site_col <- match_first_col(meta, c("^site$", "site", "population", "pop"))
-  if (is.na(site_col)) stop("Could not detect site column in ", meta_path)
+  site_col <- first_col_by_patterns(
+    df,
+    c(
+      "^site$", "^sites$", "^site_id$", "^population$", "^pop$",
+      "^numero_population$", "^numero_de_population$", "^num_population$", "^numeropopulation$", "^numerodepopulation$", "^numeropop$"
+    )
+  )
   
-  lat_col <- match_first_col(meta, c("^lat$", "latitude", "^y$", "^y_coord", "northing"))
-  lon_col <- match_first_col(meta, c("^lon$", "^long$", "longitude", "^x$", "^x_coord", "easting"))
+  if (is.na(site_col)) {
+    return(list(ok = FALSE, reason = paste0("Could not detect site column in ", source_label)))
+  }
   
-  out <- meta %>%
+  lat_col <- first_col_by_patterns(df, c("^latitude$", "^lat$", "^y$", "^northing$", "^coord_y$", "^utm_y$", "^y_coord$"))
+  lon_col <- first_col_by_patterns(df, c("^longitude$", "^lon$", "^long$", "^x$", "^easting$", "^coord_x$", "^utm_x$", "^x_coord$"))
+  
+  if (is.na(lat_col) || is.na(lon_col)) {
+    return(list(ok = FALSE, reason = paste0("Could not detect coordinate columns in ", source_label), site_col = site_col))
+  }
+  
+  coord_df <- df %>%
     mutate(
       Site = normalize_site(.data[[site_col]]),
       coord_a = suppressWarnings(as.numeric(.data[[lat_col]])),
       coord_b = suppressWarnings(as.numeric(.data[[lon_col]]))
     ) %>%
-    filter(!is.na(Site)) %>%
-    distinct(Site, .keep_all = TRUE)
+    filter(!is.na(Site), !is.na(coord_a), !is.na(coord_b))
   
-  if (is.na(lat_col) || is.na(lon_col)) {
-    warning("Could not detect coordinate columns in site metadata.")
-    return(list(data = out, mode = "none", lat_col = lat_col, lon_col = lon_col))
+  if (!nrow(coord_df)) {
+    return(list(ok = FALSE, reason = paste0("No valid coordinates after cleaning for ", source_label), site_col = site_col, lat_col = lat_col, lon_col = lon_col))
   }
   
-  lat_name <- tolower(lat_col)
-  lon_name <- tolower(lon_col)
-  likely_latlon <- any(grepl("lat|lon|long|latitude|longitude", c(lat_name, lon_name)))
+  mode <- {
+    lat_norm <- normalize_name(lat_col)
+    lon_norm <- normalize_name(lon_col)
+    if (grepl("lat|latitude", lat_norm) || grepl("lon|long|longitude", lon_norm)) "latlon" else "projected"
+  }
   
-  mode <- if (likely_latlon) "latlon" else "projected"
-  list(data = out, mode = mode, lat_col = lat_col, lon_col = lon_col)
+  site_df <- coord_df %>%
+    group_by(Site) %>%
+    summarise(coord_a = mean(coord_a, na.rm = TRUE), coord_b = mean(coord_b, na.rm = TRUE), .groups = "drop")
+  
+  list(
+    ok = TRUE,
+    data = site_df,
+    mode = mode,
+    source = source_label,
+    site_col = site_col,
+    lat_col = lat_col,
+    lon_col = lon_col
+  )
+}
+
+read_site_metadata <- function(meta_path, df_ids = NULL) {
+  meta_obj <- NULL
+  
+  if (file.exists(meta_path)) {
+    meta_try <- tryCatch(readr::read_csv(meta_path, show_col_types = FALSE), error = function(e) e)
+    if (inherits(meta_try, "error")) {
+      warning("Failed reading site metadata file: ", meta_path, " -> ", conditionMessage(meta_try))
+    } else {
+      meta_obj <- extract_site_coordinates(meta_try, source_label = "inputs/site_metadata.csv")
+      if (isTRUE(meta_obj$ok)) {
+        message("Using inputs/site_metadata.csv")
+        message("Detected columns -> site: ", meta_obj$site_col, ", coord1: ", meta_obj$lat_col, ", coord2: ", meta_obj$lon_col)
+        return(meta_obj)
+      }
+      warning(meta_obj$reason)
+    }
+  } else {
+    warning("Missing site metadata file: ", meta_path)
+  }
+  
+  if (!is.null(df_ids)) {
+    fallback <- extract_site_coordinates(as.data.frame(df_ids), source_label = "df_ids")
+    if (isTRUE(fallback$ok)) {
+      message("Falling back to df_ids site means")
+      message("Detected columns -> site: ", fallback$site_col, ", coord1: ", fallback$lat_col, ", coord2: ", fallback$lon_col)
+      return(fallback)
+    }
+    warning("df_ids fallback failed: ", fallback$reason)
+  }
+  
+  list(ok = FALSE, reason = "No usable site coordinate source (metadata + df_ids fallback failed).")
 }
 
 compute_nei_matrix <- function(gi) {
@@ -104,23 +178,42 @@ compute_nei_matrix <- function(gi) {
   mat
 }
 
-compute_geo_matrix <- function(meta_obj, gi_sites = NULL) {
+compute_geo_matrix <- function(meta_obj, site_order = NULL) {
+  if (is.null(meta_obj) || !isTRUE(meta_obj$ok)) {
+    warning("No usable coordinate metadata; skipping geographic matrix.")
+    return(NULL)
+  }
+  
   dat <- meta_obj$data
   dat <- dat[!is.na(dat$coord_a) & !is.na(dat$coord_b), , drop = FALSE]
-  if (!is.null(gi_sites)) dat <- dat[dat$Site %in% gi_sites, , drop = FALSE]
+  
+  if (!is.null(site_order)) {
+    dat <- dat[dat$Site %in% site_order, , drop = FALSE]
+  }
+  
   if (nrow(dat) < 2) {
     warning("Too few sites with coordinates to compute geographic distances.")
     return(NULL)
   }
   
-  dat <- dat[order(dat$Site), , drop = FALSE]
+  if (!is.null(site_order)) {
+    dat <- dat[match(site_order, dat$Site), , drop = FALSE]
+    dat <- dat[!is.na(dat$Site), , drop = FALSE]
+  } else {
+    dat <- dat[order(dat$Site), , drop = FALSE]
+  }
+  
+  if (nrow(dat) < 2) {
+    warning("Too few aligned sites to compute geographic distances.")
+    return(NULL)
+  }
   
   if (meta_obj$mode == "latlon") {
     mat <- geosphere::distm(as.matrix(dat[, c("coord_b", "coord_a")]), fun = geosphere::distHaversine) / 1000
-    message("Computed geographic matrix with Haversine distances (km) using columns: ", meta_obj$lat_col, ", ", meta_obj$lon_col)
+    message("Computed geographic matrix with Haversine distances (km).")
   } else if (meta_obj$mode == "projected") {
     mat <- as.matrix(stats::dist(dat[, c("coord_b", "coord_a")])) / 1000
-    message("Computed geographic matrix with Euclidean distances (km) using projected coordinates: ", meta_obj$lat_col, ", ", meta_obj$lon_col)
+    message("Computed geographic matrix with Euclidean distances (km) from projected coordinates.")
   } else {
     warning("No usable coordinate mode detected.")
     return(NULL)
@@ -175,13 +268,21 @@ if (!is.null(nei_mat)) {
 }
 
 meta_path <- file.path(INPUTS_DIR, "site_metadata.csv")
-if (!file.exists(meta_path)) {
-  warning("Missing site metadata file: ", meta_path, " (cannot compute geographic matrix).")
+meta_obj <- read_site_metadata(meta_path, df_ids = if (exists("df_ids")) df_ids else NULL)
+if (!isTRUE(meta_obj$ok)) {
+  warning(meta_obj$reason)
   geo_mat <- NULL
 } else {
-  meta_obj <- read_site_metadata(meta_path)
-  geo_mat <- compute_geo_matrix(meta_obj, gi_sites = if (!is.null(nei_mat)) rownames(nei_mat) else NULL)
+  target_sites <- if (!is.null(nei_mat)) rownames(nei_mat) else sort(unique(meta_obj$data$Site))
+  geo_mat <- tryCatch(
+    compute_geo_matrix(meta_obj, site_order = target_sites),
+    error = function(e) {
+      warning("Geographic matrix computation failed: ", conditionMessage(e))
+      NULL
+    }
+  )
 }
+
 save_matrix_outputs(geo_mat, geo_csv, geo_rds, "geographic distance matrix")
 if (!is.null(geo_mat)) {
   write.csv(geo_mat, geo_csv_legacy, row.names = TRUE)

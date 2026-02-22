@@ -113,6 +113,31 @@ if (high_missing_n > 0) {
   warning(high_missing_n, " individuals have >35% missing data.")
 }
 
+# Missingness summaries (allele-level, locus-level, individual-level)
+QC_OUTDIR <- file.path(RUN_OUT, "qc")
+dir.create(QC_OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+allele_missing <- colMeans(is.na(geno_tab_asis))
+loci_fac <- as.character(adegenet::locFac(gi))
+if (length(allele_missing) != length(loci_fac)) {
+  stop("Mismatch between allele columns and locus factor length when computing missingness summaries.")
+}
+locus_missing <- tapply(allele_missing, loci_fac, mean)
+locus_missing_df <- data.frame(
+  locus = names(locus_missing),
+  missing_prop = as.numeric(locus_missing),
+  stringsAsFactors = FALSE
+)
+
+individual_missing_df <- data.frame(
+  individual = rownames(geno_tab_asis),
+  missing_prop = as.numeric(rowMeans(is.na(geno_tab_asis))),
+  stringsAsFactors = FALSE
+)
+
+write.csv(locus_missing_df, file.path(QC_OUTDIR, "locus_missingness.csv"), row.names = FALSE)
+write.csv(individual_missing_df, file.path(QC_OUTDIR, "individual_missingness.csv"), row.names = FALSE)
+
 # MLG
 mlg_vec <- tryCatch(poppr::mlg.vector(gi), error = function(e) poppr::mlg(gi))
 if (length(mlg_vec) != nInd(gi)) stop("Could not compute per-individual MLG vector.")

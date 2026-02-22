@@ -83,6 +83,23 @@ extract_hw_pvals <- function(ht) {
   list(pvals = pv, locus = names(ht))
 }
 
+sanitize_loci_object <- function(loci_obj) {
+  bad_cols <- c("pop", "Pop", "Population")
+  keep_by_name <- !(colnames(loci_obj) %in% bad_cols)
+  keep_by_type <- vapply(loci_obj, function(col) is.factor(col) || is.character(col), logical(1))
+  keep <- keep_by_name & keep_by_type
+  loci_obj <- loci_obj[, keep, drop = FALSE]
+  if (ncol(loci_obj) == 0) return(loci_obj)
+  loci_obj <- as.data.frame(lapply(loci_obj, function(col) {
+    if (is.factor(col)) {
+      col
+    } else {
+      factor(as.character(col))
+    }
+  }), stringsAsFactors = TRUE, check.names = FALSE)
+  loci_obj
+}
+
 all_diploid_genotypes <- function(df_loci) {
   vals <- unlist(df_loci, use.names = FALSE)
   vals <- as.character(vals)
@@ -157,10 +174,12 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
       reason = ifelse(is.na(reason), paste("as.loci_conversion_error:", loci_obj$message), reason)
     ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
-  
-  if ("pop" %in% colnames(loci_obj)) {
-    loci_obj <- loci_obj[, colnames(loci_obj) != "pop", drop = FALSE]
-    message("[HWE] Removed 'pop' column from loci object for ", label)
+  loci_obj <- sanitize_loci_object(loci_obj)
+  if (ncol(loci_obj) == 0) {
+    return(base_tbl %>% mutate(
+      p_value = NA_real_,
+      reason = ifelse(is.na(reason), "no_valid_genotype_loci_after_loci_sanitization", reason)
+    ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
   diploid_data_ok <- all_diploid_genotypes(gdf_test)

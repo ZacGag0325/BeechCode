@@ -40,8 +40,10 @@ src("scripts/13_stand_structure_tables.R")
 src("scripts/01_clonality.R")
 src("scripts/02_hwe.R")
 src("scripts/03_structure_all_plots_S2N_bySite.R")
+src("scripts/XX_structure_pies_map.R")
 src("scripts/04_amova.R")
 src("scripts/05_pca_dapc.R")
+
 
 # ---- 2) Distance + diversity + Mantel/IBE (required order) ----
 src("scripts/06_distance_matrices.R")

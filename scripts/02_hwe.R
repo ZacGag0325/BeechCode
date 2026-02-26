@@ -86,17 +86,7 @@ extract_hw_pvals <- function(ht) {
 sanitize_loci_object <- function(loci_obj) {
   bad_cols <- c("pop", "Pop", "Population")
   keep_by_name <- !(colnames(loci_obj) %in% bad_cols)
-  keep_by_type <- vapply(loci_obj, function(col) is.factor(col) || is.character(col), logical(1))
-  keep <- keep_by_name & keep_by_type
-  loci_obj <- loci_obj[, keep, drop = FALSE]
-  if (ncol(loci_obj) == 0) return(loci_obj)
-  loci_obj <- as.data.frame(lapply(loci_obj, function(col) {
-    if (is.factor(col)) {
-      col
-    } else {
-      factor(as.character(col))
-    }
-  }), stringsAsFactors = TRUE, check.names = FALSE)
+  loci_obj <- loci_obj[, keep_by_name, drop = FALSE]
   loci_obj
 }
 
@@ -174,16 +164,28 @@ run_hwe_for_genind <- function(genind_obj, label = "POP", min_n = MIN_N) {
       reason = ifelse(is.na(reason), paste("as.loci_conversion_error:", loci_obj$message), reason)
     ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
+  
+  message(
+    "[HWE] class(loci_obj)=", paste(class(loci_obj), collapse = ","),
+    " ncol=", ncol(loci_obj)
+  )
+  
   loci_obj <- sanitize_loci_object(loci_obj)
+  
+  message(
+    "[HWE] class(loci_obj) after pop cleanup=", paste(class(loci_obj), collapse = ","),
+    " ncol=", ncol(loci_obj)
+  )
+  
   if (ncol(loci_obj) == 0) {
     return(base_tbl %>% mutate(
       p_value = NA_real_,
-      reason = ifelse(is.na(reason), "no_valid_genotype_loci_after_loci_sanitization", reason)
+      reason = ifelse(is.na(reason), "no_loci_after_filter", reason)
     ) %>% select(Site, Locus, p_value, n_inds, n_non_missing, reason))
   }
   
   diploid_data_ok <- all_diploid_genotypes(gdf_test)
-  diploid_all <- ploidy_all_diploid(genind_obj)
+  diploid_all <- isTRUE(all(adegenet::ploidy(genind_obj) == 2, na.rm = TRUE))
   B_use <- if (isTRUE(diploid_data_ok) && isTRUE(diploid_all)) HWE_B else 0
   if (!isTRUE(diploid_data_ok) || !isTRUE(diploid_all)) {
     message("[HWE] ", label, ": non-diploid or ambiguous data/ploidy detected; running hw.test without Monte Carlo permutations.")

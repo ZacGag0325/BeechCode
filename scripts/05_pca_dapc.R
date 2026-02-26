@@ -55,6 +55,18 @@ get_ld_df <- function(dapc_obj) {
   out
 }
 
+
+# Helper: subset rows to groups with enough non-missing 2D points for ellipses
+ellipse_subset <- function(df, group_col, x_col, y_col, min_n = 3) {
+  keep <- !is.na(df[[group_col]]) & !is.na(df[[x_col]]) & !is.na(df[[y_col]])
+  df_ok <- df[keep, , drop = FALSE]
+  if (nrow(df_ok) == 0) return(df_ok)
+  
+  grp_counts <- table(df_ok[[group_col]])
+  valid_groups <- names(grp_counts)[grp_counts >= min_n]
+  df_ok[df_ok[[group_col]] %in% valid_groups, , drop = FALSE]
+}
+
 ############################################################
 # 1) PCA (allele table -> prcomp)
 ############################################################
@@ -98,7 +110,22 @@ if (length(keep_meta_cols) > 0) {
   pc <- merge(pc, df_ids[, keep_meta_cols, drop = FALSE], by = "ind", all.x = TRUE)
 }
 
+pc_ell <- ellipse_subset(pc, group_col = "Site", x_col = "PC1", y_col = "PC2", min_n = 3)
+
 p_pca12 <- ggplot(pc, aes(x = PC1, y = PC2, color = Site)) +
+  stat_ellipse(
+    data = pc_ell,
+    aes(x = PC1, y = PC2, group = Site, fill = Site),
+    type = "norm", level = 0.95,
+    geom = "polygon", alpha = 0.25,
+    color = NA, inherit.aes = FALSE
+  ) +
+  stat_ellipse(
+    data = pc_ell,
+    aes(x = PC1, y = PC2, group = Site, color = Site),
+    type = "norm", level = 0.95,
+    linewidth = 0.9, inherit.aes = FALSE
+  ) +
   geom_point(size = 2, alpha = 0.85) +
   theme_minimal(base_size = 12) +
   labs(title = "PCA (PC1 vs PC2)", subtitle = "Individuals colored by Site")
@@ -148,7 +175,22 @@ if (all(is.na(dapc_df$LD2))) {
       x = NULL, y = "LD1"
     )
 } else {
+  dapc_ell <- ellipse_subset(dapc_df, group_col = "Site", x_col = "LD1", y_col = "LD2", min_n = 3)
+  
   p_dapc <- ggplot(dapc_df, aes(x = LD1, y = LD2, color = Site)) +
+    stat_ellipse(
+      data = dapc_ell,
+      aes(x = LD1, y = LD2, group = Site, fill = Site),
+      type = "norm", level = 0.95,
+      geom = "polygon", alpha = 0.25,
+      color = NA, inherit.aes = FALSE
+    ) +
+    stat_ellipse(
+      data = dapc_ell,
+      aes(x = LD1, y = LD2, group = Site, color = Site),
+      type = "norm", level = 0.95,
+      linewidth = 0.9, inherit.aes = FALSE
+    ) +
     geom_point(size = 2, alpha = 0.85) +
     theme_minimal(base_size = 12) +
     labs(
@@ -224,7 +266,22 @@ if (!is.null(fc)) {
         x = "Cluster", y = "LD1"
       )
   } else {
+    dk_ell <- ellipse_subset(dk, group_col = "Cluster", x_col = "LD1", y_col = "LD2", min_n = 3)
+    
     p_dapc_k <- ggplot(dk, aes(x = LD1, y = LD2, color = Cluster, shape = Site)) +
+      stat_ellipse(
+        data = dk_ell,
+        aes(x = LD1, y = LD2, group = Cluster, fill = Cluster),
+        type = "norm", level = 0.95,
+        geom = "polygon", alpha = 0.25,
+        color = NA, inherit.aes = FALSE
+      ) +
+      stat_ellipse(
+        data = dk_ell,
+        aes(x = LD1, y = LD2, group = Cluster, color = Cluster),
+        type = "norm", level = 0.95,
+        linewidth = 0.9, inherit.aes = FALSE
+      ) +
       geom_point(size = 2, alpha = 0.85) +
       theme_minimal(base_size = 12) +
       labs(

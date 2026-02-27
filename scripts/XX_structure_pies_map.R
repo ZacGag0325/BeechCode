@@ -1,515 +1,679 @@
+#!/usr/bin/env Rscript
+
 ############################################################
 # scripts/XX_structure_pies_map.R
-# STRUCTURE pies by site (map + non-spatial fallback)
+# Publication-style STRUCTURE geographic pie maps (ALL K)
 ############################################################
 
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-
-suppressPackageStartupMessages(library(here))
-
-FALLBACK_ROOT <- file.path(path.expand("~"), "Desktop", "BeechCode")
-candidate_root <- here::here()
-if (dir.exists(file.path(candidate_root, "data"))) {
-  PROJECT_ROOT <- candidate_root
-} else if (dir.exists(file.path(FALLBACK_ROOT, "data"))) {
-  PROJECT_ROOT <- FALLBACK_ROOT
-  setwd(PROJECT_ROOT)
-} else {
-  stop("Can't find project root. Open BeechCode.Rproj or set FALLBACK_ROOT.")
-}
-
-OUT_DIR <- file.path(PROJECT_ROOT, "outputs", "figures")
-dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
-cat("\n[structure_pies_map] Project root:", PROJECT_ROOT, "\n")
-
-req <- c("dplyr", "tidyr", "ggplot2", "readr", "stringi", "scales")
-for (p in req) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
-
 suppressPackageStartupMessages({
+  library(ggplot2)
   library(dplyr)
   library(tidyr)
-  library(ggplot2)
-  library(readr)
+  library(readxl)
+  library(stringr)
   library(stringi)
+  library(scales)
+  library(sf)
+  library(rnaturalearth)
 })
 
-use_scatterpie <- requireNamespace("scatterpie", quietly = TRUE)
-if (!use_scatterpie) {
-  cat("[structure_pies_map] 'scatterpie' missing, trying install...\n")
-  try(install.packages("scatterpie"), silent = TRUE)
-  use_scatterpie <- requireNamespace("scatterpie", quietly = TRUE)
+if (!requireNamespace("scatterpie", quietly = TRUE)) {
+  stop("MISSING FROM YOUR SIDE: Package 'scatterpie' is required. Install it with install.packages('scatterpie').")
 }
-use_sf <- requireNamespace("sf", quietly = TRUE)
-use_rnaturalearth <- requireNamespace("rnaturalearth", quietly = TRUE)
-use_ggspatial <- requireNamespace("ggspatial", quietly = TRUE)
 
-q_dirs <- c("outputs/v1/structure_runs/Q_extracted")
+has_ggspatial <- requireNamespace("ggspatial", quietly = TRUE)
+has_ggrepel <- requireNamespace("ggrepel", quietly = TRUE)
+
+# -----------------------------
+# User options
+# -----------------------------
+pad_lon <- 2.0
+pad_lat <- 1.5
+pie_r_min <- 0.04
+pie_r_max <- 0.10
+save_per_k_pdf <- TRUE
+
+# overlap reduction (stable deterministic offsets)
+jitter_lon <- 0.03
+jitter_lat <- 0.02
+
+# optional labels
+add_site_labels <- FALSE
+
+# optional tile background
+use_tiles <- FALSE
+
+# -----------------------------
+# Strict paths
+# -----------------------------
+project_root <- normalizePath(".", winslash = "/", mustWork = TRUE)
+q_dir <- file.path(project_root, "outputs", "v1", "structure_runs", "Q_extracted")
+meta_path <- file.path(project_root, "data", "raw", "donnees_modifiees_west_summer2024 copie.xlsx")
+out_dir <- file.path(project_root, "outputs", "figures")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!dir.exists(q_dir)) {
+  stop("MISSING FROM YOUR SIDE: Q directory not found at outputs/v1/structure_runs/Q_extracted/.")
+}
+if (!file.exists(meta_path)) {
+  stop("MISSING FROM YOUR SIDE: Missing metadata file data/raw/donnees_modifiees_west_summer2024 copie.xlsx.")
+}
+
+# -----------------------------
+# Helpers
+# -----------------------------
+to_utf8 <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (!is.character(x)) return(x)
+  y <- iconv(x, from = "", to = "UTF-8", sub = "")
+  y[is.na(y)] <- ""
+  y
+}
 
 clean_names <- function(x) {
-  x <- iconv(as.character(x), from = "", to = "UTF-8", sub = "")
-  x[is.na(x)] <- ""
-  x <- trimws(x)
+  x <- to_utf8(x)
   x <- stringi::stri_trans_general(x, "Latin-ASCII")
+  x <- tolower(x)
   x <- gsub("\\s+", "_", x)
-  x <- gsub("[^a-zA-Z0-9_]+", "_", x)
+  x <- gsub("[^a-z0-9_]+", "_", x)
   x <- gsub("_+", "_", x)
   x <- gsub("^_|_$", "", x)
-  tolower(x)
+  x
 }
 
-safe_basename <- function(x) {
-  b <- basename(x)
-  b <- iconv(as.character(b), from = "", to = "UTF-8", sub = "")
-  b[is.na(b)] <- ""
-  b
-}
-
-read_tabular_clean <- function(path) {
-  ext <- tolower(tools::file_ext(path))
-  dat <- tryCatch({
-    if (ext == "csv") {
-      suppressWarnings(readr::read_csv(path, show_col_types = FALSE, guess_max = 5000, locale = readr::locale(encoding = "UTF-8"), comment = "#", name_repair = "minimal"))
-    } else if (ext %in% c("tsv", "txt", "dat", "pop")) {
-      utils::read.table(path, header = FALSE, fill = TRUE, stringsAsFactors = FALSE, check.names = FALSE, sep = "", comment.char = "")
-    } else {
-      suppressWarnings(readr::read_csv(path, show_col_types = FALSE, guess_max = 5000, locale = readr::locale(encoding = "UTF-8"), comment = "#", name_repair = "minimal"))
+apply_utf8_df <- function(df) {
+  names(df) <- to_utf8(names(df))
+  for (j in seq_along(df)) {
+    if (is.character(df[[j]]) || is.factor(df[[j]])) {
+      df[[j]] <- to_utf8(df[[j]])
     }
-  }, error = function(e) NULL)
-  if (is.null(dat)) return(NULL)
-  
-  dat <- as.data.frame(dat, stringsAsFactors = FALSE, check.names = FALSE)
-  nms <- names(dat)
-  if (is.null(nms)) nms <- paste0("v", seq_len(ncol(dat)))
-  names(dat) <- clean_names(nms)
-  
-  keep <- !grepl("^\\.\\.\\.[0-9]+$", names(dat)) & !grepl("^\\.\\.[0-9]+$", names(dat))
-  dat <- dat[, keep, drop = FALSE]
-  non_empty <- vapply(dat, function(col) {
-    v <- trimws(as.character(col)); any(!is.na(v) & v != "")
-  }, logical(1))
-  dat <- dat[, non_empty, drop = FALSE]
-  names(dat) <- make.unique(names(dat), sep = "_")
-  dat
-}
-
-choose_col <- function(nms, candidates) {
-  i <- which(nms %in% candidates)
-  if (length(i) > 0) nms[i[1]] else NA_character_
-}
-
-extract_k <- function(path) {
-  nm <- safe_basename(path)
-  pats <- c("(?i)k\\s*=\\s*(\\d+)", "(?i)-k(\\d+)\\b", "(?i)_k(\\d+)\\b", "(?i)\\bk(\\d+)\\b")
-  for (pt in pats) {
-    m <- regexec(pt, nm, perl = TRUE)
-    g <- regmatches(nm, m)[[1]]
-    if (length(g) >= 2) return(as.integer(g[2]))
   }
-  NA_integer_
+  df
+}
+
+remove_empty_auto_cols <- function(df) {
+  if (ncol(df) == 0) return(df)
+  nm <- names(df)
+  nm[is.na(nm)] <- ""
+  keep_nm <- !grepl("^\\.\\.\\.[0-9]+$", nm)
+  df <- df[, keep_nm, drop = FALSE]
+  if (ncol(df) == 0) return(df)
+  
+  non_empty <- vapply(df, function(col) {
+    z <- trimws(as.character(col))
+    any(!is.na(z) & z != "")
+  }, logical(1))
+  df[, non_empty, drop = FALSE]
+}
+
+pick_first <- function(nms, candidates) {
+  hit <- intersect(candidates, nms)
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+extract_k <- function(path, default_k) {
+  b <- basename(path)
+  m <- stringr::str_match(b, "(?i)k\\s*[-_=]?\\s*(\\d+)")
+  if (!is.na(m[1, 2])) return(as.integer(m[1, 2]))
+  as.integer(default_k)
 }
 
 extract_rep <- function(path) {
-  nm <- safe_basename(path)
+  b <- basename(path)
   pats <- c(
-    "(?i)-k\\d+-(\\d+)_f\\.q$",
-    "(?i)-k\\d+[-_](\\d+)\\b",
-    "(?i)rep(?:licate)?[-_ ]?(\\d+)\\b",
-    "(?i)run[-_ ]?(\\d+)\\b"
+    "(?i)rep(?:licate)?[-_ ]?(\\d+)",
+    "(?i)run[-_ ]?(\\d+)",
+    "(?i)k\\s*\\d+[-_](\\d+)",
+    "(?i)k\\s*\\d+\\D+(\\d+)"
   )
   for (pt in pats) {
-    m <- regexec(pt, nm, perl = TRUE)
-    g <- regmatches(nm, m)[[1]]
-    if (length(g) >= 2) return(as.integer(g[2]))
+    m <- stringr::str_match(b, pt)
+    if (!is.na(m[1, 2])) return(as.integer(m[1, 2]))
   }
   1L
 }
 
-is_numeric_like <- function(x) {
+is_num_like <- function(x) {
   suppressWarnings(y <- as.numeric(as.character(x)))
   mean(!is.na(y)) >= 0.95
 }
 
-site_candidates <- c("site", "population", "pop", "numero_population", "num_population", "station", "sampling_site", "localite", "location", "site_id", "pop_id", "id_site", "v1")
-id_candidates <- c("id", "ind_id", "ind", "nom_labo_echantillons", "sample", "sample_id", "individual", "individu", "v2")
-lon_candidates <- c("lon", "long", "longitude", "x")
-lat_candidates <- c("lat", "latitude", "y")
-
-meta_site_path <- file.path(PROJECT_ROOT, "inputs", "site_metadata.csv")
-if (!file.exists(meta_site_path)) stop("Missing inputs/site_metadata.csv")
-meta_site <- read_tabular_clean(meta_site_path)
-if (is.null(meta_site) || nrow(meta_site) == 0) stop("Could not read inputs/site_metadata.csv")
-cat("[structure_pies_map] meta_site columns:\n")
-print(names(meta_site))
-
-site_col_site <- choose_col(names(meta_site), site_candidates)
-if (is.na(site_col_site)) stop("inputs/site_metadata.csv must contain a site/population column.")
-meta_site <- meta_site %>% mutate(site = as.character(.data[[site_col_site]]))
-
-coords_paths <- c(
-  file.path(PROJECT_ROOT, "inputs", "site_coordinates.csv"),
-  file.path(PROJECT_ROOT, "inputs", "site_coords.csv"),
-  file.path(PROJECT_ROOT, "inputs", "sites_latlon.csv"),
-  file.path(PROJECT_ROOT, "inputs", "coordinates.csv")
-)
-coords_tbl <- NULL
-for (p in coords_paths) {
-  if (!file.exists(p)) next
-  x <- read_tabular_clean(p)
-  if (is.null(x)) next
-  sc <- choose_col(names(x), site_candidates)
-  lc <- choose_col(names(x), lon_candidates)
-  tc <- choose_col(names(x), lat_candidates)
-  if (is.na(sc) || is.na(lc) || is.na(tc)) next
-  coords_tbl <- x %>% transmute(site = as.character(.data[[sc]]), lon = suppressWarnings(as.numeric(.data[[lc]])), lat = suppressWarnings(as.numeric(.data[[tc]])))
-  cat("[structure_pies_map] Using coords file:", p, "\n")
-  break
-}
-if (!is.null(coords_tbl)) {
-  meta_site <- meta_site %>% left_join(coords_tbl, by = "site")
-} else {
-  lc <- choose_col(names(meta_site), lon_candidates)
-  tc <- choose_col(names(meta_site), lat_candidates)
-  if (!is.na(lc) && !is.na(tc)) {
-    meta_site <- meta_site %>% mutate(lon = suppressWarnings(as.numeric(.data[[lc]])), lat = suppressWarnings(as.numeric(.data[[tc]])))
-  } else {
-    meta_site <- meta_site %>% mutate(lon = NA_real_, lat = NA_real_)
-  }
-}
-cat("[structure_pies_map] site coords: with=", sum(!is.na(meta_site$lon) & !is.na(meta_site$lat)), " missing=", sum(is.na(meta_site$lon) | is.na(meta_site$lat)), "\n", sep = "")
-
-q_abs <- unique(file.path(PROJECT_ROOT, q_dirs))
-q_abs <- q_abs[dir.exists(q_abs)]
-if (length(q_abs) == 0) stop("q_dirs not found: ", paste(q_dirs, collapse = ", "))
-
-q_files <- unlist(lapply(q_abs, function(d) list.files(d, pattern = "\\.(Q|q|txt|csv)$", recursive = TRUE, full.names = TRUE)), use.names = FALSE)
-q_files <- unique(q_files)
-q_files <- q_files[!grepl("dapc_supervised_posterior", safe_basename(q_files), ignore.case = TRUE)]
-q_files <- q_files[!grepl("harvest|summary|log|evanno|delta|trace|plot|meta", safe_basename(q_files), ignore.case = TRUE)]
-if (length(q_files) == 0) stop("No Q files found in q_dirs.")
-
-parse_q <- function(path) {
-  ext <- tolower(tools::file_ext(path))
-  dat <- tryCatch({
-    if (ext == "csv") suppressWarnings(readr::read_csv(path, show_col_types = FALSE, guess_max = 5000, locale = readr::locale(encoding = "UTF-8"), comment = "#", name_repair = "minimal"))
-    else utils::read.table(path, header = FALSE, fill = TRUE, stringsAsFactors = FALSE, check.names = FALSE, comment.char = "")
-  }, error = function(e) NULL)
-  if (is.null(dat)) return(NULL)
-  
-  dat <- as.data.frame(dat, stringsAsFactors = FALSE, check.names = FALSE)
-  if (nrow(dat) < 3 || ncol(dat) < 2) return(NULL)
-  
-  nms <- names(dat); if (is.null(nms)) nms <- paste0("v", seq_len(ncol(dat)))
-  names(dat) <- clean_names(nms)
-  names(dat)[names(dat) == ""] <- paste0("col", seq_len(sum(names(dat) == "")))
-  
-  keep <- !grepl("^\\.\\.\\.[0-9]+$", names(dat))
-  dat <- dat[, keep, drop = FALSE]
-  
-  num_like <- vapply(dat, is_numeric_like, logical(1))
-  id_col <- NA_character_
-  if (!num_like[1] && sum(num_like[-1]) >= 2) id_col <- names(dat)[1]
-  
-  q_cols <- if (!is.na(id_col)) names(dat)[-1] else names(dat)[num_like]
-  if (length(q_cols) < 2) return(NULL)
-  
-  q <- as.data.frame(lapply(dat[, q_cols, drop = FALSE], function(z) suppressWarnings(as.numeric(as.character(z)))))
-  keep_rows <- rowSums(is.na(q)) == 0
-  q <- q[keep_rows, , drop = FALSE]
-  if (nrow(q) < 3) return(NULL)
-  
-  if (!all(q >= -1e-8 & q <= 1 + 1e-8, na.rm = TRUE)) return(NULL)
-  if (mean(abs(rowSums(q) - 1) <= 0.02) < 0.95) return(NULL)
-  
-  k <- extract_k(path); if (is.na(k)) k <- ncol(q)
-  if (k > 20 || k == nrow(q)) return(NULL)
-  
-  ids <- NULL
-  if (!is.na(id_col)) {
-    ids <- as.character(dat[[id_col]])
-    ids <- ids[keep_rows]
+load_states_layer <- function() {
+  if (requireNamespace("rnaturalearthhires", quietly = TRUE)) {
+    st <- tryCatch(
+      rnaturalearth::ne_states(
+        country = c("canada", "united states of america"),
+        returnclass = "sf"
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(st) && nrow(st) > 0) return(list(data = st, method = "rnaturalearth::ne_states"))
   }
   
-  colnames(q) <- paste0("Q", seq_len(ncol(q)))
-  list(path = path, k = k, rep = extract_rep(path), q = q, ids = ids, n = nrow(q), p = ncol(q))
-}
-
-q_list <- list()
-for (f in q_files) {
-  x <- parse_q(f)
-  if (is.null(x)) next
-  q_list[[f]] <- x
-  cat("[structure_pies_map] Q retained:", f, "| K=", x$k, "| rep=", x$rep, "| n=", x$n, "| p=", x$p, "\n", sep = "")
-}
-if (length(q_list) == 0) stop("No valid Q files retained.")
-
-find_ids_q <- function(target_n) {
-  base_dir <- file.path(PROJECT_ROOT, "outputs", "v1", "structure_runs")
-  if (!dir.exists(base_dir)) return(NULL)
+  st <- tryCatch(
+    rnaturalearth::ne_download(
+      scale = 50,
+      type = "admin_1_states_provinces_lines",
+      category = "cultural",
+      returnclass = "sf"
+    ),
+    error = function(e) NULL
+  )
   
-  all_files <- list.files(base_dir, recursive = TRUE, full.names = TRUE)
-  all_files <- all_files[file.exists(all_files)]
-  all_files <- all_files[!dir.exists(all_files)]
-  all_files <- all_files[grepl("ind|inds|id|ids|order|sample|individual|popfile|mainparams", safe_basename(all_files), ignore.case = TRUE)]
-  if (length(all_files) == 0) return(NULL)
-  
-  best <- NULL; best_score <- -Inf
-  for (f in all_files) {
-    d <- read_tabular_clean(f)
-    
-    # line-based fallback for weird/no-extension files
-    if (is.null(d)) {
-      lines <- tryCatch(readLines(f, warn = FALSE), error = function(e) character(0))
-      if (length(lines) > 0) {
-        spl <- strsplit(trimws(lines), "\\s+")
-        lens <- lengths(spl)
-        keep <- lens >= 2
-        if (sum(keep) > 0) {
-          m <- do.call(rbind, lapply(spl[keep], function(v) c(v[1], v[2])))
-          d <- data.frame(v1 = m[, 1], v2 = m[, 2], stringsAsFactors = FALSE)
-        }
-      }
-    }
-    
-    if (is.null(d)) next
-    nr <- nrow(d)
-    if (nr < 200 || nr > 400) next
-    
-    idc <- choose_col(names(d), id_candidates)
-    if (is.na(idc) && ncol(d) >= 2) idc <- names(d)[2]
-    if (is.na(idc)) next
-    
-    score <- 0
-    score <- score + ifelse(abs(nr - target_n) <= 2, 8, ifelse(abs(nr - target_n) <= 10, 4, 0))
-    score <- score + ifelse(grepl("popfile|order|ind_ids|individual", safe_basename(f), ignore.case = TRUE), 3, 0)
-    
-    if (score > best_score) {
-      best_score <- score
-      best <- list(path = f, data = d, id_col = idc)
-    }
+  if (is.null(st) || nrow(st) == 0) {
+    st <- tryCatch(
+      rnaturalearth::ne_download(
+        scale = 50,
+        type = "admin_1_states_provinces",
+        category = "cultural",
+        returnclass = "sf"
+      ),
+      error = function(e) NULL
+    )
   }
   
-  if (is.null(best)) return(NULL)
-  out <- best$data %>% transmute(ind_id = as.character(.data[[best$id_col]]))
-  cat("[structure_pies_map] Using ids_q file:", best$path, "(n=", nrow(out), ", id_col=", best$id_col, ")\n", sep = "")
-  out
-}
-
-find_meta_ind <- function(target_n, ids_q = NULL) {
-  scan_dirs <- c(file.path(PROJECT_ROOT, "outputs", "v1", "structure_runs"), file.path(PROJECT_ROOT, "outputs", "v1"), file.path(PROJECT_ROOT, "inputs"))
-  files <- unlist(lapply(scan_dirs, function(d) {
-    if (!dir.exists(d)) return(character(0))
-    list.files(d, recursive = TRUE, full.names = TRUE)
-  }), use.names = FALSE)
-  files <- unique(files)
-  files <- files[file.exists(files)]
-  files <- files[!dir.exists(files)]
-  files <- files[!grepl("site_metadata\\.csv$", files, ignore.case = TRUE)]
+  if (is.null(st) || nrow(st) == 0) return(list(data = NULL, method = "none"))
   
-  best <- NULL; best_score <- -Inf
-  for (f in files) {
-    d <- read_tabular_clean(f)
-    if (is.null(d)) next
-    nr <- nrow(d)
-    if (nr < 250 || nr > 320) next
-    
-    idc <- choose_col(names(d), id_candidates)
-    sc <- choose_col(names(d), site_candidates)
-    if (is.na(sc) && "v1" %in% names(d)) sc <- "v1"
-    if (is.na(idc) && "v2" %in% names(d)) idc <- "v2"
-    if (is.na(idc) || is.na(sc)) next
-    
-    score <- 0
-    score <- score + ifelse(abs(nr - target_n) <= 1, 12, ifelse(abs(nr - target_n) <= 3, 7, ifelse(abs(nr - target_n) <= 10, 3, 0)))
-    score <- score + ifelse(grepl("structure_runs", f, ignore.case = TRUE), 4, 0)
-    score <- score + ifelse(grepl("popfile|sample|individual|meta", safe_basename(f), ignore.case = TRUE), 2, 0)
-    
-    if (!is.null(ids_q) && nrow(ids_q) == nr) {
-      tmp_ids <- as.character(d[[idc]])
-      overlap <- mean(ids_q$ind_id %in% tmp_ids)
-      score <- score + 8 * overlap
-    }
-    
-    if (score > best_score) {
-      best_score <- score
-      best <- list(path = f, n = nr, id_col = idc, site_col = sc, data = d)
-    }
+  nm <- names(st)
+  country_col <- intersect(c("admin", "adm0_name", "geonunit", "sr_adm0_a3", "adm0_a3"), nm)
+  if (length(country_col) > 0) {
+    cc <- country_col[1]
+    keep <- grepl("canada|united states", tolower(as.character(st[[cc]]))) |
+      as.character(st[[cc]]) %in% c("CAN", "USA")
+    st <- st[keep, , drop = FALSE]
   }
   
-  if (is.null(best)) return(NULL)
-  
-  # hard guard: if no ids_q and selected meta_ind does not match target_n exactly, reject
-  if (is.null(ids_q) && best$n != target_n) return(NULL)
-  
-  cat("[structure_pies_map] Using individual metadata:", best$path, "(n=", best$n, ", id_col=", best$id_col, ", site_col=", best$site_col, ")\n", sep = "")
-  best$data %>% transmute(ind_id = as.character(.data[[best$id_col]]), site = as.character(.data[[best$site_col]]))
+  if (nrow(st) == 0) return(list(data = NULL, method = "none"))
+  list(data = st, method = "rnaturalearth::ne_download")
 }
 
-target_n <- max(vapply(q_list, function(x) x$n, numeric(1)))
-ids_q <- find_ids_q(target_n)
-meta_ind <- find_meta_ind(target_n, ids_q)
-if (is.null(meta_ind)) {
-  stop("No compatible individual metadata found for STRUCTURE cohort (n=", target_n, ").\nProvide an IDs/order file in outputs/v1/structure_runs/ (e.g., popfile/ind_ids).")
+# -----------------------------
+# 1) Read metadata
+# -----------------------------
+sheets <- readxl::excel_sheets(meta_path)
+if (length(sheets) == 0) {
+  stop("MISSING FROM YOUR SIDE: No readable sheet in metadata Excel.")
 }
 
-site_rep_list <- list()
-for (nm in names(q_list)) {
-  x <- q_list[[nm]]
-  qdf <- x$q %>% mutate(row_index = row_number())
-  cat("[structure_pies_map] merge for", basename(nm), "| Q n=", nrow(qdf), "| meta_ind n=", nrow(meta_ind), "\n")
+target_sheet <- NA_character_
+meta_raw <- NULL
+for (sh in sheets) {
+  tmp <- tryCatch(readxl::read_excel(meta_path, sheet = sh), error = function(e) NULL)
+  if (is.null(tmp) || nrow(tmp) == 0 || ncol(tmp) == 0) next
+  tmp <- apply_utf8_df(tmp)
+  names(tmp) <- clean_names(names(tmp))
+  tmp <- remove_empty_auto_cols(tmp)
+  if (ncol(tmp) == 0) next
   
-  if (!is.null(x$ids)) {
-    qdf$ind_id <- as.character(x$ids)
-  } else if (!is.null(ids_q)) {
-    if (nrow(ids_q) != nrow(qdf)) {
-      stop("Impossible to map Q rows to individuals: provide an IDs file in outputs/v1/structure_runs/ (ind_id order) OR use the same meta_ind cohort as STRUCTURE (n=", nrow(qdf), ").")
-    }
-    qdf$ind_id <- ids_q$ind_id
+  if ("nom_labo_echantillons" %in% names(tmp) || "nom_labo_echantillon" %in% names(tmp)) {
+    target_sheet <- sh
+    meta_raw <- tmp
+    break
+  }
+}
+
+if (is.na(target_sheet) || is.null(meta_raw)) {
+  stop("MISSING FROM YOUR SIDE: Could not find a sheet containing Nom_Labo_Échantillons in metadata Excel.")
+}
+
+id_col <- pick_first(names(meta_raw), c("nom_labo_echantillons", "nom_labo_echantillon"))
+site_col <- pick_first(names(meta_raw), c("numero_population", "num_population"))
+lon_col <- pick_first(names(meta_raw), c("lon", "long", "longitude", "x"))
+lat_col <- pick_first(names(meta_raw), c("lat", "latitude", "y"))
+
+if (is.na(id_col) || is.na(site_col)) {
+  stop(sprintf(
+    "MISSING FROM YOUR SIDE: Could not detect required ID/SITE columns. Columns found: %s",
+    paste(names(meta_raw), collapse = ", ")
+  ))
+}
+if (is.na(lon_col) || is.na(lat_col)) {
+  stop("MISSING FROM YOUR SIDE: Longitude and latitude columns not found in genetic sheet.")
+}
+
+meta_ind <- meta_raw %>%
+  transmute(
+    id_ind = to_utf8(as.character(.data[[id_col]])),
+    site = to_utf8(as.character(.data[[site_col]])),
+    lon = suppressWarnings(as.numeric(.data[[lon_col]])),
+    lat = suppressWarnings(as.numeric(.data[[lat_col]])),
+    row_idx = row_number()
+  )
+
+if (nrow(meta_ind) == 0) {
+  stop("MISSING FROM YOUR SIDE: Genetic sheet has 0 data rows.")
+}
+if (any(is.na(meta_ind$site) | meta_ind$site == "")) {
+  stop("MISSING FROM YOUR SIDE: Some individuals have missing Numéro_Population in genetic sheet.")
+}
+if (any(is.na(meta_ind$lon) | is.na(meta_ind$lat))) {
+  stop("MISSING FROM YOUR SIDE: Some individuals have missing longitude/latitude values in genetic sheet.")
+}
+if (any(abs(meta_ind$lon) > 180, na.rm = TRUE) || any(abs(meta_ind$lat) > 90, na.rm = TRUE)) {
+  stop(
+    paste0(
+      "MISSING FROM YOUR SIDE: Coordinates are not valid lon/lat degrees (WGS84). ",
+      "Values suggest projected coordinates (e.g., UTM)."
+    )
+  )
+}
+
+# -----------------------------
+# 2) Read Q files
+# -----------------------------
+read_q_file <- function(path) {
+  dat <- tryCatch(
+    utils::read.table(path, header = FALSE, fill = TRUE, stringsAsFactors = FALSE,
+                      check.names = FALSE, comment.char = "", sep = ""),
+    error = function(e) NULL
+  )
+  if (is.null(dat) || nrow(dat) == 0 || ncol(dat) == 0) return(NULL)
+  
+  dat <- apply_utf8_df(dat)
+  names(dat) <- clean_names(names(dat))
+  dat <- remove_empty_auto_cols(dat)
+  if (ncol(dat) < 2) return(NULL)
+  
+  num_like <- vapply(dat, is_num_like, logical(1))
+  if (sum(num_like) < 2) return(NULL)
+  
+  q <- dat[, num_like, drop = FALSE]
+  q <- as.data.frame(lapply(q, function(z) suppressWarnings(as.numeric(as.character(z)))))
+  
+  q <- q[stats::complete.cases(q), , drop = FALSE]
+  if (nrow(q) == 0) return(NULL)
+  
+  if (any(as.matrix(q) < -1e-8 | as.matrix(q) > 1 + 1e-8, na.rm = TRUE)) {
+    stop(sprintf("MISSING FROM YOUR SIDE: Q values outside [0,1] in file %s.", basename(path)))
   }
   
-  merged <- NULL
-  if ("ind_id" %in% names(qdf)) {
-    merged <- qdf %>% left_join(meta_ind, by = "ind_id")
-    matched <- sum(!is.na(merged$site))
-    unmatched <- nrow(merged) - matched
-    bad <- unique(merged$ind_id[is.na(merged$site)]); bad <- bad[!is.na(bad)]
-    cat("[structure_pies_map] matched=", matched, " unmatched=", unmatched, " bad_ids=", ifelse(length(bad)==0,"none",paste(head(bad,10), collapse=", ")), "\n", sep = "")
-    merged <- merged %>% filter(!is.na(site))
-  } else {
-    if (nrow(qdf) != nrow(meta_ind)) {
-      stop("Impossible to map Q rows to individuals: provide an IDs file in outputs/v1/structure_runs/ (ind_id order) OR use the same meta_ind cohort as STRUCTURE (n=", nrow(qdf), ").")
-    }
-    merged <- qdf %>% left_join(meta_ind %>% mutate(row_index = row_number()), by = "row_index")
+  rs <- rowSums(q)
+  if (mean(abs(rs - 1) <= 0.02) < 0.95) {
+    stop(sprintf("MISSING FROM YOUR SIDE: Q rowSums are not approximately 1 in file %s.", basename(path)))
   }
   
-  if (nrow(merged) == 0) next
+  k <- extract_k(path, ncol(q))
+  if (k > ncol(q)) {
+    stop(sprintf("MISSING FROM YOUR SIDE: Detected K=%s but only %s numeric columns in %s.",
+                 k, ncol(q), basename(path)))
+  }
   
-  site_rep <- merged %>%
-    group_by(site) %>%
-    summarise(n_ind = n(), across(starts_with("Q"), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
-    mutate(K = x$k, rep = x$rep, q_file = basename(nm))
+  q <- q[, seq_len(k), drop = FALSE]
+  names(q) <- paste0("Q", seq_len(k))
   
-  site_rep_list[[nm]] <- site_rep
+  list(file = path, K = k, replicate = extract_rep(path), q = q)
 }
 
-if (length(site_rep_list) == 0) stop("No valid K datasets after merge checks.")
+q_files <- list.files(q_dir, full.names = TRUE)
+q_files <- q_files[file.info(q_files)$isdir %in% FALSE]
+if (length(q_files) == 0) {
+  stop("MISSING FROM YOUR SIDE: No files found in outputs/v1/structure_runs/Q_extracted/.")
+}
 
-site_rep_df <- bind_rows(site_rep_list)
-cluster_cols_all <- grep("^Q[0-9]+$", names(site_rep_df), value = TRUE)
+q_list_all <- lapply(q_files, read_q_file)
+q_list_all <- q_list_all[!vapply(q_list_all, is.null, logical(1))]
+if (length(q_list_all) == 0) {
+  stop("MISSING FROM YOUR SIDE: No valid Q files could be parsed from outputs/v1/structure_runs/Q_extracted/.")
+}
 
-site_k_df <- site_rep_df %>%
-  group_by(site, K) %>%
+k_detected_all <- sort(unique(vapply(q_list_all, function(x) x$K, integer(1))))
+k_plot <- sort(intersect(k_detected_all, 2:12))
+if (length(k_plot) == 0) {
+  stop(sprintf(
+    "MISSING FROM YOUR SIDE: No K in 2:12 detected in Q files. Available K: %s",
+    paste(k_detected_all, collapse = ", ")
+  ))
+}
+
+q_list <- q_list_all[vapply(q_list_all, function(x) x$K %in% k_plot, logical(1))]
+
+# -----------------------------
+# 3) Join by order + aggregate
+# -----------------------------
+long_all <- list()
+for (i in seq_along(q_list)) {
+  qi <- q_list[[i]]
+  q_df <- qi$q
+  
+  if (nrow(q_df) != nrow(meta_ind)) {
+    stop(sprintf(
+      paste0(
+        "MISSING FROM YOUR SIDE: Q rows (%s) do not match number of individuals in genetic sheet (%s). ",
+        "Ensure STRUCTURE used the same individual order."
+      ),
+      nrow(q_df), nrow(meta_ind)
+    ))
+  }
+  
+  merged <- dplyr::bind_cols(meta_ind, q_df)
+  long_i <- merged %>%
+    pivot_longer(cols = starts_with("Q"), names_to = "cluster", values_to = "prop") %>%
+    mutate(K = qi$K, replicate = qi$replicate)
+  
+  long_all[[i]] <- long_i
+}
+long_all <- bind_rows(long_all)
+
+site_rep <- long_all %>%
+  group_by(site, K, replicate, cluster) %>%
+  summarise(prop = mean(prop, na.rm = TRUE), .groups = "drop")
+
+site_k <- site_rep %>%
+  group_by(site, K, cluster) %>%
+  summarise(prop = mean(prop, na.rm = TRUE), .groups = "drop")
+
+site_meta <- meta_ind %>%
+  group_by(site) %>%
   summarise(
-    n_ind = mean(n_ind, na.rm = TRUE),
-    n_reps = n_distinct(rep),
-    across(all_of(cluster_cols_all), ~ mean(.x, na.rm = TRUE)),
+    n_ind = n(),
+    lon = mean(lon, na.rm = TRUE),
+    lat = mean(lat, na.rm = TRUE),
     .groups = "drop"
+  )
+
+plot_df <- site_k %>% left_join(site_meta, by = "site")
+plot_wide <- plot_df %>%
+  select(site, K, cluster, prop, n_ind, lon, lat) %>%
+  pivot_wider(names_from = cluster, values_from = prop, values_fill = 0) %>%
+  filter(K %in% k_plot)
+
+# bounded radii
+plot_wide <- plot_wide %>%
+  mutate(
+    base_r = sqrt(n_ind),
+    r = scales::rescale(base_r, to = c(pie_r_min, pie_r_max))
+  )
+
+# deterministic offsets to reduce overlap
+site_offset <- site_meta %>%
+  arrange(site) %>%
+  mutate(
+    idx = row_number(),
+    ang = 2 * pi * (idx - 1) / pmax(n(), 1),
+    dx = jitter_lon * cos(ang),
+    dy = jitter_lat * sin(ang),
+    lon_plot = lon + dx,
+    lat_plot = lat + dy
   ) %>%
-  left_join(meta_site, by = "site")
+  select(site, lon_plot, lat_plot)
 
-if (nrow(site_k_df) == 0) stop("No site-level rows after aggregation.")
+plot_wide <- plot_wide %>% left_join(site_offset, by = "site")
 
-max_k <- max(site_k_df$K, na.rm = TRUE)
-cluster_cols <- paste0("Q", seq_len(max_k))
-for (cc in cluster_cols) if (!(cc %in% names(site_k_df))) site_k_df[[cc]] <- 0
-pal <- setNames(scales::hue_pal()(max_k), cluster_cols)
+# -----------------------------
+# 4) Basemap + extent
+# -----------------------------
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+states_info <- load_states_layer()
+states <- states_info$data
+basemap_method <- states_info$method
 
-has_coords <- any(!is.na(site_k_df$lon) & !is.na(site_k_df$lat))
-subtitle_reps <- paste0("Pies = mean Q by site; replicate-averaged per K (n_reps range: ", min(site_k_df$n_reps, na.rm = TRUE), "-", max(site_k_df$n_reps, na.rm = TRUE), ")")
-
-if (has_coords) {
-  miss <- site_k_df %>% filter(is.na(lon) | is.na(lat)) %>% distinct(site)
-  if (nrow(miss) > 0) warning("Sites excluded from spatial plot (missing lon/lat): ", paste(miss$site, collapse = ", "))
-  plot_df <- site_k_df %>% filter(!is.na(lon), !is.na(lat)) %>% mutate(K_label = paste0("K=", K), radius_raw = sqrt(n_ind))
-  if (nrow(plot_df) == 0) has_coords <- FALSE
+if (is.null(world) || nrow(world) == 0) {
+  stop("MISSING FROM YOUR SIDE: Could not load world basemap from rnaturalearth.")
+}
+if (is.null(states) || nrow(states) == 0) {
+  stop(
+    paste0(
+      "MISSING FROM YOUR SIDE: Could not load provinces/states boundaries. ",
+      "Install 'rnaturalearthhires' OR allow Natural Earth downloads, then rerun."
+    )
+  )
 }
 
-if (has_coords) {
-  span <- max(diff(range(plot_df$lon, na.rm = TRUE)), diff(range(plot_df$lat, na.rm = TRUE)))
-  if (!is.finite(span) || span <= 0) span <- 1
-  plot_df <- plot_df %>% mutate(radius = radius_raw * (0.03 * span / max(radius_raw, na.rm = TRUE)))
-  
-  p <- ggplot()
-  if (use_sf && use_rnaturalearth) {
-    base <- tryCatch({
-      w <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
-      bb <- sf::st_bbox(c(xmin = min(plot_df$lon) - 1, xmax = max(plot_df$lon) + 1, ymin = min(plot_df$lat) - 1, ymax = max(plot_df$lat) + 1), crs = sf::st_crs(4326))
-      geom_sf(data = sf::st_crop(w, bb), fill = "grey97", color = "grey70", linewidth = 0.2)
-    }, error = function(e) NULL)
-    if (!is.null(base)) p <- p + base
-  }
-  
-  if (use_scatterpie) {
-    p <- p + scatterpie::geom_scatterpie(data = plot_df, aes(x = lon, y = lat, r = radius), cols = cluster_cols, color = "grey25", linewidth = 0.2, alpha = 0.95)
-  } else {
-    long <- plot_df %>%
-      pivot_longer(cols = all_of(cluster_cols), names_to = "cluster", values_to = "q") %>%
-      group_by(site, K, K_label, lon, lat, n_ind, radius_raw) %>%
-      slice_max(q, n = 1, with_ties = FALSE) %>%
-      ungroup()
-    p <- p + geom_point(data = long, aes(x = lon, y = lat, size = radius_raw, fill = cluster), shape = 21, color = "grey20")
-  }
-  
-  bks <- pretty(plot_df$n_ind, n = 3); bks <- bks[bks > 0]
-  if (length(bks) == 0) bks <- sort(unique(plot_df$n_ind))[1]
-  
-  p <- p +
-    geom_point(data = plot_df, aes(x = lon, y = lat, size = n_ind), alpha = 0, color = NA) +
-    scale_fill_manual(values = pal, name = "Clusters") +
-    scale_size_continuous(name = "Samples (n)", breaks = bks) +
-    facet_wrap(~K_label, ncol = ifelse(length(unique(plot_df$K)) <= 4, 2, 3)) +
-    coord_equal() +
-    labs(title = "STRUCTURE mean Q by site", subtitle = subtitle_reps, x = "Longitude", y = "Latitude") +
-    theme_bw(base_size = 11) +
-    theme(plot.title = element_text(face = "bold"), strip.text = element_text(face = "bold"), panel.grid.minor = element_blank(), legend.position = "right")
-  
-  if (use_ggspatial) {
-    p <- p +
-      ggspatial::annotation_scale(location = "bl", width_hint = 0.25) +
-      ggspatial::annotation_north_arrow(location = "tl", which_north = "true", style = ggspatial::north_arrow_fancy_orienteering)
-  }
-  
-  pdf_path <- file.path(OUT_DIR, "structure_pies_map.pdf")
-  png_path <- file.path(OUT_DIR, "structure_pies_map.png")
-  ggsave(pdf_path, p, width = 12, height = 8, device = grDevices::cairo_pdf)
-  ggsave(png_path, p, width = 12, height = 8, dpi = 400)
-  cat("[structure_pies_map] Figure exported:\n - ", pdf_path, "\n - ", png_path, "\n", sep = "")
-  
-} else {
-  cat("[structure_pies_map] No lon/lat found: generated non-spatial pies. To enable map, add inputs/site_coordinates.csv with columns site, lon, lat.\n")
-  
-  plot_df <- site_k_df %>% mutate(site = factor(site, levels = unique(site[order(region_ns, site)])), x_site = as.numeric(site), y_site = 0, K_label = paste0("K=", K), radius_raw = sqrt(n_ind))
-  plot_df <- plot_df %>% mutate(radius = radius_raw * (0.35 / max(radius_raw, na.rm = TRUE)))
-  
-  p <- ggplot()
-  if (use_scatterpie) {
-    p <- p + scatterpie::geom_scatterpie(data = plot_df, aes(x = x_site, y = y_site, r = radius), cols = cluster_cols, color = "grey25", linewidth = 0.2, alpha = 0.95)
-  } else {
-    long <- plot_df %>%
-      pivot_longer(cols = all_of(cluster_cols), names_to = "cluster", values_to = "q") %>%
-      group_by(site, K, K_label, x_site, y_site, n_ind, radius_raw) %>%
-      slice_max(q, n = 1, with_ties = FALSE) %>%
-      ungroup()
-    p <- p + geom_point(data = long, aes(x = x_site, y = y_site, size = radius_raw, fill = cluster), shape = 21, color = "grey20")
-  }
-  
-  bks <- pretty(plot_df$n_ind, n = 3); bks <- bks[bks > 0]
-  if (length(bks) == 0) bks <- sort(unique(plot_df$n_ind))[1]
-  
-  p <- p +
-    geom_point(data = plot_df, aes(x = x_site, y = y_site, size = n_ind), alpha = 0, color = NA) +
-    geom_text(data = plot_df %>% distinct(site, x_site), aes(x = x_site, y = -0.75, label = site), angle = 45, hjust = 1, size = 3) +
-    scale_fill_manual(values = pal, name = "Clusters") +
-    scale_size_continuous(name = "Samples (n)", breaks = bks) +
-    facet_wrap(~K_label, ncol = ifelse(length(unique(plot_df$K)) <= 4, 2, 3)) +
-    scale_x_continuous(breaks = NULL) +
-    scale_y_continuous(breaks = NULL) +
-    labs(title = "STRUCTURE mean Q by site (non-spatial fallback)", subtitle = subtitle_reps, x = NULL, y = NULL) +
-    theme_bw(base_size = 11) +
-    theme(plot.title = element_text(face = "bold"), strip.text = element_text(face = "bold"), panel.grid = element_blank(), legend.position = "right")
-  
-  pdf_path <- file.path(OUT_DIR, "structure_pies_no_coords.pdf")
-  png_path <- file.path(OUT_DIR, "structure_pies_no_coords.png")
-  ggsave(pdf_path, p, width = 12, height = 8, device = grDevices::cairo_pdf)
-  ggsave(png_path, p, width = 12, height = 8, dpi = 400)
-  cat("[structure_pies_map] Figure exported:\n - ", pdf_path, "\n - ", png_path, "\n", sep = "")
+lon_range <- range(site_meta$lon, na.rm = TRUE)
+lat_range <- range(site_meta$lat, na.rm = TRUE)
+xlim <- lon_range + c(-pad_lon, pad_lon)
+ylim <- lat_range + c(-pad_lat, pad_lat)
+
+# -----------------------------
+# 5) Diagnostics
+# -----------------------------
+rep_by_k <- dplyr::bind_rows(lapply(q_list_all, function(x) {
+  data.frame(K = x$K, replicate = x$replicate)
+})) %>%
+  count(K, name = "n_runs")
+
+cat("\n==== STRUCTURE map diagnostics ====\n")
+cat("Individuals:", nrow(meta_ind), "\n")
+cat("Sites:", dplyr::n_distinct(meta_ind$site), "\n")
+cat("K detected:", paste(k_detected_all, collapse = ", "), "\n")
+cat("K plotted (2..12 present):", paste(k_plot, collapse = ", "), "\n")
+cat("Replicates detected:", ifelse(any(rep_by_k$n_runs > 1), "YES", "NO"), "\n")
+cat("Coordinates found in genetic sheet: YES\n")
+cat("Sheet used:", target_sheet, "\n")
+cat("Lon range:", paste(signif(lon_range, 6), collapse = " to "), "\n")
+cat("Lat range:", paste(signif(lat_range, 6), collapse = " to "), "\n")
+cat("xlim used:", paste(signif(xlim, 6), collapse = " to "), "\n")
+cat("ylim used:", paste(signif(ylim, 6), collapse = " to "), "\n")
+cat("Jitter settings (lon, lat):", paste0(jitter_lon, ", ", jitter_lat), "\n")
+cat("Pie radius range:", sprintf("min=%.3f max=%.3f", min(plot_wide$r), max(plot_wide$r)), "\n")
+cat("Basemap method:", basemap_method, "\n")
+
+# -----------------------------
+# 6) Plot objects
+# -----------------------------
+base_pal <- c(
+  "#1b9e77", "#d95f02", "#7570b3", "#e7298a", "#66a61e",
+  "#e6ab02", "#a6761d", "#666666", "#1f78b4", "#b2df8a",
+  "#fb9a99", "#cab2d6"
+)
+max_k <- max(k_plot)
+fill_vals <- setNames(base_pal[seq_len(max_k)], paste0("Q", seq_len(max_k)))
+
+ref_n <- as.numeric(stats::quantile(site_meta$n_ind, probs = c(0, 0.5, 1), na.rm = TRUE, type = 1))
+if (any(!is.finite(ref_n))) {
+  ref_n <- c(min(site_meta$n_ind, na.rm = TRUE), stats::median(site_meta$n_ind, na.rm = TRUE), max(site_meta$n_ind, na.rm = TRUE))
 }
+if (diff(range(ref_n, na.rm = TRUE)) == 0) {
+  ref_n <- c(ref_n[1], ref_n[1] + 1, ref_n[1] + 2)
+}
+
+x0 <- xlim[2] - 0.22 * diff(xlim)
+y0 <- ylim[1] + 0.16 * diff(ylim)
+leg_df <- data.frame(
+  n = ref_n,
+  lon_plot = rep(x0, 3),
+  lat_plot = y0 + c(0, 0.25, 0.5)
+)
+
+p_all <- ggplot()
+
+if (isTRUE(use_tiles) && has_ggspatial) {
+  cache_dir <- file.path(project_root, "outputs", "cache_tiles")
+  dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+  tile_added <- FALSE
+  p_try <- tryCatch({
+    p_all + ggspatial::annotation_map_tile(type = "osm", cachedir = cache_dir)
+  }, error = function(e) NULL)
+  if (!is.null(p_try)) {
+    p_all <- p_try
+    tile_added <- TRUE
+    basemap_method <- "ggspatial::annotation_map_tile(osm)"
+  }
+  if (!tile_added) {
+    p_all <- ggplot()
+  }
+}
+
+# Colored basemap fallback / default
+if (!grepl("annotation_map_tile", basemap_method)) {
+  p_all <- p_all +
+    geom_sf(data = world, fill = "#dbe9f6", color = NA) +
+    geom_sf(data = states, fill = "#dfead6", color = "grey65", linewidth = 0.2)
+}
+
+p_all <- p_all +
+  scatterpie::geom_scatterpie(
+    data = plot_wide,
+    aes(x = lon_plot, y = lat_plot, r = r),
+    cols = paste0("Q", seq_len(max_k)),
+    color = "black",
+    linewidth = 0.2,
+    alpha = 0.95
+  ) +
+  scale_fill_manual(values = fill_vals, name = "Ancestry cluster") +
+  geom_point(
+    data = leg_df,
+    aes(x = lon_plot, y = lat_plot, size = n),
+    shape = 21,
+    fill = "white",
+    color = "black",
+    stroke = 0.25,
+    inherit.aes = FALSE
+  ) +
+  scale_size_continuous(
+    name = "Samples (n)",
+    breaks = ref_n,
+    range = c(pie_r_min * 90, pie_r_max * 90),
+    guide = guide_legend(order = 2)
+  ) +
+  coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+  facet_wrap(~K, ncol = 4) +
+  labs(
+    title = "STRUCTURE mean Q by site (K = 2..12)",
+    subtitle = "Pie size proportional to sqrt(n individuals per site)",
+    x = "Longitude",
+    y = "Latitude"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "#dbe9f6", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+
+if (isTRUE(add_site_labels) && has_ggrepel) {
+  labels_df <- plot_wide %>%
+    group_by(site) %>%
+    summarise(lon_plot = first(lon_plot), lat_plot = first(lat_plot), .groups = "drop")
+  p_all <- p_all +
+    ggrepel::geom_text_repel(
+      data = labels_df,
+      aes(x = lon_plot, y = lat_plot, label = site),
+      size = 2.5,
+      min.segment.length = 0,
+      box.padding = 0.15,
+      point.padding = 0.05,
+      inherit.aes = FALSE
+    )
+}
+
+if (has_ggspatial) {
+  p_all <- p_all +
+    ggspatial::annotation_scale(location = "bl") +
+    ggspatial::annotation_north_arrow(
+      location = "tr",
+      style = ggspatial::north_arrow_fancy_orienteering
+    )
+}
+
+# -----------------------------
+# 7) Export ALL-K
+# -----------------------------
+out_pdf_all <- file.path(out_dir, "structure_map_pies_allK.pdf")
+out_png_all <- file.path(out_dir, "structure_map_pies_allK.png")
+
+ggplot2::ggsave(out_pdf_all, p_all, width = 14, height = 9)
+ggplot2::ggsave(out_png_all, p_all, width = 14, height = 9, dpi = 400)
+
+if (!file.exists(out_pdf_all)) {
+  stop("MISSING FROM YOUR SIDE: Failed to produce combined ALL-K PDF output.")
+}
+
+# -----------------------------
+# 8) Optional per-K PDFs
+# -----------------------------
+if (isTRUE(save_per_k_pdf)) {
+  for (k in k_plot) {
+    d_k <- plot_wide %>% filter(K == k)
+    cols_k <- paste0("Q", seq_len(k))
+    
+    p_k <- ggplot()
+    if (!grepl("annotation_map_tile", basemap_method)) {
+      p_k <- p_k +
+        geom_sf(data = world, fill = "#dbe9f6", color = NA) +
+        geom_sf(data = states, fill = "#dfead6", color = "grey65", linewidth = 0.2)
+    }
+    
+    p_k <- p_k +
+      scatterpie::geom_scatterpie(
+        data = d_k,
+        aes(x = lon_plot, y = lat_plot, r = r),
+        cols = cols_k,
+        color = "black",
+        linewidth = 0.2,
+        alpha = 0.95
+      ) +
+      scale_fill_manual(
+        values = setNames(base_pal[seq_len(k)], cols_k),
+        name = "Ancestry cluster"
+      ) +
+      geom_point(
+        data = leg_df,
+        aes(x = lon_plot, y = lat_plot, size = n),
+        shape = 21,
+        fill = "white",
+        color = "black",
+        stroke = 0.25,
+        inherit.aes = FALSE
+      ) +
+      scale_size_continuous(
+        name = "Samples (n)",
+        breaks = ref_n,
+        range = c(pie_r_min * 90, pie_r_max * 90),
+        guide = guide_legend(order = 2)
+      ) +
+      coord_sf(xlim = xlim, ylim = ylim, expand = FALSE) +
+      labs(
+        title = paste0("STRUCTURE mean Q by site (K = ", k, ")"),
+        subtitle = "Pie size proportional to sqrt(n individuals per site)",
+        x = "Longitude",
+        y = "Latitude"
+      ) +
+      theme_bw(base_size = 12) +
+      theme(
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "#dbe9f6", color = NA),
+        plot.background = element_rect(fill = "white", color = NA),
+        legend.position = "right",
+        plot.title = element_text(face = "bold")
+      )
+    
+    if (isTRUE(add_site_labels) && has_ggrepel) {
+      labels_df <- d_k %>% distinct(site, lon_plot, lat_plot)
+      p_k <- p_k +
+        ggrepel::geom_text_repel(
+          data = labels_df,
+          aes(x = lon_plot, y = lat_plot, label = site),
+          size = 2.5,
+          min.segment.length = 0,
+          box.padding = 0.15,
+          point.padding = 0.05,
+          inherit.aes = FALSE
+        )
+    }
+    
+    if (has_ggspatial) {
+      p_k <- p_k +
+        ggspatial::annotation_scale(location = "bl") +
+        ggspatial::annotation_north_arrow(
+          location = "tr",
+          style = ggspatial::north_arrow_fancy_orienteering
+        )
+    }
+    
+    out_pdf_k <- file.path(out_dir, paste0("structure_map_pies_K", k, ".pdf"))
+    ggplot2::ggsave(out_pdf_k, p_k, width = 12, height = 8)
+  }
+}
+
+cat("[structure_pies_map] Output written:", out_pdf_all, "\n")
+cat("[structure_pies_map] Output written:", out_png_all, "\n")
+if (isTRUE(save_per_k_pdf)) {
+  cat("[structure_pies_map] Per-K PDFs written for K:", paste(k_plot, collapse = ", "), "\n")
+}
+cat("[structure_pies_map] Done.\n")

@@ -43,21 +43,69 @@ add_site_labels <- FALSE
 # optional tile background
 use_tiles <- FALSE
 
+# map decorations (scale bar + north arrow) can be disabled if device export is unstable
+add_map_decorations <- FALSE
+
 # -----------------------------
-# Strict paths
+# Strict paths (resolved from this script location first)
 # -----------------------------
-project_root <- normalizePath(".", winslash = "/", mustWork = TRUE)
+get_script_path <- function() {
+  # Works when sourced()
+  ofile <- NULL
+  nfr <- sys.nframe()
+  if (nfr >= 1) for (i in rev(seq_len(nfr))) {
+    f <- sys.frame(i)
+    if (!is.null(f$ofile)) {
+      ofile <- f$ofile
+      break
+    }
+  }
+  
+  # Works when run via Rscript
+  if (is.null(ofile)) {
+    args <- commandArgs(trailingOnly = FALSE)
+    idx <- grep("^--file=", args)
+    if (length(idx) > 0) {
+      ofile <- sub("^--file=", "", args[idx[1]])
+    }
+  }
+  
+  if (is.null(ofile) || !file.exists(ofile)) return(NULL)
+  normalizePath(ofile, winslash = "/", mustWork = TRUE)
+}
+
+script_path <- get_script_path()
+project_root_candidates <- c(
+  if (!is.null(script_path)) normalizePath(file.path(dirname(script_path), ".."), winslash = "/", mustWork = FALSE) else NULL,
+  normalizePath(".", winslash = "/", mustWork = TRUE)
+)
+project_root_candidates <- unique(project_root_candidates[file.exists(project_root_candidates)])
+
+project_root <- NULL
+for (cand in project_root_candidates) {
+  if (dir.exists(file.path(cand, "outputs", "v1", "structure_runs", "Q_extracted")) &&
+      file.exists(file.path(cand, "data", "raw", "donnees_modifiees_west_summer2024 copie.xlsx"))) {
+    project_root <- cand
+    break
+  }
+}
+
+if (is.null(project_root)) {
+  stop(
+    paste0(
+      "MISSING FROM YOUR SIDE: Could not resolve project root containing both required inputs.\n",
+      "Expected:\n",
+      "- outputs/v1/structure_runs/Q_extracted/\n",
+      "- data/raw/donnees_modifiees_west_summer2024 copie.xlsx\n",
+      "Tip: run from BeechCode root OR source this script from inside BeechCode/scripts."
+    )
+  )
+}
+
 q_dir <- file.path(project_root, "outputs", "v1", "structure_runs", "Q_extracted")
 meta_path <- file.path(project_root, "data", "raw", "donnees_modifiees_west_summer2024 copie.xlsx")
 out_dir <- file.path(project_root, "outputs", "figures")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
-
-if (!dir.exists(q_dir)) {
-  stop("MISSING FROM YOUR SIDE: Q directory not found at outputs/v1/structure_runs/Q_extracted/.")
-}
-if (!file.exists(meta_path)) {
-  stop("MISSING FROM YOUR SIDE: Missing metadata file data/raw/donnees_modifiees_west_summer2024 copie.xlsx.")
-}
 
 # -----------------------------
 # Helpers
@@ -448,6 +496,7 @@ cat("ylim used:", paste(signif(ylim, 6), collapse = " to "), "\n")
 cat("Jitter settings (lon, lat):", paste0(jitter_lon, ", ", jitter_lat), "\n")
 cat("Pie radius range:", sprintf("min=%.3f max=%.3f", min(plot_wide$r), max(plot_wide$r)), "\n")
 cat("Basemap method:", basemap_method, "\n")
+cat("Map decorations enabled:", ifelse(has_ggspatial && isTRUE(add_map_decorations), "YES", "NO"), "\n")
 
 # -----------------------------
 # 6) Plot objects
@@ -561,7 +610,7 @@ if (isTRUE(add_site_labels) && has_ggrepel) {
     )
 }
 
-if (has_ggspatial) {
+if (has_ggspatial && isTRUE(add_map_decorations)) {
   p_all <- p_all +
     ggspatial::annotation_scale(location = "bl") +
     ggspatial::annotation_north_arrow(
@@ -570,14 +619,80 @@ if (has_ggspatial) {
     )
 }
 
+
+
+safe_save_pdf <- function(filename, plot_obj, width, height) {
+  save_with_device <- function(open_fun, ...) {
+    dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+    
+    # Neutralize any external custom default device (e.g. device uses RUN_OUT)
+    old_opt <- options(device = function(...) grDevices::pdf(file = tempfile(fileext = ".pdf")))
+    on.exit(options(old_opt), add = TRUE)
+    
+    ok <- FALSE
+    tryCatch({
+      open_fun(file = filename, width = width, height = height, ...)
+      print(plot_obj)
+      close_err <- NULL
+      tryCatch(
+        grDevices::dev.off(),
+        error = function(e) close_err <<- e
+      )
+      
+      # Treat as success if file was written even if dev.off complains
+      if (file.exists(filename) && is.finite(file.info(filename)$size) && file.info(filename)$size > 0) {
+        if (!is.null(close_err)) {
+          message("[structure_pies_map] dev.off warning for ", basename(filename), ": ", conditionMessage(close_err),
+                  " (file exists; continuing)")
+        }
+        ok <- TRUE
+      } else if (!is.null(close_err)) {
+        stop(close_err)
+      }
+    }, error = function(e) {
+      message("[structure_pies_map] PDF device failed for ", basename(filename), ": ", conditionMessage(e))
+    }, finally = {
+      # Ensure no leftover device from failed attempts
+      tryCatch({
+        if (grDevices::dev.cur() > 1) grDevices::dev.off()
+      }, error = function(e) NULL)
+    })
+    
+    ok
+  }
+  
+  ok <- save_with_device(grDevices::cairo_pdf)
+  if (!ok) {
+    ok <- save_with_device(grDevices::pdf, useDingbats = FALSE)
+  }
+  if (!ok) {
+    stop("MISSING FROM YOUR SIDE: Failed to export PDF file ", filename,
+         ". Check write permissions and graphics device support.")
+  }
+}
+
+safe_save_png <- function(filename, plot_obj, width, height, dpi = 400) {
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  old_opt <- options(device = function(...) grDevices::pdf(file = tempfile(fileext = ".pdf")))
+  on.exit(options(old_opt), add = TRUE)
+  
+  tryCatch({
+    ggplot2::ggsave(filename, plot_obj, width = width, height = height, dpi = dpi, type = "cairo")
+  }, error = function(e) {
+    message("[structure_pies_map] Cairo PNG export failed for ", basename(filename), ": ", conditionMessage(e),
+            ". Retrying default device.")
+    ggplot2::ggsave(filename, plot_obj, width = width, height = height, dpi = dpi)
+  })
+}
+
 # -----------------------------
 # 7) Export ALL-K
 # -----------------------------
 out_pdf_all <- file.path(out_dir, "structure_map_pies_allK.pdf")
 out_png_all <- file.path(out_dir, "structure_map_pies_allK.png")
 
-ggplot2::ggsave(out_pdf_all, p_all, width = 14, height = 9)
-ggplot2::ggsave(out_png_all, p_all, width = 14, height = 9, dpi = 400)
+safe_save_pdf(out_pdf_all, p_all, width = 14, height = 9)
+safe_save_png(out_png_all, p_all, width = 14, height = 9, dpi = 400)
 
 if (!file.exists(out_pdf_all)) {
   stop("MISSING FROM YOUR SIDE: Failed to produce combined ALL-K PDF output.")
@@ -657,7 +772,7 @@ if (isTRUE(save_per_k_pdf)) {
         )
     }
     
-    if (has_ggspatial) {
+    if (has_ggspatial && isTRUE(add_map_decorations)) {
       p_k <- p_k +
         ggspatial::annotation_scale(location = "bl") +
         ggspatial::annotation_north_arrow(
@@ -667,7 +782,7 @@ if (isTRUE(save_per_k_pdf)) {
     }
     
     out_pdf_k <- file.path(out_dir, paste0("structure_map_pies_K", k, ".pdf"))
-    ggplot2::ggsave(out_pdf_k, p_k, width = 12, height = 8)
+    safe_save_pdf(out_pdf_k, p_k, width = 12, height = 8)
   }
 }
 

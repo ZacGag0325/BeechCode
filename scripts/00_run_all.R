@@ -53,5 +53,6 @@ src("scripts/11_isolation_by_distance.R")
 # ---- 3) Extended analyses (safe runner; skips missing modules) ----
 src("scripts/10_run_extended_suite.R")
 src("scripts/12_environment_and_additional_metrics.R")
+src("scripts/16_thesis_audit_hardening.R")
 
 cat("\n✅ ALL DONE.\nCheck outputs in: ", file.path(PROJECT_ROOT, "outputs", "v1"), "\n", sep = "")

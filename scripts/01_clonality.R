@@ -1,55 +1,103 @@
-# filename: scripts/01_clonality.R
-############################################################
 # scripts/01_clonality.R
-# Clonality summaries only (uses saved df_ids with MLG/MLL)
+############################################################
+# Clonality summary (uses full genind: gi)
+# Required output:
+# - outputs/tables/clonality_summary.csv
+# Metrics:
+# - MLG
+# - MLL
+# - clonal richness R
 ############################################################
 
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-pkgs <- c("dplyr")
-for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
-suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages({
+  library(adegenet)
+  library(poppr)
+  library(dplyr)
+})
 
 source("scripts/_load_objects.R")
 
-OUTDIR <- file.path(RUN_OUT, "clonality_only")
-dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+message("[01_clonality] Calculating MLG / MLL / clonal richness...")
 
-if (!all(c("Site", "MLG", "MLL") %in% names(df_ids))) {
-  stop(
-    "df_ids must contain Site, MLG, and MLL columns. ",
-    "Run scripts/01_clone_correction.R first to populate clone IDs."
-  )
+resolve_col <- function(df, choices) {
+  nms <- names(df)
+  nms_low <- tolower(nms)
+  idx <- match(TRUE, nms_low %in% tolower(choices), nomatch = 0)
+  if (idx == 0) return(NA_character_)
+  nms[idx]
 }
 
-clonality_by_site <- df_ids %>%
-  group_by(Site) %>%
-  summarise(
-    n_inds = n(),
-    n_MLG  = n_distinct(MLG),
-    n_MLL  = n_distinct(MLL),
-    genotypic_richness_MLG = n_MLG / n_inds,
-    genotypic_richness_MLL = n_MLL / n_inds,
-    clonal_richness_R = ifelse(n_inds > 1, (n_MLL - 1) / (n_inds - 1), NA_real_),
-    .groups = "drop"
-  ) %>%
-  arrange(desc(n_inds))
+id_col <- resolve_col(df_ids, c("ind", "individual", "sample", "sampleid", "id"))
+site_col <- resolve_col(df_ids, c("site", "population", "pop"))
+mll_col <- resolve_col(df_ids, c("mll"))
 
-overall <- data.frame(
-  n_inds = nrow(df_ids),
-  n_MLG  = dplyr::n_distinct(df_ids$MLG),
-  n_MLL  = dplyr::n_distinct(df_ids$MLL),
-  genotypic_richness_MLG = dplyr::n_distinct(df_ids$MLG) / nrow(df_ids),
-  genotypic_richness_MLL = dplyr::n_distinct(df_ids$MLL) / nrow(df_ids),
-  clonal_richness_R = ifelse(nrow(df_ids) > 1,
-                             (dplyr::n_distinct(df_ids$MLL) - 1) / (nrow(df_ids) - 1),
-                             NA_real_)
+if (is.na(id_col) || is.na(site_col)) {
+  stop("df_ids must contain an individual ID column and a Site column.")
+}
+
+# MLG labels from full genotype data (gi)
+detected_mlg <- tryCatch(poppr::mlg.vector(gi), error = function(e) as.integer(factor(poppr::mlg(gi))))
+mlg_labels <- paste0("MLG_", as.integer(factor(detected_mlg)))
+
+# MLL labels from df_ids when available; fallback to MLG labels
+if (!is.na(mll_col)) {
+  mll_map <- setNames(as.character(df_ids[[mll_col]]), as.character(df_ids[[id_col]]))
+  mll_labels <- mll_map[adegenet::indNames(gi)]
+  if (any(is.na(mll_labels))) {
+    warning("Missing MLL labels for some individuals; filling with MLG labels.")
+    mll_labels[is.na(mll_labels)] <- mlg_labels[is.na(mll_labels)]
+  }
+} else {
+  warning("MLL column not found in df_ids; using MLG labels as fallback.")
+  mll_labels <- mlg_labels
+}
+
+site_map <- setNames(as.character(df_ids[[site_col]]), as.character(df_ids[[id_col]]))
+site_labels <- site_map[adegenet::indNames(gi)]
+if (any(is.na(site_labels))) stop("Could not map all individuals to Site.")
+
+clonality_df <- data.frame(
+  Individual = adegenet::indNames(gi),
+  Site = site_labels,
+  MLG = mlg_labels,
+  MLL = mll_labels,
+  stringsAsFactors = FALSE
 )
 
-print(clonality_by_site)
-print(overall)
+calc_R <- function(N, G) ifelse(N > 1, (G - 1) / (N - 1), NA_real_)
 
-write.csv(clonality_by_site, file.path(OUTDIR, "clonality_by_site.csv"), row.names = FALSE)
-write.csv(overall,           file.path(OUTDIR, "clonality_overall.csv"), row.names = FALSE)
+overall <- clonality_df %>%
+  summarise(
+    Level = "overall",
+    Site = "ALL",
+    N_individuals = n(),
+    MLG = n_distinct(MLG),
+    MLL = n_distinct(MLL)
+  ) %>%
+  mutate(
+    Clonal_Richness_R = calc_R(N_individuals, MLL),
+    Genotypic_Richness_MLG = MLG / N_individuals,
+    Genotypic_Richness_MLL = MLL / N_individuals
+  )
 
-cat("DONE clonality. Outputs in: ", OUTDIR, "\n", sep = "")
+by_site <- clonality_df %>%
+  group_by(Site) %>%
+  summarise(
+    Level = "site",
+    N_individuals = n(),
+    MLG = n_distinct(MLG),
+    MLL = n_distinct(MLL),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Clonal_Richness_R = calc_R(N_individuals, MLL),
+    Genotypic_Richness_MLG = MLG / N_individuals,
+    Genotypic_Richness_MLL = MLL / N_individuals
+  ) %>%
+  select(Level, Site, N_individuals, MLG, MLL, Clonal_Richness_R, Genotypic_Richness_MLG, Genotypic_Richness_MLL)
 
+clonality_summary <- bind_rows(overall, by_site)
+out_file <- file.path(TABLES_DIR, "clonality_summary.csv")
+write.csv(clonality_summary, out_file, row.names = FALSE)
+
+message("[01_clonality] Saved: ", out_file)

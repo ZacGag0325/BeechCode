@@ -1,87 +1,103 @@
-# filename: scripts/07_allelic_richness.R
-############################################################
 # scripts/07_allelic_richness.R
-# Per-site allelic richness summary (robust + non-crashing)
+############################################################
+# Genetic diversity by site (clone-corrected genind: gi_mll)
+# Required outputs:
+# - outputs/tables/heterozygosity_by_site.csv
+# - outputs/tables/allelic_richness_by_site.csv
+# - outputs/tables/site_genetic_summary.csv
+# Metrics:
+# - Ho, He, FIS
+# - Allelic richness (+ SE)
+# - merged with clonality summary (N, MLG, MLL, R)
 ############################################################
 
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-pkgs <- c("adegenet", "hierfstat", "dplyr")
-for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
-suppressPackageStartupMessages({library(adegenet); library(hierfstat); library(dplyr)})
-
-find_project_root <- function() {
-  candidates <- c(getwd(), normalizePath(file.path(getwd(), ".."), mustWork = FALSE))
-  for (start in unique(candidates)) {
-    cur <- normalizePath(start, mustWork = FALSE)
-    repeat {
-      if (file.exists(file.path(cur, "scripts", "_load_objects.R"))) return(cur)
-      parent <- dirname(cur); if (identical(parent, cur)) break; cur <- parent
-    }
-  }
-  stop("Cannot find project root containing scripts/_load_objects.R")
-}
-
-compute_ar <- function(gen) {
-  if (!inherits(gen, "genind")) stop("Input must be a genind object.")
-  if (nPop(gen) < 2) {
-    warning("Need at least two sites for allelic richness summaries.")
-    return(NULL)
-  }
-  
-  pop_sizes <- table(pop(gen))
-  min_n <- min(pop_sizes)
-  if (is.na(min_n) || min_n < 2) {
-    warning("At least one site has fewer than 2 individuals; allelic richness cannot be robustly computed.")
-    return(NULL)
-  }
-  
-  hf <- hierfstat::genind2hierfstat(gen)
-  ar <- hierfstat::allelic.richness(hf, min.n = min_n)
-  
-  ar_mat <- ar$Ar
-  if (is.null(ar_mat) || ncol(ar_mat) < 1) {
-    warning("allelic.richness returned no per-site values.")
-    return(NULL)
-  }
-  
-  data.frame(
-    Site = colnames(ar_mat),
-    n = as.integer(pop_sizes[colnames(ar_mat)]),
-    allelic_richness = as.numeric(colMeans(ar_mat, na.rm = TRUE)),
-    allelic_richness_se = as.numeric(apply(ar_mat, 2, sd, na.rm = TRUE) / sqrt(nrow(ar_mat))),
-    stringsAsFactors = FALSE
-  )
-}
-
-PROJECT_ROOT <- find_project_root()
-setwd(PROJECT_ROOT)
-source(file.path("scripts", "_load_objects.R"))
-
-RUN_TAG <- if (exists("RUN_TAG", inherits = TRUE)) get("RUN_TAG", inherits = TRUE) else "v1"
-RUN_OUT <- if (exists("RUN_OUT", inherits = TRUE)) get("RUN_OUT", inherits = TRUE) else file.path(PROJECT_ROOT, "outputs", RUN_TAG)
-DIVERSITY_DIR <- file.path(PROJECT_ROOT, "outputs", RUN_TAG, "diversity")
-dir.create(file.path(PROJECT_ROOT, "outputs"), showWarnings = FALSE, recursive = TRUE)
-dir.create(file.path(PROJECT_ROOT, "outputs", RUN_TAG), showWarnings = FALSE, recursive = TRUE)
-dir.create(DIVERSITY_DIR, showWarnings = FALSE, recursive = TRUE)
-
-ar_site <- tryCatch(compute_ar(gi_mll), error = function(e) {
-  warning("Allelic richness computation failed: ", conditionMessage(e))
-  NULL
+suppressPackageStartupMessages({
+  library(adegenet)
+  library(hierfstat)
+  library(dplyr)
 })
 
-csv_path <- file.path(DIVERSITY_DIR, "allelic_richness_by_site.csv")
-rds_path <- file.path(DIVERSITY_DIR, "allelic_richness_by_site.rds")
-legacy_csv <- file.path(RUN_OUT, "allelic_richness_site_summary.csv")
+source("scripts/_load_objects.R")
 
-if (is.null(ar_site) || nrow(ar_site) == 0) {
-  warning("No allelic richness output produced (insufficient data).")
-} else {
-  write.csv(ar_site, csv_path, row.names = FALSE)
-  saveRDS(ar_site, rds_path)
-  write.csv(ar_site, legacy_csv, row.names = FALSE)
-  cat("Created allelic richness summary CSV: ", csv_path, "\n", sep = "")
-  cat("Created allelic richness summary RDS: ", rds_path, "\n", sep = "")
-  cat("Created legacy compatibility CSV: ", legacy_csv, "\n", sep = "")
+message("[07_allelic_richness] Calculating heterozygosity/FIS and allelic richness...")
+
+hf <- hierfstat::genind2hierfstat(gi_mll)
+bs <- hierfstat::basic.stats(hf)
+
+# ----------------------------
+# 1) Ho / He / FIS by site
+# ----------------------------
+heterozygosity_by_site <- data.frame(
+  Site = rownames(bs$Ho),
+  Ho = rowMeans(bs$Ho, na.rm = TRUE),
+  He = rowMeans(bs$Hs, na.rm = TRUE),
+  FIS = rowMeans(bs$Fis, na.rm = TRUE),
+  stringsAsFactors = FALSE
+)
+
+het_file <- file.path(TABLES_DIR, "heterozygosity_by_site.csv")
+write.csv(heterozygosity_by_site, het_file, row.names = FALSE)
+message("[07_allelic_richness] Saved: ", het_file)
+
+# ----------------------------
+# 2) Allelic richness + SE
+# ----------------------------
+pop_sizes <- table(adegenet::pop(gi_mll))
+min_n <- min(pop_sizes)
+if (is.na(min_n) || min_n < 2) {
+  stop("At least one site has fewer than 2 individuals; cannot compute robust allelic richness.")
 }
 
-cat("Allelic-richness step complete. Output folder: ", DIVERSITY_DIR, "\n", sep = "")
+ar <- hierfstat::allelic.richness(hf, min.n = min_n)
+Ar <- ar$Ar
+
+allelic_richness_by_site <- data.frame(
+  Site = colnames(Ar),
+  Allelic_Richness = as.numeric(colMeans(Ar, na.rm = TRUE)),
+  Allelic_Richness_SE = as.numeric(apply(Ar, 2, sd, na.rm = TRUE) / sqrt(nrow(Ar))),
+  stringsAsFactors = FALSE
+)
+
+ar_file <- file.path(TABLES_DIR, "allelic_richness_by_site.csv")
+write.csv(allelic_richness_by_site, ar_file, row.names = FALSE)
+message("[07_allelic_richness] Saved: ", ar_file)
+
+# ----------------------------
+# 3) Site-level paper-ready summary
+# ----------------------------
+# We merge diversity metrics (clone-corrected gi_mll) with clonality metrics (from gi).
+clonality_file <- file.path(TABLES_DIR, "clonality_summary.csv")
+if (!file.exists(clonality_file)) {
+  stop("Missing clonality_summary.csv. Run scripts/01_clonality.R first.")
+}
+
+clonality_by_site <- read.csv(clonality_file, stringsAsFactors = FALSE) %>%
+  filter(Level == "site") %>%
+  transmute(
+    Site = as.character(Site),
+    N_individuals = as.numeric(N_individuals),
+    MLG = as.numeric(MLG),
+    MLL = as.numeric(MLL),
+    Clonal_Richness_R = as.numeric(Clonal_Richness_R)
+  )
+
+site_genetic_summary <- clonality_by_site %>%
+  left_join(heterozygosity_by_site, by = "Site") %>%
+  left_join(allelic_richness_by_site, by = "Site") %>%
+  arrange(Site) %>%
+  select(
+    Site,
+    N_individuals,
+    MLG,
+    MLL,
+    Clonal_Richness_R,
+    Ho,
+    He,
+    FIS,
+    Allelic_Richness,
+    Allelic_Richness_SE
+  )
+
+summary_file <- file.path(TABLES_DIR, "site_genetic_summary.csv")
+write.csv(site_genetic_summary, summary_file, row.names = FALSE)
+message("[07_allelic_richness] Saved: ", summary_file)

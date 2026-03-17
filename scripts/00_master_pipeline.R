@@ -221,6 +221,7 @@ read_tabular_robust <- function(path, required_choices = list(), label = "table"
   df
 }
 
+
 relabel_mll_ids <- function(raw_id, sample_ids) {
   if (length(raw_id) != length(sample_ids)) {
     stop("MLL relabeling error: raw_id length does not match sample_ids length.")
@@ -332,6 +333,224 @@ find_object_file <- function(fname) {
   NA_character_
 }
 
+GENOTYPE_SEARCH_DIRS <- c(
+  file.path(PROJECT_ROOT, "outputs", "v1", "objects"),
+  file.path(PROJECT_ROOT, "outputs", "objects"),
+  file.path(PROJECT_ROOT, "outputs", "v1"),
+  file.path(PROJECT_ROOT, "outputs"),
+  file.path(PROJECT_ROOT, "inputs"),
+  file.path(PROJECT_ROOT, "data")
+)
+
+discover_genotype_candidates <- function() {
+  exts <- "\\.(rds|csv|tsv|txt|xlsx|xls)$"
+  all_files <- character(0)
+  for (d in unique(GENOTYPE_SEARCH_DIRS)) {
+    if (!dir.exists(d)) next
+    f <- list.files(d, recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+    if (length(f) == 0) next
+    f <- f[file.info(f)$isdir %in% FALSE]
+    f <- f[grepl(exts, basename(f), ignore.case = TRUE)]
+    all_files <- c(all_files, f)
+  }
+  all_files <- unique(normalizePath(all_files, winslash = "/", mustWork = FALSE))
+  
+  if (length(all_files) == 0) {
+    return(data.frame(path = character(0), ext = character(0), score = numeric(0), stringsAsFactors = FALSE))
+  }
+  
+  score_file <- function(path) {
+    b <- tolower(basename(path))
+    s <- 0
+    if (grepl("gi\\.rds$", b)) s <- s + 1000
+    if (grepl("genind|geno|genotype|microsat|poppr|allele", b)) s <- s + 200
+    if (grepl("structure|evanno|likelihood|delta|medk", b)) s <- s - 400
+    if (grepl("meta|site_metadata|ids_order", b)) s <- s - 200
+    if (grepl("\\.rds$", b)) s <- s + 80
+    if (grepl("\\.xlsx$|\\.xls$", b)) s <- s + 40
+    s
+  }
+  
+  out <- data.frame(
+    path = all_files,
+    ext = tolower(sub("^.*\\.", "", all_files)),
+    score = vapply(all_files, score_file, numeric(1)),
+    stringsAsFactors = FALSE
+  )
+  
+  out <- out[order(-out$score, out$path), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+extract_genind_from_object <- function(obj, source_path) {
+  if (inherits(obj, "genind")) return(obj)
+  
+  if (is.list(obj)) {
+    likely_names <- c("gi", "gen", "genind", "g", "data")
+    hit <- intersect(likely_names, names(obj))
+    for (nm in hit) {
+      if (inherits(obj[[nm]], "genind")) return(obj[[nm]])
+    }
+    idx <- which(vapply(obj, function(x) inherits(x, "genind"), logical(1)))
+    if (length(idx) > 0) return(obj[[idx[1]]])
+  }
+  
+  NULL
+}
+
+read_delimited_guess <- function(path) {
+  readers <- list(
+    function() read.csv(path, stringsAsFactors = FALSE, check.names = FALSE),
+    function() read.delim(path, stringsAsFactors = FALSE, check.names = FALSE),
+    function() read.table(path, sep = ";", header = TRUE, stringsAsFactors = FALSE, check.names = FALSE, fill = TRUE, quote = "\"'", comment.char = ""),
+    function() read.table(path, sep = "",  header = TRUE, stringsAsFactors = FALSE, check.names = FALSE, fill = TRUE, quote = "\"'", comment.char = "")
+  )
+  
+  for (rd in readers) {
+    dat <- tryCatch(rd(), error = function(e) NULL)
+    if (is.null(dat) || !is.data.frame(dat) || nrow(dat) == 0 || ncol(dat) == 0) next
+    names(dat) <- sanitize_names(names(dat))
+    return(dat)
+  }
+  NULL
+}
+
+build_genind_from_table <- function(tbl, source_path) {
+  nms <- names(tbl)
+  nms_low <- tolower(nms)
+  
+  id_col <- resolve_col(tbl, c("ind", "individual", "sample", "sampleid", "id", "ind_id", "nom_labo_échantillons", "nom_labo_echantillons", "nom_labo_echantillon"))
+  pop_col <- resolve_col(tbl, c("site", "population", "pop", "numero_population", "numéro_population", "site_id"))
+  
+  if (is.na(id_col) || is.na(pop_col)) {
+    return(NULL)
+  }
+  
+  # Detect allele pair columns such as locus_1/locus_2 or locus.1/locus.2
+  allele_idx <- grep("(_|\\.)[12]$", nms, perl = TRUE)
+  if (length(allele_idx) < 2 || length(allele_idx) %% 2 != 0) return(NULL)
+  
+  locus_base <- sub("(_|\\.)[12]$", "", nms[allele_idx], perl = TRUE)
+  locus_tab <- table(locus_base)
+  if (any(locus_tab != 2)) return(NULL)
+  
+  col_1 <- allele_idx[grepl("(_|\\.)1$", nms[allele_idx], perl = TRUE)]
+  col_1 <- col_1[order(sub("(_|\\.)1$", "", nms[col_1], perl = TRUE))]
+  
+  ids <- trimws(as.character(tbl[[id_col]]))
+  pops <- trimws(as.character(tbl[[pop_col]]))
+  keep <- nzchar(ids)
+  ids <- ids[keep]
+  pops <- pops[keep]
+  sub_tbl <- tbl[keep, , drop = FALSE]
+  
+  geno_locus <- data.frame(row.names = ids)
+  for (idx in col_1) {
+    nm1 <- nms[idx]
+    nm2 <- sub("1$", "2", nm1)
+    j <- match(nm2, nms)
+    if (is.na(j)) return(NULL)
+    
+    locus <- sub("(_|\\.)1$", "", nm1, perl = TRUE)
+    a1 <- as.character(sub_tbl[[nm1]])
+    a2 <- as.character(sub_tbl[[nms[j]]])
+    g <- paste(a1, a2, sep = "/")
+    g[grepl("NA", g, fixed = TRUE)] <- NA_character_
+    geno_locus[[locus]] <- g
+  }
+  
+  if (ncol(geno_locus) == 0 || nrow(geno_locus) == 0) return(NULL)
+  names(geno_locus) <- sanitize_names(names(geno_locus))
+  
+  gi <- tryCatch(
+    adegenet::df2genind(
+      geno_locus,
+      ploidy = 2,
+      ind.names = rownames(geno_locus),
+      pop = as.factor(pops),
+      type = "codom",
+      sep = "/",
+      ncode = 3
+    ),
+    error = function(e) NULL
+  )
+  
+  gi
+}
+
+build_gi_from_sources <- function() {
+  candidates <- discover_genotype_candidates()
+  
+  message("[00_master_pipeline] Genotype source search dirs:")
+  for (d in unique(GENOTYPE_SEARCH_DIRS)) message("  - ", d)
+  
+  if (nrow(candidates) == 0) {
+    stop("[00_master_pipeline] No genotype candidate files found in configured search directories.")
+  }
+  
+  message("[00_master_pipeline] Genotype candidate files found (top 25 by priority):")
+  top_n <- min(25, nrow(candidates))
+  for (i in seq_len(top_n)) {
+    message("  [", i, "] score=", candidates$score[i], " | ", candidates$path[i])
+  }
+  
+  for (i in seq_len(nrow(candidates))) {
+    f <- candidates$path[i]
+    ext <- candidates$ext[i]
+    
+    if (ext == "rds") {
+      obj <- tryCatch(readRDS(f), error = function(e) NULL)
+      gi <- extract_genind_from_object(obj, f)
+      if (!is.null(gi)) {
+        message("[00_master_pipeline] Chosen genotype source: ", f)
+        message("[00_master_pipeline] Source mode: loaded genind from RDS")
+        return(gi)
+      }
+      next
+    }
+    
+    if (ext %in% c("xlsx", "xls")) {
+      if (!requireNamespace("readxl", quietly = TRUE)) next
+      tbl <- tryCatch(readxl::read_xlsx(f), error = function(e) NULL)
+      if (is.null(tbl)) next
+      tbl <- as.data.frame(tbl, stringsAsFactors = FALSE, check.names = FALSE)
+      names(tbl) <- sanitize_names(names(tbl))
+      gi <- build_genind_from_table(tbl, f)
+      if (!is.null(gi)) {
+        message("[00_master_pipeline] Chosen genotype source: ", f)
+        message("[00_master_pipeline] Source mode: rebuilt genind from spreadsheet table")
+        return(gi)
+      }
+      next
+    }
+    
+    if (ext %in% c("csv", "tsv", "txt")) {
+      tbl <- read_delimited_guess(f)
+      if (is.null(tbl)) next
+      gi <- build_genind_from_table(tbl, f)
+      if (!is.null(gi)) {
+        message("[00_master_pipeline] Chosen genotype source: ", f)
+        message("[00_master_pipeline] Source mode: rebuilt genind from delimited table")
+        return(gi)
+      }
+      next
+    }
+  }
+  
+  stop(
+    "[00_master_pipeline] Could not build 'gi' from available files.
+",
+    "Checked ", nrow(candidates), " candidate files across search directories.
+",
+    "Expected either:
+",
+    "  - an RDS containing a genind object (or list element gi/genind),
+",
+    "  - or a genotype table with ID + population + paired allele columns (*_1/*_2 or *.1/*.2)."
+  )
+}
+
 try_load_legacy_objects <- function() {
   targets <- c("gi.rds", "gi_mll.rds", "df_ids.rds", "meta.rds")
   paths <- setNames(vapply(targets, find_object_file, character(1)), targets)
@@ -341,36 +560,6 @@ try_load_legacy_objects <- function() {
   objs <- lapply(paths, readRDS)
   names(objs) <- names(paths)
   objs
-}
-
-build_gi_from_rds_sources <- function() {
-  rds_candidates <- list.files(
-    path = file.path(PROJECT_ROOT, "inputs"),
-    pattern = "\\.rds$",
-    recursive = TRUE,
-    full.names = TRUE
-  )
-  rds_candidates <- c(
-    rds_candidates,
-    list.files(file.path(PROJECT_ROOT, "data"), pattern = "\\.rds$", recursive = TRUE, full.names = TRUE)
-  )
-  rds_candidates <- unique(rds_candidates)
-  
-  if (length(rds_candidates) == 0) return(NULL)
-  
-  for (f in rds_candidates) {
-    obj <- tryCatch(readRDS(f), error = function(e) NULL)
-    if (inherits(obj, "genind")) {
-      message("[00_master_pipeline] Using genind source from RDS: ", f)
-      return(obj)
-    }
-    if (is.list(obj) && "gi" %in% names(obj) && inherits(obj$gi, "genind")) {
-      message("[00_master_pipeline] Using list$gi source from RDS: ", f)
-      return(obj$gi)
-    }
-  }
-  
-  NULL
 }
 
 assign_pop_from_df_ids <- function(gi, df_ids) {
@@ -390,16 +579,7 @@ build_objects <- function() {
   df_ids <- load_df_ids()
   meta <- load_meta()
   
-  gi <- build_gi_from_rds_sources()
-  if (is.null(gi)) {
-    stop(
-      "[00_master_pipeline] Could not build 'gi'.\n",
-      "Expected either:\n",
-      "  - existing gi.rds in outputs*/data*/inputs\n",
-      "  - or an RDS in inputs/ or data/ containing a genind object."
-    )
-  }
-  
+  gi <- build_gi_from_sources()
   gi <- assign_pop_from_df_ids(gi, df_ids)
   
   mll <- make_mll_from_bruvo(gi, threshold = 0)
@@ -425,6 +605,7 @@ build_objects <- function() {
     meta.rds = meta
   )
 }
+
 
 objs <- try_load_legacy_objects()
 if (is.null(objs)) {

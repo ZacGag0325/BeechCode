@@ -106,7 +106,8 @@ pairwise_jostD <- to_numeric_matrix(jost_raw, name = "Jost's D")
 
 site_levels <- sort(unique(as.character(adegenet::pop(gi_mll))))
 pairwise_jostD <- ensure_square_named(pairwise_jostD, fallback_names = site_levels, name = "Jost's D")
-diag(pairwise_jostD) <- NA_real_
+diag(pairwise_jostD) <- 0
+message("[06_distance_matrices] Set Jost's D diagonal to 0 for downstream distance compatibility.")
 
 message("[06_distance_matrices] Jost's D matrix dimensions: ", nrow(pairwise_jostD), " x ", ncol(pairwise_jostD))
 
@@ -156,7 +157,8 @@ if (length(site_lookup) == nrow(pairwise_fst)) {
 }
 
 pairwise_fst <- ensure_square_named(pairwise_fst, fallback_names = sort(unique(as.character(adegenet::pop(gi_mll)))), name = "pairwise FST")
-diag(pairwise_fst) <- NA_real_
+diag(pairwise_fst) <- 0
+message("[06_distance_matrices] Set FST diagonal to 0 for downstream distance compatibility.")
 
 message("[06_distance_matrices] FST matrix dimensions: ", nrow(pairwise_fst), " x ", ncol(pairwise_fst))
 

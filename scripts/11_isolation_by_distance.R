@@ -125,8 +125,22 @@ safe_read_square_matrix <- function(path) {
     stop("Imported matrix row/column names could not be aligned identically: ", path)
   }
   
-  if (any(!is.finite(mat), na.rm = TRUE)) {
-    stop("Imported genetic matrix contains non-finite values.")
+  diag_idx <- row(mat) == col(mat)
+  finite_mask <- is.finite(mat)
+  
+  n_nonfinite_diag <- sum(!finite_mask[diag_idx], na.rm = TRUE)
+  n_nonfinite_offdiag <- sum(!finite_mask[!diag_idx], na.rm = TRUE)
+  
+  cat("[11_isolation_by_distance] Non-finite entries on diagonal: ", n_nonfinite_diag, "\n", sep = "")
+  cat("[11_isolation_by_distance] Non-finite entries off-diagonal: ", n_nonfinite_offdiag, "\n", sep = "")
+  
+  if (n_nonfinite_offdiag > 0) {
+    stop("Imported genetic matrix contains non-finite OFF-diagonal values; cannot run Mantel.")
+  }
+  
+  if (n_nonfinite_diag > 0) {
+    mat[diag_idx & !finite_mask] <- 0
+    cat("[11_isolation_by_distance] Replaced non-finite diagonal values with 0 for distance-matrix use.\n")
   }
   
   cat("[11_isolation_by_distance] Genetic matrix dimensions: ", nrow(mat), " x ", ncol(mat), "\n", sep = "")
@@ -294,6 +308,22 @@ cat("[11_isolation_by_distance] Saved geographic matrix: ", geo_file, "\n", sep 
 # ----------------------------
 # 4) Mantel test
 # ----------------------------
+pairwise_jostD <- as.matrix(pairwise_jostD)
+geographic_km <- as.matrix(geographic_km)
+storage.mode(pairwise_jostD) <- "numeric"
+storage.mode(geographic_km) <- "numeric"
+
+if (!identical(rownames(pairwise_jostD), rownames(geographic_km))) {
+  stop("Site-order mismatch between genetic and geographic matrices before Mantel.")
+}
+if (any(!is.finite(pairwise_jostD[row(pairwise_jostD) != col(pairwise_jostD)]))) {
+  stop("Genetic matrix has non-finite off-diagonal values before Mantel.")
+}
+if (any(!is.finite(geographic_km[row(geographic_km) != col(geographic_km)]))) {
+  stop("Geographic matrix has non-finite off-diagonal values before Mantel.")
+}
+diag(pairwise_jostD) <- 0
+diag(geographic_km) <- 0
 gen_dist <- as.dist(pairwise_jostD)
 geo_dist <- as.dist(geographic_km)
 

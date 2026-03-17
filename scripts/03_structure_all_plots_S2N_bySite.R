@@ -56,46 +56,79 @@ if (is.na(id_col_dfids) || is.na(site_col_dfids)) {
   stop("[03_structure] df_ids must contain individual ID and Site columns.")
 }
 
-ids_default <- as.character(df_ids[[id_col_dfids]])
-site_map <- setNames(as.character(df_ids[[site_col_dfids]]), ids_default)
+ids_dfids <- trimws(as.character(df_ids[[id_col_dfids]]))
+ids_dfids <- ids_dfids[nzchar(ids_dfids)]
+site_map_dfids <- setNames(as.character(df_ids[[site_col_dfids]]), ids_dfids)
 
-load_individual_order <- function(default_ids) {
+load_ids_order_from_raw <- function() {
   ids_path <- file.path(PROJECT_ROOT, "data", "structure", "ids_order_from_raw.csv")
-  
-  if (!file.exists(ids_path)) return(default_ids)
+  if (!file.exists(ids_path)) {
+    return(list(ids = character(0), source = "ids_order_from_raw.csv (missing)"))
+  }
   
   ids_df <- tryCatch(
     read.csv(ids_path, stringsAsFactors = FALSE, check.names = FALSE),
     error = function(e) NULL
   )
   if (is.null(ids_df) || nrow(ids_df) == 0) {
-    warning("[03_structure] Could not read ids_order_from_raw.csv; using df_ids order.")
-    return(default_ids)
+    return(list(ids = character(0), source = "ids_order_from_raw.csv (unreadable)"))
   }
   
-  id_col <- resolve_col(ids_df, c("ind", "individual", "sample", "sampleid", "id"))
+  id_col <- resolve_col(ids_df, c("ind", "individual", "sample", "sampleid", "id", "ind_id"))
   if (is.na(id_col)) id_col <- names(ids_df)[1]
   
-  ordered_ids <- trimws(as.character(ids_df[[id_col]]))
-  ordered_ids <- ordered_ids[nzchar(ordered_ids)]
-  ordered_ids <- unique(ordered_ids)
+  ids <- trimws(as.character(ids_df[[id_col]]))
+  ids <- ids[nzchar(ids)]
+  ids <- unique(ids)
   
-  matched <- ordered_ids[ordered_ids %in% default_ids]
-  if (length(matched) == 0) {
-    warning("[03_structure] ids_order_from_raw.csv did not match df_ids IDs; using df_ids order.")
-    return(default_ids)
-  }
-  
-  missing <- setdiff(default_ids, matched)
-  c(matched, missing)
+  list(ids = ids, source = "data/structure/ids_order_from_raw.csv")
 }
 
-id_reference_raw <- load_individual_order(ids_default)
-id_reference <- unique(id_reference_raw)
-if (length(id_reference_raw) != length(id_reference)) {
-  warning("[03_structure] Duplicate IDs found in reference order; using first occurrence only.")
+extract_structure_order_from_results <- function() {
+  res_dir <- file.path(PROJECT_ROOT, "data", "structure", "STRUCTURE_ZG_HEG-results")
+  if (!dir.exists(res_dir)) {
+    return(list(ids = character(0), pop = integer(0), source = "STRUCTURE results (missing)"))
+  }
+  
+  files <- list.files(res_dir, full.names = TRUE)
+  files <- files[file.info(files)$isdir %in% FALSE]
+  if (length(files) == 0) {
+    return(list(ids = character(0), pop = integer(0), source = "STRUCTURE results (empty)"))
+  }
+  
+  # use first K>=2 file if available
+  b <- basename(files)
+  k_vals <- suppressWarnings(as.integer(gsub(".*K([0-9]+).*", "\\1", b, perl = TRUE)))
+  ord <- order(ifelse(is.na(k_vals) | k_vals < 2, Inf, k_vals), b)
+  
+  for (i in ord) {
+    f <- files[i]
+    txt <- tryCatch(readLines(f, warn = FALSE), error = function(e) character(0))
+    if (length(txt) == 0) next
+    
+    anc_start <- grep("^Inferred ancestry of individuals:", txt)
+    if (length(anc_start) == 0) next
+    block <- txt[(anc_start[1] + 1):length(txt)]
+    
+    keep <- grepl("^\\s*[0-9]+\\s+\\S+\\s+\\([^)]*\\)\\s+[0-9]+\\s*:\\s+", block)
+    lines <- block[keep]
+    if (length(lines) == 0) next
+    
+    labels <- sub("^\\s*[0-9]+\\s+(\\S+)\\s+\\([^)]*\\)\\s+[0-9]+\\s*:.*$", "\\1", lines, perl = TRUE)
+    pops <- suppressWarnings(as.integer(sub("^\\s*[0-9]+\\s+\\S+\\s+\\([^)]*\\)\\s+([0-9]+)\\s*:.*$", "\\1", lines, perl = TRUE)))
+    labels <- trimws(labels)
+    labels <- labels[nzchar(labels)]
+    
+    if (length(labels) > 0) {
+      return(list(ids = labels, pop = pops[seq_along(labels)], source = paste0("", f)))
+    }
+  }
+  
+  list(ids = character(0), pop = integer(0), source = "STRUCTURE results (no ancestry block parsed)")
 }
-expected_n <- length(id_reference)
+
+ids_order_raw <- load_ids_order_from_raw()
+ids_results <- extract_structure_order_from_results()
 
 # ----------------------------
 # 2) Site latitude map (for SOUTH -> NORTH ordering)
@@ -132,10 +165,10 @@ load_site_latitude <- function(meta_df) {
 
 site_lat_map <- load_site_latitude(meta)
 
-build_base_order <- function(ids_vec) {
+build_base_order <- function(ids_vec, site_map_final) {
   out <- data.frame(
     Individual = ids_vec,
-    Site = site_map[ids_vec],
+    Site = site_map_final[ids_vec],
     stringsAsFactors = FALSE
   )
   out$SiteLat <- as.numeric(site_lat_map[out$Site])
@@ -148,8 +181,6 @@ build_base_order <- function(ids_vec) {
   out$PlotIndex <- seq_len(nrow(out))
   out
 }
-
-base_order_full <- build_base_order(id_reference)
 
 # ----------------------------
 # 3) Q file discovery
@@ -202,7 +233,6 @@ numeric_columns <- function(df) {
 
 window_stats <- function(mat, tol = 1e-6) {
   na_count <- sum(is.na(mat))
-  nonnum <- 0L
   lo <- sum(mat < -tol, na.rm = TRUE)
   hi <- sum(mat > 1 + tol, na.rm = TRUE)
   valid_rows <- complete.cases(mat)
@@ -218,7 +248,7 @@ window_stats <- function(mat, tol = 1e-6) {
     row_bad <- Inf
     row_dev <- Inf
   }
-  list(na = na_count, nonnum = nonnum, lo = lo, hi = hi, row_min = row_min, row_max = row_max, row_bad = row_bad, row_dev = row_dev)
+  list(na = na_count, lo = lo, hi = hi, row_min = row_min, row_max = row_max, row_bad = row_bad, row_dev = row_dev)
 }
 
 choose_q_columns <- function(num_df, k_hint = NA_integer_, tol = 1e-6) {
@@ -250,6 +280,39 @@ choose_q_columns <- function(num_df, k_hint = NA_integer_, tol = 1e-6) {
   cands[[best_i]]
 }
 
+inspect_q_file_lines <- function(path, expected_k = NA_integer_) {
+  txt <- tryCatch(readLines(path, warn = FALSE), error = function(e) character(0))
+  if (length(txt) == 0) {
+    return(list(total = 0L, blank = 0L, numeric_like = 0L, wrong_token_count = 0L, duplicate_lines = 0L))
+  }
+  
+  raw <- trimws(txt)
+  nonblank <- raw[nzchar(raw)]
+  blank_n <- sum(!nzchar(raw))
+  
+  token_n <- vapply(strsplit(nonblank, "\\s+"), length, integer(1))
+  numeric_like <- vapply(nonblank, function(line) {
+    toks <- strsplit(line, "\\s+")[[1]]
+    all(!is.na(suppressWarnings(as.numeric(toks))))
+  }, logical(1))
+  
+  if (is.na(expected_k)) {
+    numeric_rows <- sum(numeric_like)
+    wrong_tok <- NA_integer_
+  } else {
+    numeric_rows <- sum(numeric_like & token_n == expected_k)
+    wrong_tok <- sum(numeric_like & token_n != expected_k)
+  }
+  
+  list(
+    total = length(txt),
+    blank = blank_n,
+    numeric_like = numeric_rows,
+    wrong_token_count = wrong_tok,
+    duplicate_lines = sum(duplicated(nonblank))
+  )
+}
+
 read_q_matrix <- function(path, k_hint = NA_integer_, tol = 1e-6) {
   readers <- list(
     list(label = "whitespace_no_header", fun = function() read.table(path, header = FALSE, sep = "", stringsAsFactors = FALSE, check.names = FALSE, fill = TRUE, comment.char = "", quote = "")),
@@ -267,12 +330,10 @@ read_q_matrix <- function(path, k_hint = NA_integer_, tol = 1e-6) {
     num_df <- numeric_columns(dat)
     if (nrow(num_df) == 0 || ncol(num_df) < 2) next
     
-    # remove empty numeric columns
     keep_non_empty <- vapply(num_df, function(x) sum(!is.na(x)) > 0, logical(1))
     num_df <- num_df[, keep_non_empty, drop = FALSE]
     if (ncol(num_df) < 2) next
     
-    # remove index-like first column if exactly 1..N
     first_col <- num_df[[1]]
     if (!anyNA(first_col) && length(first_col) > 1 && all(abs(first_col - seq_len(length(first_col))) < 1e-8)) {
       num_df <- num_df[, -1, drop = FALSE]
@@ -283,12 +344,15 @@ read_q_matrix <- function(path, k_hint = NA_integer_, tol = 1e-6) {
     if (is.null(sel)) next
     
     q <- sel$q
+    q <- q[rowSums(!is.na(q)) > 0, , drop = FALSE]
     colnames(q) <- paste0("Q", seq_len(ncol(q)))
     
-    return(list(ok = TRUE, matrix = q, reader = r$label, q_indices = sel$idx, stats = sel$stats))
+    line_diag <- inspect_q_file_lines(path, expected_k = ncol(q))
+    
+    return(list(ok = TRUE, matrix = q, reader = r$label, q_indices = sel$idx, stats = sel$stats, line_diag = line_diag))
   }
   
-  list(ok = FALSE, matrix = NULL, reader = NA_character_, q_indices = integer(0), stats = NULL)
+  list(ok = FALSE, matrix = NULL, reader = NA_character_, q_indices = integer(0), stats = NULL, line_diag = inspect_q_file_lines(path, expected_k = k_hint))
 }
 
 summarize_candidate <- function(file_base, k_infer, parsed, reason) {
@@ -301,6 +365,7 @@ summarize_candidate <- function(file_base, k_infer, parsed, reason) {
   
   q <- parsed$matrix
   st <- parsed$stats
+  ld <- parsed$line_diag
   message("[03_structure] Candidate: ", file_base,
           " | inferred K=", ifelse(is.na(k_infer), "NA", k_infer),
           " | rows=", nrow(q),
@@ -310,6 +375,8 @@ summarize_candidate <- function(file_base, k_infer, parsed, reason) {
           " | min=", signif(min(q, na.rm = TRUE), 6),
           " | max=", signif(max(q, na.rm = TRUE), 6),
           " | rowSumRange=", signif(st$row_min, 6), "-", signif(st$row_max, 6),
+          " | lines(total/blank/numeric_like)=", ld$total, "/", ld$blank, "/", ld$numeric_like,
+          " | duplicate_nonblank_rows=", ld$duplicate_lines,
           " | ", reason)
 }
 
@@ -394,7 +461,6 @@ if (length(scan$files) == 0) {
     if (!is.na(meta_name$K) && meta_name$K != K_detected) K_final <- K_detected
     
     row_dev <- mean(abs(rowSums(clamp01(q_mat, 1e-6), na.rm = TRUE) - 1), na.rm = TRUE)
-    st <- parsed$stats
     
     reject_reason <- NULL
     status <- "parsed_candidate"
@@ -403,11 +469,20 @@ if (length(scan$files) == 0) {
       status <- "skipped_k1"
     }
     
+    ld <- parsed$line_diag
+    cause_msg <- "ACCEPTED as parsed candidate"
+    if (ld$blank > 0 && ld$numeric_like == nrow(q_mat)) {
+      cause_msg <- paste0(cause_msg, " (blank lines ignored; no extra non-data rows kept)")
+    }
+    if (!is.na(ld$wrong_token_count) && ld$wrong_token_count > 0) {
+      cause_msg <- paste0(cause_msg, " (non-Q token-count rows excluded)")
+    }
+    
     summarize_candidate(
       basename(f),
       meta_name$K,
       parsed,
-      ifelse(is.null(reject_reason), "ACCEPTED as parsed candidate", paste0("REJECTED: ", reject_reason))
+      ifelse(is.null(reject_reason), cause_msg, paste0("REJECTED: ", reject_reason))
     )
     
     run_inventory[[length(run_inventory) + 1]] <- data.frame(
@@ -428,9 +503,7 @@ if (length(scan$files) == 0) {
         run = meta_name$run,
         reader = parsed$reader,
         q = q_mat,
-        mad = row_dev,
-        row_min = st$row_min,
-        row_max = st$row_max
+        mad = row_dev
       )
     }
   }
@@ -446,171 +519,233 @@ if (length(scan$files) == 0) {
     message("[03_structure] No usable K>=2 Q runs after parsing.")
     message("[03_structure] Done.")
   } else {
-    # choose target n: prefer expected_n, otherwise use most common parsed row count
-    candidate_n <- vapply(parsed_candidates, function(x) nrow(x$q), integer(1))
-    target_n <- expected_n
-    if (!(expected_n %in% candidate_n)) {
-      tbl <- sort(table(candidate_n), decreasing = TRUE)
-      target_n <- as.integer(names(tbl)[1])
-      warning("[03_structure] Expected n=", expected_n,
-              " not found in parsed files. Using modal parsed n=", target_n,
-              " for plotting order.")
+    parsed_runs <- Filter(function(x) x$K >= 2, parsed_candidates)
+    row_counts <- sort(unique(vapply(parsed_runs, function(x) nrow(x$q), integer(1))))
+    if (length(row_counts) != 1) {
+      stop("[03_structure] Parsed Q files have inconsistent row counts across runs: ", paste(row_counts, collapse = ", "))
+    }
+    q_n <- row_counts[1]
+    
+    # choose reference source with exact match to parsed Q row count
+    ref_candidates <- list(
+      list(name = ids_order_raw$source, ids = ids_order_raw$ids),
+      list(name = ids_results$source, ids = unique(ids_results$ids)),
+      list(name = "df_ids object order", ids = unique(ids_dfids))
+    )
+    
+    ref_lengths <- vapply(ref_candidates, function(x) length(x$ids), integer(1))
+    message("[03_structure] Reference lengths (for matching parsed n=", q_n, "): ",
+            paste0(vapply(ref_candidates, function(x) x$name, character(1)), "=", ref_lengths, collapse = " | "))
+    
+    idx_match <- which(ref_lengths == q_n)
+    if (length(idx_match) == 0) {
+      stop("[03_structure] No reference ID source matches parsed Q row count n=", q_n,
+           ". Check ids_order_from_raw.csv and STRUCTURE input export order.")
     }
     
-    if (target_n > nrow(base_order_full)) {
-      stop("[03_structure] Parsed Q files have more rows than available reference IDs.")
-    }
-    base_order_df <- base_order_full[seq_len(target_n), , drop = FALSE]
+    # preference order already encoded above: raw IDs -> results labels -> df_ids
+    ref_pick <- idx_match[1]
+    id_reference <- ref_candidates[[ref_pick]]$ids
+    ref_source_used <- ref_candidates[[ref_pick]]$name
+    message("[03_structure] Using reference ID source: ", ref_source_used, " (n=", length(id_reference), ")")
     
-    parsed_runs <- Filter(function(x) nrow(x$q) == target_n && x$K >= 2, parsed_candidates)
-    if (length(parsed_runs) == 0) {
-      message("[03_structure] No usable K>=2 runs after row-count harmonization (target_n=", target_n, ").")
-      message("[03_structure] Done.")
-    } else {
-      runs_by_k <- split(parsed_runs, sapply(parsed_runs, function(x) x$K))
-      selected_rows <- list()
-      allk_plot_data <- list()
-      validations_passed <- 0L
+    # diagnose mismatch vs df_ids
+    missing_in_df <- setdiff(id_reference, ids_dfids)
+    extra_in_df <- setdiff(ids_dfids, id_reference)
+    if (length(missing_in_df) > 0 || length(extra_in_df) > 0) {
+      message("[03_structure] ID mismatch diagnostic:")
+      message("  IDs in reference but not df_ids: ", length(missing_in_df),
+              ifelse(length(missing_in_df) > 0, paste0(" (e.g., ", paste(head(missing_in_df, 5), collapse = ", "), ")"), ""))
+      message("  IDs in df_ids but not reference: ", length(extra_in_df),
+              ifelse(length(extra_in_df) > 0, paste0(" (e.g., ", paste(head(extra_in_df, 5), collapse = ", "), ")"), ""))
+    }
+    
+    # build best-available site map for all reference IDs
+    site_map_final <- site_map_dfids
+    
+    if (length(ids_results$ids) > 0 && length(ids_results$pop) == length(ids_results$ids)) {
+      lab_pop <- data.frame(Individual = ids_results$ids, PopIdx = ids_results$pop, stringsAsFactors = FALSE)
+      known <- lab_pop %>%
+        mutate(Site = site_map_dfids[Individual]) %>%
+        filter(!is.na(Site), !is.na(PopIdx))
       
-      site_blocks <- base_order_df %>%
-        count(Site, name = "n") %>%
-        mutate(xmax = cumsum(n), xmin = xmax - n + 1, xmid = (xmin + xmax) / 2)
-      separators <- site_blocks$xmax[-nrow(site_blocks)] + 0.5
-      
-      k_levels <- sort(unique(as.integer(names(runs_by_k))))
-      
-      for (k_name in names(runs_by_k)) {
-        k_runs <- runs_by_k[[k_name]]
-        k_num <- as.integer(k_name)
+      if (nrow(known) > 0) {
+        pop_to_site <- known %>%
+          count(PopIdx, Site, name = "n") %>%
+          group_by(PopIdx) %>%
+          arrange(desc(n), Site, .by_group = TRUE) %>%
+          slice(1) %>%
+          ungroup() %>%
+          select(PopIdx, Site)
         
-        score_df <- bind_rows(lapply(k_runs, function(x) {
-          data.frame(
-            file = x$file,
-            file_base = x$file_base,
-            K = x$K,
-            run = ifelse(is.na(x$run), Inf, x$run),
-            run_report = x$run,
-            reader = x$reader,
-            mad = x$mad,
-            stringsAsFactors = FALSE
-          )
-        })) %>% arrange(mad, run, file_base)
+        inferred <- lab_pop %>%
+          left_join(pop_to_site, by = "PopIdx")
+        inferred_map <- setNames(inferred$Site, inferred$Individual)
         
-        best <- k_runs[[match(score_df$file[1], sapply(k_runs, function(x) x$file))]]
-        
-        message("[03_structure] Found ", length(k_runs), " usable run(s) for K=", k_num)
-        message("[03_structure] Using best run for K=", k_num,
-                " (run=", ifelse(is.na(best$run), "NA", best$run),
-                ", reader=", best$reader,
-                ", mean|rowSum-1|=", signif(best$mad, 4), ")")
-        
-        q_df <- cbind(base_order_df, as.data.frame(best$q, stringsAsFactors = FALSE, check.names = FALSE))
-        q_cols <- grep("^Q", names(q_df), value = TRUE)
-        
-        q_df <- validate_selected_run(
-          k_num = k_num,
-          run_info = best,
-          q_df = q_df,
-          q_cols = q_cols,
-          id_reference = base_order_df$Individual,
-          tol = 1e-6,
-          row_tol = 1e-3
-        )
-        
-        plot_df <- q_df %>%
-          select(PlotIndex, Site, all_of(q_cols)) %>%
-          pivot_longer(cols = all_of(q_cols), names_to = "Cluster", values_to = "Q")
-        
-        if (!is.numeric(plot_df$Q)) fail_validation(k_num, best$file_base, best$run, "Long-format Q column is not numeric after pivot.")
-        if (anyNA(plot_df$Q)) fail_validation(k_num, best$file_base, best$run, paste0("Long-format Q contains NA: ", sum(is.na(plot_df$Q))))
-        if (any(plot_df$Q < -1e-6 | plot_df$Q > 1 + 1e-6)) {
-          fail_validation(k_num, best$file_base, best$run, "Long-format Q contains values outside [0,1].")
+        need_fill <- id_reference[is.na(site_map_final[id_reference])]
+        if (length(need_fill) > 0) {
+          fill_vals <- inferred_map[need_fill]
+          site_map_final[need_fill] <- fill_vals
         }
-        
-        plot_df$Q <- clamp01(plot_df$Q, tol = 1e-6)
-        plot_df$K <- k_num
-        plot_df$KLabel <- factor(paste0("K=", k_num), levels = paste0("K=", k_levels))
-        allk_plot_data[[length(allk_plot_data) + 1]] <- plot_df
-        
-        p <- ggplot(plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
-          geom_col(width = 1) +
-          geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
-          scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-          scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
-          theme_bw(base_size = 11) +
-          theme(
-            panel.grid = element_blank(),
-            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
-            axis.ticks.x = element_blank(),
-            legend.position = "right",
-            plot.title = element_text(face = "bold")
-          ) +
-          labs(
-            title = sprintf("STRUCTURE ancestry barplot (K=%d)", k_num),
-            subtitle = "Individuals ordered south to north by site latitude",
-            x = "Site blocks (south -> north)",
-            y = "Ancestry proportion"
-          )
-        
-        out_fig <- file.path(FIGURES_DIR, sprintf("structure_individual_barplot_K%d.jpeg", k_num))
-        ggsave(out_fig, p, width = 13, height = 5.5, dpi = 320)
-        message("[03_structure] Saved: ", out_fig)
-        
-        selected_rows[[length(selected_rows) + 1]] <- data.frame(
-          K = k_num,
-          selected_file = best$file_base,
-          selected_path = best$file,
-          selected_run = best$run,
-          reader = best$reader,
-          mean_abs_row_sum_deviation = best$mad,
-          n_runs_available = length(k_runs),
-          method = "best_single_run_no_cluster_relabeling",
+      }
+    }
+    
+    base_order_df <- build_base_order(id_reference, site_map_final)
+    if (nrow(base_order_df) != q_n) {
+      stop("[03_structure] Internal alignment error: reference order n=", nrow(base_order_df), " but parsed Q n=", q_n)
+    }
+    
+    missing_site_n <- sum(is.na(base_order_df$Site))
+    if (missing_site_n > 0) {
+      warning("[03_structure] ", missing_site_n,
+              " individuals have missing Site labels after site-map recovery; they will be plotted at end.")
+    }
+    
+    runs_by_k <- split(parsed_runs, sapply(parsed_runs, function(x) x$K))
+    selected_rows <- list()
+    allk_plot_data <- list()
+    validations_passed <- 0L
+    
+    site_blocks <- base_order_df %>%
+      mutate(Site = ifelse(is.na(Site), "Unknown", Site)) %>%
+      count(Site, name = "n") %>%
+      mutate(xmax = cumsum(n), xmin = xmax - n + 1, xmid = (xmin + xmax) / 2)
+    separators <- site_blocks$xmax[-nrow(site_blocks)] + 0.5
+    
+    k_levels <- sort(unique(as.integer(names(runs_by_k))))
+    
+    for (k_name in names(runs_by_k)) {
+      k_runs <- runs_by_k[[k_name]]
+      k_num <- as.integer(k_name)
+      
+      score_df <- bind_rows(lapply(k_runs, function(x) {
+        data.frame(
+          file = x$file,
+          file_base = x$file_base,
+          K = x$K,
+          run = ifelse(is.na(x$run), Inf, x$run),
+          run_report = x$run,
+          reader = x$reader,
+          mad = x$mad,
           stringsAsFactors = FALSE
         )
-        
-        validations_passed <- validations_passed + 1L
+      })) %>% arrange(mad, run, file_base)
+      
+      best <- k_runs[[match(score_df$file[1], sapply(k_runs, function(x) x$file))]]
+      
+      message("[03_structure] Found ", length(k_runs), " usable run(s) for K=", k_num)
+      message("[03_structure] Using best run for K=", k_num,
+              " (run=", ifelse(is.na(best$run), "NA", best$run),
+              ", reader=", best$reader,
+              ", mean|rowSum-1|=", signif(best$mad, 4), ")")
+      
+      q_df <- cbind(base_order_df, as.data.frame(best$q, stringsAsFactors = FALSE, check.names = FALSE))
+      q_cols <- grep("^Q", names(q_df), value = TRUE)
+      
+      q_df <- validate_selected_run(
+        k_num = k_num,
+        run_info = best,
+        q_df = q_df,
+        q_cols = q_cols,
+        id_reference = base_order_df$Individual,
+        tol = 1e-6,
+        row_tol = 1e-3
+      )
+      
+      plot_df <- q_df %>%
+        mutate(Site = ifelse(is.na(Site), "Unknown", Site)) %>%
+        select(PlotIndex, Site, all_of(q_cols)) %>%
+        pivot_longer(cols = all_of(q_cols), names_to = "Cluster", values_to = "Q")
+      
+      if (!is.numeric(plot_df$Q)) fail_validation(k_num, best$file_base, best$run, "Long-format Q column is not numeric after pivot.")
+      if (anyNA(plot_df$Q)) fail_validation(k_num, best$file_base, best$run, paste0("Long-format Q contains NA: ", sum(is.na(plot_df$Q))))
+      if (any(plot_df$Q < -1e-6 | plot_df$Q > 1 + 1e-6)) {
+        fail_validation(k_num, best$file_base, best$run, "Long-format Q contains values outside [0,1].")
       }
       
-      if (length(allk_plot_data) > 0) {
-        combined_plot_df <- bind_rows(allk_plot_data)
-        
-        p_all <- ggplot(combined_plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
-          geom_col(width = 1) +
-          geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
-          scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-          scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
-          facet_grid(rows = vars(KLabel)) +
-          theme_bw(base_size = 11) +
-          theme(
-            panel.grid = element_blank(),
-            axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
-            axis.ticks.x = element_blank(),
-            legend.position = "right",
-            strip.text.y = element_text(face = "bold")
-          ) +
-          labs(
-            title = "STRUCTURE ancestry barplots across K",
-            subtitle = "Individuals ordered south to north by site latitude",
-            x = "Site blocks (south -> north)",
-            y = "Ancestry proportion"
-          )
-        
-        out_all <- file.path(FIGURES_DIR, "structure_individual_barplot_allK.jpeg")
-        ggsave(out_all, p_all, width = 13, height = max(5.5, 2.2 * length(unique(combined_plot_df$K))), dpi = 320)
-        message("[03_structure] Saved: ", out_all)
-      }
+      plot_df$Q <- clamp01(plot_df$Q, tol = 1e-6)
+      plot_df$K <- k_num
+      plot_df$KLabel <- factor(paste0("K=", k_num), levels = paste0("K=", k_levels))
+      allk_plot_data[[length(allk_plot_data) + 1]] <- plot_df
       
-      if (length(selected_rows) > 0) {
-        selected_df <- bind_rows(selected_rows) %>% arrange(K)
-        selected_file <- file.path(TABLES_SUPP_DIR, "structure_selected_runs.csv")
-        write.csv(selected_df, selected_file, row.names = FALSE)
-        message("[03_structure] Saved selected-run summary: ", selected_file)
-      }
+      p <- ggplot(plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
+        geom_col(width = 1) +
+        geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
+        scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
+        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+        theme_bw(base_size = 11) +
+        theme(
+          panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+          axis.ticks.x = element_blank(),
+          legend.position = "right",
+          plot.title = element_text(face = "bold")
+        ) +
+        labs(
+          title = sprintf("STRUCTURE ancestry barplot (K=%d)", k_num),
+          subtitle = "Individuals ordered south to north by site latitude",
+          x = "Site blocks (south -> north)",
+          y = "Ancestry proportion"
+        )
       
-      message("[03_structure] Validation summary: all K plots passed validation (", validations_passed, " K values).")
-      message("[03_structure] Validation summary: no rows dropped in plotting.")
-      message("[03_structure] Validation summary: combined figure built successfully.")
-      message("[03_structure] Done.")
+      out_fig <- file.path(FIGURES_DIR, sprintf("structure_individual_barplot_K%d.jpeg", k_num))
+      ggsave(out_fig, p, width = 13, height = 5.5, dpi = 320)
+      message("[03_structure] Saved: ", out_fig)
+      
+      selected_rows[[length(selected_rows) + 1]] <- data.frame(
+        K = k_num,
+        selected_file = best$file_base,
+        selected_path = best$file,
+        selected_run = best$run,
+        reader = best$reader,
+        mean_abs_row_sum_deviation = best$mad,
+        n_runs_available = length(k_runs),
+        method = "best_single_run_no_cluster_relabeling",
+        stringsAsFactors = FALSE
+      )
+      
+      validations_passed <- validations_passed + 1L
     }
+    
+    if (length(allk_plot_data) > 0) {
+      combined_plot_df <- bind_rows(allk_plot_data)
+      
+      p_all <- ggplot(combined_plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
+        geom_col(width = 1) +
+        geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
+        scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
+        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+        facet_grid(rows = vars(KLabel)) +
+        theme_bw(base_size = 11) +
+        theme(
+          panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+          axis.ticks.x = element_blank(),
+          legend.position = "right",
+          strip.text.y = element_text(face = "bold")
+        ) +
+        labs(
+          title = "STRUCTURE ancestry barplots across K",
+          subtitle = "Individuals ordered south to north by site latitude",
+          x = "Site blocks (south -> north)",
+          y = "Ancestry proportion"
+        )
+      
+      out_all <- file.path(FIGURES_DIR, "structure_individual_barplot_allK.jpeg")
+      ggsave(out_all, p_all, width = 13, height = max(5.5, 2.2 * length(unique(combined_plot_df$K))), dpi = 320)
+      message("[03_structure] Saved: ", out_all)
+    }
+    
+    if (length(selected_rows) > 0) {
+      selected_df <- bind_rows(selected_rows) %>% arrange(K)
+      selected_file <- file.path(TABLES_SUPP_DIR, "structure_selected_runs.csv")
+      write.csv(selected_df, selected_file, row.names = FALSE)
+      message("[03_structure] Saved selected-run summary: ", selected_file)
+    }
+    
+    message("[03_structure] Validation summary: all K plots passed validation (", validations_passed, " K values).")
+    message("[03_structure] Validation summary: no rows dropped in plotting.")
+    message("[03_structure] Validation summary: combined figure built successfully.")
+    message("[03_structure] Done.")
   }
 }

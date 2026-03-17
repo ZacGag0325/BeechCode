@@ -706,12 +706,23 @@ harmonize_df_ids_to_gi <- function(df_ids, gi) {
   
   missing_in_df <- !(gi_norm %in% df_norm)
   if (any(missing_in_df)) {
-    add <- data.frame(stringsAsFactors = FALSE)
-    for (nm in names(df_ids)) add[[nm]] <- NA_character_
+    n_add <- sum(missing_in_df)
+    add <- as.data.frame(
+      matrix(NA_character_, nrow = n_add, ncol = ncol(df_ids)),
+      stringsAsFactors = FALSE
+    )
+    names(add) <- names(df_ids)
+    
     add[[id_col]] <- gi_ids[missing_in_df]
     add[[site_col]] <- gi_site[missing_in_df]
+    
+    # Optional metadata from source pop labels if a numeric site column exists.
+    if (site_col %in% names(add)) {
+      add[[site_col]] <- as.character(add[[site_col]])
+    }
+    
     df_ids <- rbind(df_ids, add)
-    message("[00_master_pipeline] Added ", sum(missing_in_df), " individuals to df_ids from gi universe.")
+    message("[00_master_pipeline] Added ", n_add, " individuals to df_ids from gi universe.")
   }
   
   rownames(df_ids) <- NULL

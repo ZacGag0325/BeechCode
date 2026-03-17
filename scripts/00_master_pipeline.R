@@ -58,6 +58,18 @@ sanitize_names <- function(x) {
   make.unique(x, sep = "_")
 }
 
+normalize_id <- function(x) {
+  x <- as.character(x)
+  x <- gsub("^\ufeff", "", x, perl = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x <- trimws(x)
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
+  x <- gsub("\u00A0", " ", x, perl = TRUE)
+  x <- gsub("\\s+", "", x, perl = TRUE)
+  x <- toupper(x)
+  x
+}
+
 trim_empty_columns <- function(df) {
   if (ncol(df) == 0) return(df)
   keep <- vapply(df, function(col) {
@@ -78,7 +90,6 @@ read_tabular_robust <- function(path, required_choices = list(), label = "table"
   
   raw_lines[1] <- sub("^\ufeff", "", raw_lines[1])
   
-  # Drop only leading blank and comment-style lines so downstream parse stays stable.
   lines <- raw_lines
   while (length(lines) > 0) {
     top <- trimws(lines[1])
@@ -138,14 +149,12 @@ read_tabular_robust <- function(path, required_choices = list(), label = "table"
         header_candidates[[length(header_candidates) + 1]] <- list(
           df = data_h,
           score = score,
-          req = req,
           header_row = h,
           header_mode = "header_from_detected_row"
         )
       }
     }
     
-    # Option: no header in file
     data_b <- raw_df
     names(data_b) <- paste0("V", seq_len(ncol(data_b)))
     data_b <- trim_empty_columns(data_b)
@@ -154,7 +163,6 @@ read_tabular_robust <- function(path, required_choices = list(), label = "table"
     no_header <- list(
       df = data_b,
       score = score_b,
-      req = req_b,
       header_row = NA_integer_,
       header_mode = "no_header_detected"
     )
@@ -184,8 +192,6 @@ read_tabular_robust <- function(path, required_choices = list(), label = "table"
   best_idx <- which.max(vapply(candidates, function(x) x$score, numeric(1)))
   best <- candidates[[best_idx]]
   df <- best$df
-  
-  # Convert factors/other types to character early; downstream can cast explicitly.
   df[] <- lapply(df, function(col) as.character(col))
   
   required_ok <- logical(length(required_choices))
@@ -221,6 +227,45 @@ read_tabular_robust <- function(path, required_choices = list(), label = "table"
   df
 }
 
+print_id_mismatch_diagnostics <- function(gi_ids, df_ids) {
+  gi_ids <- as.character(gi_ids)
+  df_ids <- as.character(df_ids)
+  
+  gi_norm <- normalize_id(gi_ids)
+  df_norm <- normalize_id(df_ids)
+  
+  exact_match <- sum(gi_ids %in% df_ids)
+  norm_match <- sum(gi_norm %in% df_norm)
+  
+  gi_only_norm <- setdiff(gi_norm, df_norm)
+  df_only_norm <- setdiff(df_norm, gi_norm)
+  
+  gi_example <- unique(gi_ids[gi_norm %in% gi_only_norm])
+  df_example <- unique(df_ids[df_norm %in% df_only_norm])
+  
+  message("[00_master_pipeline] ID diagnostic summary:")
+  message("  gi count: ", length(gi_ids), " | df_ids count: ", length(df_ids))
+  message("  exact ID matches: ", exact_match)
+  message("  normalized ID matches: ", norm_match)
+  message("  gi IDs missing in df_ids (normalized): ", length(gi_only_norm))
+  message("  df_ids missing in gi (normalized): ", length(df_only_norm))
+  
+  if (length(gi_example) > 0) {
+    message("  examples gi->missing (up to 25): ", paste(head(gi_example, 25), collapse = ", "))
+  }
+  if (length(df_example) > 0) {
+    message("  examples df_ids->missing (up to 25): ", paste(head(df_example, 25), collapse = ", "))
+  }
+  
+  # quick heuristics
+  trim_match <- sum(trimws(gi_ids) %in% trimws(df_ids))
+  upper_match <- sum(toupper(trimws(gi_ids)) %in% toupper(trimws(df_ids)))
+  de_punct <- function(x) gsub("[^A-Z0-9]", "", toupper(trimws(x)))
+  punct_match <- sum(de_punct(gi_ids) %in% de_punct(df_ids))
+  message("  heuristic matches after trim only: ", trim_match)
+  message("  heuristic matches after trim+case: ", upper_match)
+  message("  heuristic matches after trim+case+punctuation-strip: ", punct_match)
+}
 
 relabel_mll_ids <- function(raw_id, sample_ids) {
   if (length(raw_id) != length(sample_ids)) {
@@ -383,7 +428,7 @@ discover_genotype_candidates <- function() {
   out
 }
 
-extract_genind_from_object <- function(obj, source_path) {
+extract_genind_from_object <- function(obj) {
   if (inherits(obj, "genind")) return(obj)
   
   if (is.list(obj)) {
@@ -416,18 +461,36 @@ read_delimited_guess <- function(path) {
   NULL
 }
 
-build_genind_from_table <- function(tbl, source_path) {
+build_genind_from_table <- function(tbl) {
   nms <- names(tbl)
-  nms_low <- tolower(nms)
   
-  id_col <- resolve_col(tbl, c("ind", "individual", "sample", "sampleid", "id", "ind_id", "nom_labo_échantillons", "nom_labo_echantillons", "nom_labo_echantillon"))
-  pop_col <- resolve_col(tbl, c("site", "population", "pop", "numero_population", "numéro_population", "site_id"))
+  id_priority <- c(
+    "Nom_Labo_Échantillons", "Nom_Labo_Echantillons", "Nom_Labo_Echantillon",
+    "ind_id", "sampleid", "sample", "individual", "id", "ind"
+  )
+  pop_priority <- c("Numéro_Population", "Numero_Population", "site", "population", "pop", "site_id")
+  
+  pick_col <- function(priority) {
+    nms_low <- tolower(nms)
+    for (p in priority) {
+      i <- match(tolower(p), nms_low, nomatch = 0)
+      if (i > 0) return(nms[i])
+    }
+    NA_character_
+  }
+  
+  id_col <- pick_col(id_priority)
+  pop_col <- pick_col(pop_priority)
+  
+  if (is.na(id_col)) id_col <- resolve_col(tbl, c("ind", "individual", "sample", "sampleid", "id", "ind_id", "nom_labo_échantillons", "nom_labo_echantillons", "nom_labo_echantillon"))
+  if (is.na(pop_col)) pop_col <- resolve_col(tbl, c("site", "population", "pop", "numero_population", "numéro_population", "site_id"))
   
   if (is.na(id_col) || is.na(pop_col)) {
     return(NULL)
   }
   
-  # Detect allele pair columns such as locus_1/locus_2 or locus.1/locus.2
+  message("[00_master_pipeline] Genotype table selected columns: id=", id_col, " | pop=", pop_col)
+  
   allele_idx <- grep("(_|\\.)[12]$", nms, perl = TRUE)
   if (length(allele_idx) < 2 || length(allele_idx) %% 2 != 0) return(NULL)
   
@@ -476,6 +539,9 @@ build_genind_from_table <- function(tbl, source_path) {
     error = function(e) NULL
   )
   
+  if (is.null(gi)) return(NULL)
+  attr(gi, "source_id_col") <- id_col
+  attr(gi, "source_pop_col") <- pop_col
   gi
 }
 
@@ -501,10 +567,12 @@ build_gi_from_sources <- function() {
     
     if (ext == "rds") {
       obj <- tryCatch(readRDS(f), error = function(e) NULL)
-      gi <- extract_genind_from_object(obj, f)
+      gi <- extract_genind_from_object(obj)
       if (!is.null(gi)) {
         message("[00_master_pipeline] Chosen genotype source: ", f)
         message("[00_master_pipeline] Source mode: loaded genind from RDS")
+        attr(gi, "source_path") <- f
+        attr(gi, "source_mode") <- "loaded_genind_rds"
         return(gi)
       }
       next
@@ -516,10 +584,12 @@ build_gi_from_sources <- function() {
       if (is.null(tbl)) next
       tbl <- as.data.frame(tbl, stringsAsFactors = FALSE, check.names = FALSE)
       names(tbl) <- sanitize_names(names(tbl))
-      gi <- build_genind_from_table(tbl, f)
+      gi <- build_genind_from_table(tbl)
       if (!is.null(gi)) {
         message("[00_master_pipeline] Chosen genotype source: ", f)
         message("[00_master_pipeline] Source mode: rebuilt genind from spreadsheet table")
+        attr(gi, "source_path") <- f
+        attr(gi, "source_mode") <- "rebuilt_from_spreadsheet"
         return(gi)
       }
       next
@@ -528,10 +598,12 @@ build_gi_from_sources <- function() {
     if (ext %in% c("csv", "tsv", "txt")) {
       tbl <- read_delimited_guess(f)
       if (is.null(tbl)) next
-      gi <- build_genind_from_table(tbl, f)
+      gi <- build_genind_from_table(tbl)
       if (!is.null(gi)) {
         message("[00_master_pipeline] Chosen genotype source: ", f)
         message("[00_master_pipeline] Source mode: rebuilt genind from delimited table")
+        attr(gi, "source_path") <- f
+        attr(gi, "source_mode") <- "rebuilt_from_delimited"
         return(gi)
       }
       next
@@ -539,14 +611,10 @@ build_gi_from_sources <- function() {
   }
   
   stop(
-    "[00_master_pipeline] Could not build 'gi' from available files.
-",
-    "Checked ", nrow(candidates), " candidate files across search directories.
-",
-    "Expected either:
-",
-    "  - an RDS containing a genind object (or list element gi/genind),
-",
+    "[00_master_pipeline] Could not build 'gi' from available files.\n",
+    "Checked ", nrow(candidates), " candidate files across search directories.\n",
+    "Expected either:\n",
+    "  - an RDS containing a genind object (or list element gi/genind),\n",
     "  - or a genotype table with ID + population + paired allele columns (*_1/*_2 or *.1/*.2)."
   )
 }
@@ -565,14 +633,89 @@ try_load_legacy_objects <- function() {
 assign_pop_from_df_ids <- function(gi, df_ids) {
   id_col <- resolve_col(df_ids, c("ind", "individual", "sample", "sampleid", "id", "ind_id"))
   site_col <- resolve_col(df_ids, c("site", "population", "pop"))
-  mapper <- setNames(as.character(df_ids[[site_col]]), as.character(df_ids[[id_col]]))
-  sites <- mapper[adegenet::indNames(gi)]
-  if (any(is.na(sites))) {
-    missing_n <- sum(is.na(sites))
-    stop("[00_master_pipeline] Could not map Site for all gi individuals. Missing: ", missing_n)
+  
+  gi_ids <- as.character(adegenet::indNames(gi))
+  df_ids_raw <- as.character(df_ids[[id_col]])
+  df_site_raw <- as.character(df_ids[[site_col]])
+  
+  print_id_mismatch_diagnostics(gi_ids, df_ids_raw)
+  
+  gi_norm <- normalize_id(gi_ids)
+  df_norm <- normalize_id(df_ids_raw)
+  
+  df_map <- data.frame(df_id = df_ids_raw, df_norm = df_norm, site = df_site_raw, stringsAsFactors = FALSE)
+  df_map <- df_map[nzchar(df_map$df_norm), , drop = FALSE]
+  
+  dup_norm <- df_map$df_norm[duplicated(df_map$df_norm)]
+  if (length(dup_norm) > 0) {
+    dup_sites <- split(df_map$site[df_map$df_norm %in% dup_norm], df_map$df_norm[df_map$df_norm %in% dup_norm])
+    conflicting <- vapply(dup_sites, function(v) length(unique(na.omit(v))) > 1, logical(1))
+    if (any(conflicting)) {
+      bad <- names(dup_sites)[conflicting]
+      stop("[00_master_pipeline] Conflicting Site labels after ID normalization for IDs: ",
+           paste(head(bad, 25), collapse = ", "))
+    }
+    df_map <- df_map[!duplicated(df_map$df_norm), , drop = FALSE]
   }
-  adegenet::pop(gi) <- as.factor(sites)
+  
+  site_by_norm <- setNames(df_map$site, df_map$df_norm)
+  mapped_site <- site_by_norm[gi_norm]
+  
+  missing_idx <- which(is.na(mapped_site) | !nzchar(mapped_site))
+  recovered_n <- 0L
+  if (length(missing_idx) > 0) {
+    gi_pop <- tryCatch(as.character(adegenet::pop(gi)), error = function(e) rep(NA_character_, adegenet::nInd(gi)))
+    can_recover <- missing_idx[!is.na(gi_pop[missing_idx]) & nzchar(gi_pop[missing_idx])]
+    if (length(can_recover) > 0) {
+      mapped_site[can_recover] <- gi_pop[can_recover]
+      recovered_n <- length(can_recover)
+    }
+  }
+  
+  final_missing <- which(is.na(mapped_site) | !nzchar(mapped_site))
+  message("[00_master_pipeline] Site assignment diagnostics:")
+  message("  matched via df_ids: ", length(gi_ids) - length(missing_idx))
+  message("  recovered from genotype source pop column: ", recovered_n)
+  message("  still unmatched after harmonization: ", length(final_missing))
+  
+  if (length(final_missing) > 0) {
+    miss <- gi_ids[final_missing]
+    stop(
+      "[00_master_pipeline] Could not map Site for all gi individuals after normalization/recovery.\n",
+      "Unmatched IDs (up to 50): ", paste(head(miss, 50), collapse = ", "),
+      "\nAttempted normalization: trim, control-char removal, transliteration, whitespace removal, case normalization."
+    )
+  }
+  
+  adegenet::pop(gi) <- as.factor(mapped_site)
   gi
+}
+
+harmonize_df_ids_to_gi <- function(df_ids, gi) {
+  id_col <- resolve_col(df_ids, c("ind", "individual", "sample", "sampleid", "id", "ind_id"))
+  site_col <- resolve_col(df_ids, c("site", "population", "pop"))
+  
+  gi_ids <- as.character(adegenet::indNames(gi))
+  gi_site <- as.character(adegenet::pop(gi))
+  
+  df_ids[[id_col]] <- as.character(df_ids[[id_col]])
+  df_ids[[site_col]] <- as.character(df_ids[[site_col]])
+  
+  df_norm <- normalize_id(df_ids[[id_col]])
+  gi_norm <- normalize_id(gi_ids)
+  
+  missing_in_df <- !(gi_norm %in% df_norm)
+  if (any(missing_in_df)) {
+    add <- data.frame(stringsAsFactors = FALSE)
+    for (nm in names(df_ids)) add[[nm]] <- NA_character_
+    add[[id_col]] <- gi_ids[missing_in_df]
+    add[[site_col]] <- gi_site[missing_in_df]
+    df_ids <- rbind(df_ids, add)
+    message("[00_master_pipeline] Added ", sum(missing_in_df), " individuals to df_ids from gi universe.")
+  }
+  
+  rownames(df_ids) <- NULL
+  df_ids
 }
 
 build_objects <- function() {
@@ -580,7 +723,11 @@ build_objects <- function() {
   meta <- load_meta()
   
   gi <- build_gi_from_sources()
+  message("[00_master_pipeline] Source ID column used (if rebuilt): ", ifelse(is.null(attr(gi, "source_id_col")), "NA", attr(gi, "source_id_col")))
+  message("[00_master_pipeline] Source POP column used (if rebuilt): ", ifelse(is.null(attr(gi, "source_pop_col")), "NA", attr(gi, "source_pop_col")))
+  
   gi <- assign_pop_from_df_ids(gi, df_ids)
+  df_ids <- harmonize_df_ids_to_gi(df_ids, gi)
   
   mll <- make_mll_from_bruvo(gi, threshold = 0)
   mll_labels <- mll$mll_label
@@ -605,7 +752,6 @@ build_objects <- function() {
     meta.rds = meta
   )
 }
-
 
 objs <- try_load_legacy_objects()
 if (is.null(objs)) {
@@ -635,4 +781,6 @@ message("  - ", file.path(OUTPUT_OBJ_DIR, "gi_mll.rds"))
 message("  - ", file.path(OUTPUT_OBJ_DIR, "df_ids.rds"))
 message("  - ", file.path(OUTPUT_OBJ_DIR, "meta.rds"))
 message("[00_master_pipeline] nInd(gi)=", adegenet::nInd(objs[["gi.rds"]]),
-        " | nInd(gi_mll)=", adegenet::nInd(objs[["gi_mll.rds"]]))
+        " | nInd(gi_mll)=", adegenet::nInd(objs[["gi_mll.rds"]]),
+        " | nrow(df_ids)=", nrow(objs[["df_ids.rds"]]),
+        " | nrow(meta)=", nrow(objs[["meta.rds"]]))

@@ -23,13 +23,6 @@ source("scripts/_load_objects.R")
 
 message("[03_structure] Preparing final STRUCTURE individual barplots...")
 
-resolve_col <- function(df, choices) {
-  nms <- names(df)
-  idx <- match(TRUE, tolower(nms) %in% tolower(choices), nomatch = 0)
-  if (idx == 0) return(NA_character_)
-  nms[idx]
-}
-
 clamp01 <- function(x, tol = 1e-6) {
   x[x < 0 & x >= -tol] <- 0
   x[x > 1 & x <= 1 + tol] <- 1
@@ -51,15 +44,13 @@ fail_validation <- function(k, file_base, run_id, msg) {
 # ----------------------------
 # 1) Individual IDs and Site map
 # ----------------------------
-id_col_dfids <- resolve_col(df_ids, c("ind", "individual", "sample", "sampleid", "id"))
-site_col_dfids <- resolve_col(df_ids, c("site", "population", "pop"))
-if (is.na(id_col_dfids) || is.na(site_col_dfids)) {
-  stop("[03_structure] df_ids must contain individual ID and Site columns.")
-}
+df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[03_structure]", require = TRUE)
+id_col_dfids <- df_ids_cols$id_col
+site_col_dfids <- df_ids_cols$site_col
 
 ids_dfids <- trimws(as.character(df_ids[[id_col_dfids]]))
 ids_dfids <- ids_dfids[nzchar(ids_dfids)]
-site_map_dfids <- setNames(as.character(df_ids[[site_col_dfids]]), ids_dfids)
+site_map_dfids <- setNames(as.character(df_ids[[site_col_dfids]]), normalize_id(ids_dfids))
 
 load_ids_order_from_raw <- function() {
   ids_path <- file.path(PROJECT_ROOT, "data", "structure", "ids_order_from_raw.csv")
@@ -75,7 +66,7 @@ load_ids_order_from_raw <- function() {
     return(list(ids = character(0), source = "ids_order_from_raw.csv (unreadable)"))
   }
   
-  id_col <- resolve_col(ids_df, c("ind", "individual", "sample", "sampleid", "id", "ind_id"))
+  id_col <- resolve_col_ci(ids_df, c("ind", "individual", "sample", "sampleid", "id", "ind_id"))
   if (is.na(id_col)) id_col <- names(ids_df)[1]
   
   ids <- trimws(as.character(ids_df[[id_col]]))
@@ -135,8 +126,8 @@ ids_results <- extract_structure_order_from_results()
 # 2) Site latitude map (for SOUTH -> NORTH ordering)
 # ----------------------------
 load_site_latitude <- function(meta_df) {
-  site_col <- resolve_col(meta_df, c("site", "population", "pop"))
-  lat_col <- resolve_col(meta_df, c("latitude", "lat"))
+  site_col <- resolve_col_ci(meta_df, c("site", "population", "pop"))
+  lat_col <- resolve_col_ci(meta_df, c("latitude", "lat"))
   
   if (is.na(site_col) || is.na(lat_col)) {
     fallback <- file.path(PROJECT_ROOT, "inputs", "site_metadata.csv")
@@ -144,8 +135,8 @@ load_site_latitude <- function(meta_df) {
       stop("[03_structure] Could not find Site/Latitude in meta or inputs/site_metadata.csv")
     }
     meta_df <- read.csv(fallback, stringsAsFactors = FALSE, check.names = FALSE)
-    site_col <- resolve_col(meta_df, c("site", "population", "pop"))
-    lat_col <- resolve_col(meta_df, c("latitude", "lat"))
+    site_col <- resolve_col_ci(meta_df, c("site", "population", "pop"))
+    lat_col <- resolve_col_ci(meta_df, c("latitude", "lat"))
     if (is.na(site_col) || is.na(lat_col)) {
       stop("[03_structure] site_metadata.csv must contain Site and Latitude columns.")
     }
@@ -169,7 +160,7 @@ site_lat_map <- load_site_latitude(meta)
 build_base_order <- function(ids_vec, site_map_final) {
   out <- data.frame(
     Individual = ids_vec,
-    Site = site_map_final[ids_vec],
+    Site = site_map_final[normalize_id(ids_vec)],
     stringsAsFactors = FALSE
   )
   out$SiteLat <- as.numeric(site_lat_map[out$Site])
@@ -639,8 +630,8 @@ if (length(scan$files) == 0) {
     message("[03_structure] Using reference ID source: ", ref_source_used, " (n=", length(id_reference), ")")
     
     # diagnose mismatch vs df_ids
-    missing_in_df <- setdiff(id_reference, ids_dfids)
-    extra_in_df <- setdiff(ids_dfids, id_reference)
+    missing_in_df <- setdiff(normalize_id(id_reference), normalize_id(ids_dfids))
+    extra_in_df <- setdiff(normalize_id(ids_dfids), normalize_id(id_reference))
     if (length(missing_in_df) > 0 || length(extra_in_df) > 0) {
       message("[03_structure] ID mismatch diagnostic:")
       message("  IDs in reference but not df_ids: ", length(missing_in_df),
@@ -651,12 +642,12 @@ if (length(scan$files) == 0) {
     
     # build best-available site map for all reference IDs
     site_map_final <- site_map_dfids
-    missing_site_before <- sum(is.na(site_map_final[id_reference]))
+    missing_site_before <- sum(is.na(site_map_final[normalize_id(id_reference)]))
     
     if (length(ids_results$ids) > 0 && length(ids_results$pop) == length(ids_results$ids)) {
       lab_pop <- data.frame(Individual = ids_results$ids, PopIdx = ids_results$pop, stringsAsFactors = FALSE)
       known <- lab_pop %>%
-        mutate(Site = site_map_dfids[Individual]) %>%
+        mutate(Site = site_map_dfids[normalize_id(Individual)]) %>%
         filter(!is.na(Site), !is.na(PopIdx))
       
       if (nrow(known) > 0) {
@@ -670,17 +661,17 @@ if (length(scan$files) == 0) {
         
         inferred <- lab_pop %>%
           left_join(pop_to_site, by = "PopIdx")
-        inferred_map <- setNames(inferred$Site, inferred$Individual)
+        inferred_map <- setNames(inferred$Site, normalize_id(inferred$Individual))
         
-        need_fill <- id_reference[is.na(site_map_final[id_reference])]
+        need_fill <- id_reference[is.na(site_map_final[normalize_id(id_reference)])]
         if (length(need_fill) > 0) {
-          fill_vals <- inferred_map[need_fill]
-          site_map_final[need_fill] <- fill_vals
+          fill_vals <- inferred_map[normalize_id(need_fill)]
+          site_map_final[normalize_id(need_fill)] <- fill_vals
         }
       }
     }
     
-    missing_site_after <- sum(is.na(site_map_final[id_reference]))
+    missing_site_after <- sum(is.na(site_map_final[normalize_id(id_reference)]))
     recovered_site_n <- missing_site_before - missing_site_after
     if (missing_site_before > 0) {
       message("[03_structure] Site metadata recovery diagnostic:")

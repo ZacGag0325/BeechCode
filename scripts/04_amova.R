@@ -29,23 +29,13 @@ message("[04_amova] Running AMOVA on gi_mll...")
 # ------------------------------------------------------------
 # 1) Resolve and validate grouping variable (Site)
 # ------------------------------------------------------------
-resolve_col <- function(df, choices) {
-  nms <- names(df)
-  idx <- match(TRUE, tolower(nms) %in% tolower(choices), nomatch = 0)
-  if (idx == 0) return(NA_character_)
-  nms[idx]
-}
+df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[04_amova]", require = TRUE)
+id_col <- df_ids_cols$id_col
+site_col <- df_ids_cols$site_col
 
-id_col <- resolve_col(df_ids, c("ind", "individual", "sample", "sampleid", "id"))
-site_col <- resolve_col(df_ids, c("site", "population", "pop"))
-
-if (is.na(id_col) || is.na(site_col)) {
-  stop("[04_amova] df_ids must contain individual ID and Site columns.")
-}
-
-id_to_site <- setNames(as.character(df_ids[[site_col]]), as.character(df_ids[[id_col]]))
+id_to_site <- setNames(as.character(df_ids[[site_col]]), normalize_id(df_ids[[id_col]]))
 inds <- adegenet::indNames(gi_mll)
-site_from_dfids <- id_to_site[inds]
+site_from_dfids <- id_to_site[normalize_id(inds)]
 site_from_pop <- as.character(adegenet::pop(gi_mll))
 
 # Prefer mapped Site from df_ids if complete; fallback to pop(gi_mll)

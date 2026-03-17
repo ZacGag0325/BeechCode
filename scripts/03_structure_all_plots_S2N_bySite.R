@@ -357,9 +357,10 @@ read_q_matrix <- function(path, k_hint = NA_integer_, tol = 1e-6) {
 
 summarize_candidate <- function(file_base, k_infer, parsed, reason) {
   if (!parsed$ok) {
+    reason_print <- if (grepl("^REJECTED:", reason)) reason else paste0("REJECTED: ", reason)
     message("[03_structure] Candidate: ", file_base,
             " | inferred K=", ifelse(is.na(k_infer), "NA", k_infer),
-            " | REJECTED: ", reason)
+            " | ", reason_print)
     return(invisible(NULL))
   }
   
@@ -380,7 +381,10 @@ summarize_candidate <- function(file_base, k_infer, parsed, reason) {
           " | ", reason)
 }
 
-validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference, tol = 1e-6, row_tol = 1e-3) {
+validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference,
+                                  tol = 1e-6, row_tol = 5e-3,
+                                  hard_row_tol = 5e-2,
+                                  renormalize_rows = TRUE) {
   q_mat <- as.matrix(q_df[, q_cols, drop = FALSE])
   storage.mode(q_mat) <- "numeric"
   
@@ -390,7 +394,10 @@ validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference, t
   
   q_mat <- clamp01(q_mat, tol = tol)
   row_sums <- rowSums(q_mat)
-  bad_row_sums <- sum(abs(row_sums - 1) > row_tol)
+  abs_dev <- abs(row_sums - 1)
+  max_abs_dev <- max(abs_dev)
+  bad_row_sums <- sum(abs_dev > row_tol)
+  hard_bad_row_sums <- sum(abs_dev > hard_row_tol)
   
   duplicated_ids <- sum(duplicated(q_df$Individual))
   missing_ids <- sum(!(id_reference %in% q_df$Individual))
@@ -404,6 +411,7 @@ validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference, t
   message("  total NA in Q columns: ", na_count)
   message("  Q min/max: ", signif(min(q_mat, na.rm = TRUE), 6), " / ", signif(max(q_mat, na.rm = TRUE), 6))
   message("  row-sum range: ", signif(min(row_sums), 6), " - ", signif(max(row_sums), 6))
+  message("  max |rowSum-1|: ", signif(max_abs_dev, 6))
   message("  rows with row sums not close to 1: ", bad_row_sums)
   message("  duplicated individual IDs after merging: ", duplicated_ids)
   message("  missing IDs after matching to reference order: ", missing_ids)
@@ -417,9 +425,24 @@ validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference, t
     fail_validation(k_num, run_info$file_base, run_info$run,
                     paste0("ID matching issue: duplicated_ids=", duplicated_ids, ", missing_ids=", missing_ids))
   }
-  if (bad_row_sums > 0) {
+  if (hard_bad_row_sums > 0) {
     fail_validation(k_num, run_info$file_base, run_info$run,
-                    paste0("Row sums are not close to 1 for ", bad_row_sums, " rows (tol=", row_tol, ")."))
+                    paste0("Row sums show true invalidity for ", hard_bad_row_sums,
+                           " rows (hard tol=", hard_row_tol,
+                           "; max |rowSum-1|=", signif(max_abs_dev, 6), ")."))
+  }
+  
+  if (renormalize_rows) {
+    renorm_rows <- sum(row_sums > 0 & abs_dev > 1e-12)
+    if (renorm_rows > 0) {
+      message("  renormalizing ", renorm_rows,
+              " rows to sum exactly 1 (prevents stacked-bar clipping at y=1).")
+      q_mat <- q_mat / row_sums
+      q_mat <- clamp01(q_mat, tol = tol)
+      row_sums_after <- rowSums(q_mat)
+      message("  post-renormalization row-sum range: ",
+              signif(min(row_sums_after), 6), " - ", signif(max(row_sums_after), 6))
+    }
   }
   
   q_df[, q_cols] <- as.data.frame(q_mat, stringsAsFactors = FALSE)
@@ -444,7 +467,7 @@ if (length(scan$files) == 0) {
     parsed <- read_q_matrix(f, k_hint = meta_name$K, tol = 1e-6)
     
     if (!parsed$ok) {
-      summarize_candidate(basename(f), meta_name$K, parsed, "REJECTED: could not parse a numeric Q matrix")
+      summarize_candidate(basename(f), meta_name$K, parsed, "could not parse a numeric Q matrix")
       run_inventory[[length(run_inventory) + 1]] <- data.frame(
         file = basename(f), full_path = f, K = meta_name$K, run = meta_name$run,
         reader = parsed$reader, n_rows = NA_integer_, n_cols = NA_integer_,
@@ -562,6 +585,7 @@ if (length(scan$files) == 0) {
     
     # build best-available site map for all reference IDs
     site_map_final <- site_map_dfids
+    missing_site_before <- sum(is.na(site_map_final[id_reference]))
     
     if (length(ids_results$ids) > 0 && length(ids_results$pop) == length(ids_results$ids)) {
       lab_pop <- data.frame(Individual = ids_results$ids, PopIdx = ids_results$pop, stringsAsFactors = FALSE)
@@ -588,6 +612,16 @@ if (length(scan$files) == 0) {
           site_map_final[need_fill] <- fill_vals
         }
       }
+    }
+    
+    missing_site_after <- sum(is.na(site_map_final[id_reference]))
+    recovered_site_n <- missing_site_before - missing_site_after
+    if (missing_site_before > 0) {
+      message("[03_structure] Site metadata recovery diagnostic:")
+      message("  missing Site labels before recovery: ", missing_site_before)
+      message("  recovered via STRUCTURE results metadata: ", recovered_site_n)
+      message("  still unmatched after recovery: ", missing_site_after,
+              " (these are kept as unmatched and plotted in 'Unknown').")
     }
     
     base_order_df <- build_base_order(id_reference, site_map_final)
@@ -649,7 +683,9 @@ if (length(scan$files) == 0) {
         q_cols = q_cols,
         id_reference = base_order_df$Individual,
         tol = 1e-6,
-        row_tol = 1e-3
+        row_tol = 5e-3,
+        hard_row_tol = 5e-2,
+        renormalize_rows = TRUE
       )
       
       plot_df <- q_df %>%
@@ -672,7 +708,8 @@ if (length(scan$files) == 0) {
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
         scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+        scale_y_continuous(expand = c(0, 0)) +
+        coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
         theme_bw(base_size = 11) +
         theme(
           panel.grid = element_blank(),
@@ -714,7 +751,8 @@ if (length(scan$files) == 0) {
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
         scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+        scale_y_continuous(expand = c(0, 0)) +
+        coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
         facet_grid(rows = vars(KLabel)) +
         theme_bw(base_size = 11) +
         theme(

@@ -20,6 +20,14 @@ source("scripts/_load_objects.R")
 
 cat("[11_isolation_by_distance] Running Mantel test: Jost's D vs geographic distance...\n")
 
+normalize_site <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x <- gsub("\\s+", " ", x)
+  toupper(x)
+}
+
 safe_read_square_matrix <- function(path) {
   if (!file.exists(path)) {
     stop("Missing file: ", path)
@@ -117,12 +125,15 @@ safe_read_square_matrix <- function(path) {
     stop("Imported matrix row/column names could not be aligned identically: ", path)
   }
   
+  if (any(!is.finite(mat), na.rm = TRUE)) {
+    stop("Imported genetic matrix contains non-finite values.")
+  }
+  
   cat("[11_isolation_by_distance] Genetic matrix dimensions: ", nrow(mat), " x ", ncol(mat), "\n", sep = "")
-  cat("[11_isolation_by_distance] Genetic matrix sites: ", paste(rownames(mat), collapse = ", "), "\n", sep = "")
+  cat("[11_isolation_by_distance] Genetic matrix sites (first 10): ", paste(head(rownames(mat), 10), collapse = ", "), "\n", sep = "")
   
   mat
 }
-
 
 resolve_col <- function(df, candidates, regex = NULL) {
   nms <- names(df)
@@ -168,6 +179,10 @@ build_site_coordinates <- function(meta_df, fallback_path) {
     stop("Metadata must contain site/pop, latitude, and longitude columns.")
   }
   
+  cat("[11_isolation_by_distance] Detected metadata Site column: ", site_col, "\n", sep = "")
+  cat("[11_isolation_by_distance] Detected metadata Latitude column: ", lat_col, "\n", sep = "")
+  cat("[11_isolation_by_distance] Detected metadata Longitude column: ", lon_col, "\n", sep = "")
+  
   coords <- data.frame(
     Site = trimws(as.character(meta_df[[site_col]])),
     Latitude = suppressWarnings(as.numeric(meta_df[[lat_col]])),
@@ -183,12 +198,17 @@ build_site_coordinates <- function(meta_df, fallback_path) {
   }
   
   if (anyDuplicated(coords$Site)) {
-    coords <- coords %>% group_by(Site) %>% slice(1) %>% ungroup()
-    cat("[11_isolation_by_distance] Duplicate site rows found in metadata; keeping first row per site.\n")
+    coords <- coords %>%
+      mutate(Site_norm = normalize_site(Site)) %>%
+      group_by(Site_norm) %>%
+      slice(1) %>%
+      ungroup() %>%
+      select(-Site_norm)
+    cat("[11_isolation_by_distance] Duplicate site rows found in metadata; keeping first row per normalized site name.\n")
   }
   
   cat("[11_isolation_by_distance] Coordinate source: ", source_name, "\n", sep = "")
-  cat("[11_isolation_by_distance] Coordinate table sites: ", paste(coords$Site, collapse = ", "), "\n", sep = "")
+  cat("[11_isolation_by_distance] Coordinate table sites (first 10): ", paste(head(coords$Site, 10), collapse = ", "), "\n", sep = "")
   
   coords
 }
@@ -210,39 +230,62 @@ site_meta <- build_site_coordinates(
 # ----------------------------
 # 3) Align shared sites and build geographic distance matrix
 # ----------------------------
-gen_sites <- trimws(rownames(pairwise_jostD))
-rownames(pairwise_jostD) <- gen_sites
-colnames(pairwise_jostD) <- trimws(colnames(pairwise_jostD))
+gen_sites_raw <- trimws(rownames(pairwise_jostD))
+col_sites_raw <- trimws(colnames(pairwise_jostD))
 
-site_meta$Site <- trimws(site_meta$Site)
+gen_sites_norm <- normalize_site(gen_sites_raw)
+col_sites_norm <- normalize_site(col_sites_raw)
+meta_sites_norm <- normalize_site(site_meta$Site)
 
-shared_sites <- intersect(gen_sites, site_meta$Site)
-
-cat("[11_isolation_by_distance] Shared sites (genetic ∩ coordinates): ",
-    if (length(shared_sites) == 0) "<none>" else paste(shared_sites, collapse = ", "),
-    "\n", sep = "")
-
-if (length(setdiff(gen_sites, shared_sites)) > 0) {
-  cat("[11_isolation_by_distance] Dropping genetic-only sites: ",
-      paste(setdiff(gen_sites, shared_sites), collapse = ", "), "\n", sep = "")
+if (!identical(gen_sites_norm, col_sites_norm)) {
+  stop("Genetic matrix row/column order mismatch after normalization; cannot build valid distance object.")
 }
 
-if (length(setdiff(site_meta$Site, shared_sites)) > 0) {
-  cat("[11_isolation_by_distance] Dropping coordinate-only sites: ",
-      paste(setdiff(site_meta$Site, shared_sites), collapse = ", "), "\n", sep = "")
+cat("[11_isolation_by_distance] Genetic sites before matching (first 10): ", paste(head(gen_sites_raw, 10), collapse = ", "), "\n", sep = "")
+cat("[11_isolation_by_distance] Metadata sites before matching (first 10): ", paste(head(site_meta$Site, 10), collapse = ", "), "\n", sep = "")
+
+shared_norm <- intersect(gen_sites_norm, meta_sites_norm)
+cat("[11_isolation_by_distance] Shared site count after normalization: ", length(shared_norm), "\n", sep = "")
+
+if (length(setdiff(gen_sites_norm, shared_norm)) > 0) {
+  cat("[11_isolation_by_distance] Dropping genetic-only normalized sites: ",
+      paste(setdiff(gen_sites_norm, shared_norm), collapse = ", "), "\n", sep = "")
 }
 
-if (length(shared_sites) < 3) {
-  stop("Need at least 3 shared sites between pairwise_jostD.csv and metadata coordinates. Found: ", length(shared_sites))
+if (length(setdiff(meta_sites_norm, shared_norm)) > 0) {
+  cat("[11_isolation_by_distance] Dropping coordinate-only normalized sites: ",
+      paste(setdiff(meta_sites_norm, shared_norm), collapse = ", "), "\n", sep = "")
 }
 
-pairwise_jostD <- pairwise_jostD[shared_sites, shared_sites, drop = FALSE]
-site_meta <- site_meta[match(shared_sites, site_meta$Site), , drop = FALSE]
+if (length(shared_norm) < 3) {
+  stop(
+    "Need at least 3 shared sites between pairwise_jostD.csv and metadata coordinates. Found: ",
+    length(shared_norm),
+    "\nGenetic normalized sites: ", paste(gen_sites_norm, collapse = ", "),
+    "\nMetadata normalized sites: ", paste(meta_sites_norm, collapse = ", ")
+  )
+}
+
+# Keep original display names from metadata when available
+meta_key <- setNames(site_meta$Site, meta_sites_norm)
+shared_display <- unname(meta_key[shared_norm])
+shared_display[is.na(shared_display)] <- shared_norm[is.na(shared_display)]
+
+# subset and reorder genetic matrix by normalized keys
+idx_gen <- match(shared_norm, gen_sites_norm)
+pairwise_jostD <- pairwise_jostD[idx_gen, idx_gen, drop = FALSE]
+rownames(pairwise_jostD) <- shared_display
+colnames(pairwise_jostD) <- shared_display
+
+# subset and reorder site metadata by normalized keys
+idx_meta <- match(shared_norm, meta_sites_norm)
+site_meta <- site_meta[idx_meta, , drop = FALSE]
+site_meta$Site <- shared_display
 
 coords <- as.matrix(site_meta[, c("Longitude", "Latitude")])
 geographic_km <- geosphere::distm(coords, fun = geosphere::distHaversine) / 1000
-rownames(geographic_km) <- shared_sites
-colnames(geographic_km) <- shared_sites
+rownames(geographic_km) <- shared_display
+colnames(geographic_km) <- shared_display
 
 geo_file <- file.path(MATRICES_DIR, "geographic_distance_matrix.csv")
 write.csv(geographic_km, geo_file, row.names = TRUE)
@@ -251,9 +294,16 @@ cat("[11_isolation_by_distance] Saved geographic matrix: ", geo_file, "\n", sep 
 # ----------------------------
 # 4) Mantel test
 # ----------------------------
+gen_dist <- as.dist(pairwise_jostD)
+geo_dist <- as.dist(geographic_km)
+
+if (!identical(attr(gen_dist, "Labels"), attr(geo_dist, "Labels"))) {
+  stop("Mantel labels mismatch between genetic and geographic distance objects after alignment.")
+}
+
 mantel_fit <- vegan::mantel(
-  as.dist(pairwise_jostD),
-  as.dist(geographic_km),
+  gen_dist,
+  geo_dist,
   method = "pearson",
   permutations = 9999
 )
@@ -263,7 +313,7 @@ mantel_results <- data.frame(
   statistic_r = as.numeric(mantel_fit$statistic),
   p_value = as.numeric(mantel_fit$signif),
   permutations = as.integer(mantel_fit$permutations),
-  n_shared_sites = length(shared_sites),
+  n_shared_sites = length(shared_display),
   stringsAsFactors = FALSE
 )
 
@@ -292,7 +342,7 @@ ann_text <- sprintf(
   "Mantel r = %.3f\np = %.4f\nSites = %d",
   as.numeric(mantel_fit$statistic),
   as.numeric(mantel_fit$signif),
-  length(shared_sites)
+  length(shared_display)
 )
 
 ibd_plot <- ggplot(ibd_points, aes(Geographic_km, JostD)) +

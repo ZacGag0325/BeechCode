@@ -77,6 +77,17 @@ for (d in c(
 # 0) Build required objects (gi, gi_mll, df_ids, meta)
 run_script("00_master_pipeline.R")
 
+required_obj <- c("gi.rds", "gi_mll.rds", "df_ids.rds", "meta.rds")
+obj_dir <- here::here("outputs", "v1", "objects")
+missing_obj <- required_obj[!file.exists(file.path(obj_dir, required_obj))]
+if (length(missing_obj) > 0) {
+  stop(
+    "00_master_pipeline.R completed but required object files are missing in ", obj_dir,
+    "\nMissing: ", paste(missing_obj, collapse = ", ")
+  )
+}
+cat("Verified required object files in:", obj_dir, "\n")
+
 # 1) Population genetics analyses (publication workflow)
 run_script("01_clonality.R")
 run_script("07_allelic_richness.R")

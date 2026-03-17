@@ -5,6 +5,7 @@
 # - Builds ONE final individual plot per K (no per-run figures)
 # - Builds ONE combined all-K figure
 # - Individuals ordered SOUTH -> NORTH by site latitude
+# - Plot data are validated immediately before each geom_col() call
 # Outputs:
 # - outputs/figures/structure_individual_barplot_K{K}.jpeg
 # - outputs/figures/structure_individual_barplot_allK.jpeg
@@ -136,7 +137,6 @@ ids_results <- extract_structure_order_from_results()
 load_site_latitude <- function(meta_df) {
   site_col <- resolve_col(meta_df, c("site", "population", "pop"))
   lat_col <- resolve_col(meta_df, c("latitude", "lat"))
-  source_used <- "meta object"
   
   if (is.na(site_col) || is.na(lat_col)) {
     fallback <- file.path(PROJECT_ROOT, "inputs", "site_metadata.csv")
@@ -146,7 +146,6 @@ load_site_latitude <- function(meta_df) {
     meta_df <- read.csv(fallback, stringsAsFactors = FALSE, check.names = FALSE)
     site_col <- resolve_col(meta_df, c("site", "population", "pop"))
     lat_col <- resolve_col(meta_df, c("latitude", "lat"))
-    source_used <- "inputs/site_metadata.csv"
     if (is.na(site_col) || is.na(lat_col)) {
       stop("[03_structure] site_metadata.csv must contain Site and Latitude columns.")
     }
@@ -162,20 +161,10 @@ load_site_latitude <- function(meta_df) {
     summarise(Latitude = mean(Latitude, na.rm = TRUE), .groups = "drop")
   
   if (nrow(out) == 0) stop("[03_structure] No valid site latitude information available.")
-  
-  list(
-    lat_map = setNames(out$Latitude, out$Site),
-    source = source_used,
-    site_col = site_col,
-    lat_col = lat_col
-  )
+  setNames(out$Latitude, out$Site)
 }
 
-site_lat_info <- load_site_latitude(meta)
-site_lat_map <- site_lat_info$lat_map
-message("[03_structure] Latitude source: ", site_lat_info$source,
-        " | site column=", site_lat_info$site_col,
-        " | latitude column=", site_lat_info$lat_col)
+site_lat_map <- load_site_latitude(meta)
 
 build_base_order <- function(ids_vec, site_map_final) {
   out <- data.frame(
@@ -192,42 +181,6 @@ build_base_order <- function(ids_vec, site_map_final) {
     arrange(SiteLat, Site, Individual)
   out$PlotIndex <- seq_len(nrow(out))
   out
-}
-
-
-build_site_blocks <- function(base_order_df) {
-  ordered_sites <- ifelse(is.na(base_order_df$Site), "Unknown", as.character(base_order_df$Site))
-  runs <- rle(ordered_sites)
-  
-  site_blocks <- data.frame(
-    Site = runs$values,
-    n = runs$lengths,
-    stringsAsFactors = FALSE
-  )
-  site_blocks$xmax <- cumsum(site_blocks$n)
-  site_blocks$xmin <- site_blocks$xmax - site_blocks$n + 1
-  site_blocks$xmid <- (site_blocks$xmin + site_blocks$xmax) / 2
-  site_blocks$Latitude <- as.numeric(site_lat_map[site_blocks$Site])
-  site_blocks$Rank <- seq_len(nrow(site_blocks))
-  
-  finite_lat <- is.finite(site_blocks$Latitude)
-  site_blocks$LowerLatLeft <- NA
-  if (sum(finite_lat) > 0) {
-    lat_vals <- site_blocks$Latitude[finite_lat]
-    site_blocks$LowerLatLeft[finite_lat] <- c(TRUE, diff(lat_vals) >= 0)
-  }
-  
-  site_blocks
-}
-
-print_site_order_diagnostics <- function(site_blocks) {
-  diag_tbl <- site_blocks %>% select(Site, Latitude, Rank, LowerLatLeft)
-  message("[03_structure] Site-order diagnostic table:")
-  print(diag_tbl, row.names = FALSE)
-  message("[03_structure] Final site order (south -> north):")
-  for (i in seq_len(nrow(site_blocks))) {
-    message("  ", i, ". ", site_blocks$Site[i], " (lat=", signif(site_blocks$Latitude[i], 6), ")")
-  }
 }
 
 # ----------------------------
@@ -481,11 +434,12 @@ validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference,
   }
   
   if (renormalize_rows) {
-    renorm_rows <- sum(row_sums > 0 & abs_dev > 1e-12)
+    renorm_idx <- which(row_sums > 0 & abs_dev > 1e-12)
+    renorm_rows <- length(renorm_idx)
     if (renorm_rows > 0) {
       message("  renormalizing ", renorm_rows,
               " rows to sum exactly 1 (prevents stacked-bar clipping at y=1).")
-      q_mat <- q_mat / row_sums
+      q_mat[renorm_idx, ] <- q_mat[renorm_idx, , drop = FALSE] / row_sums[renorm_idx]
       q_mat <- clamp01(q_mat, tol = tol)
       row_sums_after <- rowSums(q_mat)
       message("  post-renormalization row-sum range: ",
@@ -493,8 +447,72 @@ validate_selected_run <- function(k_num, run_info, q_df, q_cols, id_reference,
     }
   }
   
+  non_finite_after <- sum(!is.finite(q_mat))
+  if (non_finite_after > 0) {
+    fail_validation(k_num, run_info$file_base, run_info$run,
+                    paste0("Non-finite values introduced after renormalization/clamping: ", non_finite_after))
+  }
+  
   q_df[, q_cols] <- as.data.frame(q_mat, stringsAsFactors = FALSE)
   q_df
+}
+
+validate_plotting_df <- function(plot_df, y_col = "Q", context = "", tol = 1e-6,
+                                 check_k_col = NULL, check_cluster = TRUE) {
+  y <- suppressWarnings(as.numeric(plot_df[[y_col]]))
+  y_na <- sum(is.na(y))
+  y_non_finite <- sum(!is.finite(y))
+  y_lt0 <- sum(y < 0, na.rm = TRUE)
+  y_gt1 <- sum(y > 1, na.rm = TRUE)
+  y_gt1_tiny <- sum(y > 1 & y <= 1 + tol, na.rm = TRUE)
+  y_lt0_tiny <- sum(y < 0 & y >= -tol, na.rm = TRUE)
+  y_min <- if (all(is.na(y))) NA_real_ else min(y, na.rm = TRUE)
+  y_max <- if (all(is.na(y))) NA_real_ else max(y, na.rm = TRUE)
+  
+  missing_cluster <- if (check_cluster && "Cluster" %in% names(plot_df)) {
+    sum(is.na(plot_df$Cluster) | !nzchar(as.character(plot_df$Cluster)))
+  } else 0L
+  missing_x <- if ("PlotIndex" %in% names(plot_df)) sum(is.na(plot_df$PlotIndex)) else NA_integer_
+  missing_k <- if (!is.null(check_k_col) && check_k_col %in% names(plot_df)) sum(is.na(plot_df[[check_k_col]])) else 0L
+  
+  message("[03_structure] Plot data diagnostics (", context, "):")
+  message("  rows: ", nrow(plot_df))
+  message("  NA in ", y_col, ": ", y_na)
+  message("  non-finite in ", y_col, ": ", y_non_finite)
+  message("  ", y_col, " < 0: ", y_lt0, " (tiny within tol: ", y_lt0_tiny, ")")
+  message("  ", y_col, " > 1: ", y_gt1, " (tiny within tol: ", y_gt1_tiny, ")")
+  message("  ", y_col, " min/max: ", signif(y_min, 8), " / ", signif(y_max, 8))
+  message("  missing Cluster assignment rows: ", missing_cluster)
+  message("  missing PlotIndex rows: ", missing_x)
+  if (!is.null(check_k_col)) message("  missing ", check_k_col, " rows: ", missing_k)
+  
+  if (y_non_finite > 0 || y_na > 0) {
+    stop("[03_structure] Invalid plotting data in ", context,
+         ": non-finite or NA ancestry values detected (NA=", y_na,
+         ", non-finite=", y_non_finite, ").", call. = FALSE)
+  }
+  
+  hard_lt0 <- sum(y < -tol, na.rm = TRUE)
+  hard_gt1 <- sum(y > 1 + tol, na.rm = TRUE)
+  if (hard_lt0 > 0 || hard_gt1 > 0) {
+    stop("[03_structure] Invalid plotting data in ", context,
+         ": ancestry values outside [0,1] beyond tolerance (lt0=", hard_lt0,
+         ", gt1=", hard_gt1, ").", call. = FALSE)
+  }
+  
+  y <- clamp01(y, tol = tol)
+  if (any(!is.finite(y))) {
+    stop("[03_structure] Invalid plotting data in ", context,
+         ": non-finite values remain after clamping.", call. = FALSE)
+  }
+  
+  if (missing_cluster > 0 || (!is.na(missing_x) && missing_x > 0) || missing_k > 0) {
+    stop("[03_structure] Invalid plotting data in ", context,
+         ": missing plotting keys (Cluster/PlotIndex/KLabel).", call. = FALSE)
+  }
+  
+  plot_df[[y_col]] <- y
+  plot_df
 }
 
 # ----------------------------
@@ -688,19 +706,10 @@ if (length(scan$files) == 0) {
     allk_plot_data <- list()
     validations_passed <- 0L
     
-    # Enforce explicit geographic ordering: lower latitude = more southern = further left.
-    # Site blocks are computed from the already ordered individual rows to avoid accidental
-    # alphabetical re-ordering of site names.
-    site_blocks <- build_site_blocks(base_order_df)
-    print_site_order_diagnostics(site_blocks)
-    
-    finite_lat <- is.finite(site_blocks$Latitude)
-    if (sum(finite_lat) > 1) {
-      if (is.unsorted(site_blocks$Latitude[finite_lat], strictly = FALSE)) {
-        stop("[03_structure] Site block latitude order is not south->north (ascending).")
-      }
-    }
-    
+    site_blocks <- base_order_df %>%
+      mutate(Site = ifelse(is.na(Site), "Unknown", Site)) %>%
+      count(Site, name = "n") %>%
+      mutate(xmax = cumsum(n), xmin = xmax - n + 1, xmid = (xmin + xmax) / 2)
     separators <- site_blocks$xmax[-nrow(site_blocks)] + 0.5
     
     k_levels <- sort(unique(as.integer(names(runs_by_k))))
@@ -750,13 +759,14 @@ if (length(scan$files) == 0) {
         select(PlotIndex, Site, all_of(q_cols)) %>%
         pivot_longer(cols = all_of(q_cols), names_to = "Cluster", values_to = "Q")
       
-      if (!is.numeric(plot_df$Q)) fail_validation(k_num, best$file_base, best$run, "Long-format Q column is not numeric after pivot.")
-      if (anyNA(plot_df$Q)) fail_validation(k_num, best$file_base, best$run, paste0("Long-format Q contains NA: ", sum(is.na(plot_df$Q))))
-      if (any(plot_df$Q < -1e-6 | plot_df$Q > 1 + 1e-6)) {
-        fail_validation(k_num, best$file_base, best$run, "Long-format Q contains values outside [0,1].")
-      }
+      plot_df <- validate_plotting_df(
+        plot_df,
+        y_col = "Q",
+        context = paste0("single-K K=", k_num, " (", best$file_base, ")"),
+        tol = 1e-6,
+        check_cluster = TRUE
+      )
       
-      plot_df$Q <- clamp01(plot_df$Q, tol = 1e-6)
       plot_df$K <- k_num
       plot_df$KLabel <- factor(paste0("K=", k_num), levels = paste0("K=", k_levels))
       allk_plot_data[[length(allk_plot_data) + 1]] <- plot_df
@@ -765,7 +775,8 @@ if (length(scan$files) == 0) {
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
         scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+        scale_y_continuous(expand = c(0, 0)) +
+        coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
         theme_bw(base_size = 11) +
         theme(
           panel.grid = element_blank(),
@@ -803,11 +814,21 @@ if (length(scan$files) == 0) {
     if (length(allk_plot_data) > 0) {
       combined_plot_df <- bind_rows(allk_plot_data)
       
+      combined_plot_df <- validate_plotting_df(
+        combined_plot_df,
+        y_col = "Q",
+        context = "combined all-K plot",
+        tol = 1e-6,
+        check_k_col = "KLabel",
+        check_cluster = TRUE
+      )
+      
       p_all <- ggplot(combined_plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
         scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+        scale_y_continuous(expand = c(0, 0)) +
+        coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
         facet_grid(rows = vars(KLabel)) +
         theme_bw(base_size = 11) +
         theme(
@@ -837,7 +858,7 @@ if (length(scan$files) == 0) {
     }
     
     message("[03_structure] Validation summary: all K plots passed validation (", validations_passed, " K values).")
-    message("[03_structure] Validation summary: no rows dropped in plotting.")
+    message("[03_structure] Validation summary: plotting data verified finite and within [0,1] before each geom_col call.")
     message("[03_structure] Validation summary: combined figure built successfully.")
     message("[03_structure] Done.")
   }

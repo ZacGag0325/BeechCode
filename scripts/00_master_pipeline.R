@@ -48,6 +48,10 @@ resolve_col <- function(df, choices) {
   nms[idx]
 }
 
+
+DF_IDS_ID_CHOICES <- c("ind", "individual", "sample", "sampleid", "id", "ind_id")
+DF_IDS_SITE_CHOICES <- c("Site", "site", "pop", "population")
+
 normalize_id <- function(x) {
   x <- trimws(as.character(x))
   x <- gsub("\uFEFF", "", x, fixed = TRUE)
@@ -119,11 +123,12 @@ get_sheets <- function(path) {
 
 summarize_table <- function(df) {
   id_col <- resolve_col(df, c(
-    "ind", "individual", "sample", "sampleid", "id", "ind_id",
+    DF_IDS_ID_CHOICES,
     "Nom_Labo_Échantillons", "Nom_Labo_Echantillons", "Nom_Labo_Echantillon"
   ))
   site_col <- resolve_col(df, c(
-    "Site", "site", "pop", "population", "Numéro_Population", "Numero_Population"
+    DF_IDS_SITE_CHOICES,
+    "Numéro_Population", "Numero_Population"
   ))
   lat_col <- resolve_col(df, c("latitude", "lat"))
   lon_col <- resolve_col(df, c("longitude", "lon", "long"))
@@ -172,7 +177,6 @@ scan_sources <- function() {
   }
   out
 }
-
 select_meta_ind <- function(scanned) {
   cands <- Filter(function(x) {
     !is.na(x$summary$id_col) && !is.na(x$summary$site_col) && x$summary$n_paired_loci < 3

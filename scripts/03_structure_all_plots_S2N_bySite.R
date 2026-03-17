@@ -136,6 +136,7 @@ ids_results <- extract_structure_order_from_results()
 load_site_latitude <- function(meta_df) {
   site_col <- resolve_col(meta_df, c("site", "population", "pop"))
   lat_col <- resolve_col(meta_df, c("latitude", "lat"))
+  source_used <- "meta object"
   
   if (is.na(site_col) || is.na(lat_col)) {
     fallback <- file.path(PROJECT_ROOT, "inputs", "site_metadata.csv")
@@ -145,6 +146,7 @@ load_site_latitude <- function(meta_df) {
     meta_df <- read.csv(fallback, stringsAsFactors = FALSE, check.names = FALSE)
     site_col <- resolve_col(meta_df, c("site", "population", "pop"))
     lat_col <- resolve_col(meta_df, c("latitude", "lat"))
+    source_used <- "inputs/site_metadata.csv"
     if (is.na(site_col) || is.na(lat_col)) {
       stop("[03_structure] site_metadata.csv must contain Site and Latitude columns.")
     }
@@ -160,10 +162,20 @@ load_site_latitude <- function(meta_df) {
     summarise(Latitude = mean(Latitude, na.rm = TRUE), .groups = "drop")
   
   if (nrow(out) == 0) stop("[03_structure] No valid site latitude information available.")
-  setNames(out$Latitude, out$Site)
+  
+  list(
+    lat_map = setNames(out$Latitude, out$Site),
+    source = source_used,
+    site_col = site_col,
+    lat_col = lat_col
+  )
 }
 
-site_lat_map <- load_site_latitude(meta)
+site_lat_info <- load_site_latitude(meta)
+site_lat_map <- site_lat_info$lat_map
+message("[03_structure] Latitude source: ", site_lat_info$source,
+        " | site column=", site_lat_info$site_col,
+        " | latitude column=", site_lat_info$lat_col)
 
 build_base_order <- function(ids_vec, site_map_final) {
   out <- data.frame(
@@ -180,6 +192,42 @@ build_base_order <- function(ids_vec, site_map_final) {
     arrange(SiteLat, Site, Individual)
   out$PlotIndex <- seq_len(nrow(out))
   out
+}
+
+
+build_site_blocks <- function(base_order_df) {
+  ordered_sites <- ifelse(is.na(base_order_df$Site), "Unknown", as.character(base_order_df$Site))
+  runs <- rle(ordered_sites)
+  
+  site_blocks <- data.frame(
+    Site = runs$values,
+    n = runs$lengths,
+    stringsAsFactors = FALSE
+  )
+  site_blocks$xmax <- cumsum(site_blocks$n)
+  site_blocks$xmin <- site_blocks$xmax - site_blocks$n + 1
+  site_blocks$xmid <- (site_blocks$xmin + site_blocks$xmax) / 2
+  site_blocks$Latitude <- as.numeric(site_lat_map[site_blocks$Site])
+  site_blocks$Rank <- seq_len(nrow(site_blocks))
+  
+  finite_lat <- is.finite(site_blocks$Latitude)
+  site_blocks$LowerLatLeft <- NA
+  if (sum(finite_lat) > 0) {
+    lat_vals <- site_blocks$Latitude[finite_lat]
+    site_blocks$LowerLatLeft[finite_lat] <- c(TRUE, diff(lat_vals) >= 0)
+  }
+  
+  site_blocks
+}
+
+print_site_order_diagnostics <- function(site_blocks) {
+  diag_tbl <- site_blocks %>% select(Site, Latitude, Rank, LowerLatLeft)
+  message("[03_structure] Site-order diagnostic table:")
+  print(diag_tbl, row.names = FALSE)
+  message("[03_structure] Final site order (south -> north):")
+  for (i in seq_len(nrow(site_blocks))) {
+    message("  ", i, ". ", site_blocks$Site[i], " (lat=", signif(site_blocks$Latitude[i], 6), ")")
+  }
 }
 
 # ----------------------------
@@ -640,10 +688,19 @@ if (length(scan$files) == 0) {
     allk_plot_data <- list()
     validations_passed <- 0L
     
-    site_blocks <- base_order_df %>%
-      mutate(Site = ifelse(is.na(Site), "Unknown", Site)) %>%
-      count(Site, name = "n") %>%
-      mutate(xmax = cumsum(n), xmin = xmax - n + 1, xmid = (xmin + xmax) / 2)
+    # Enforce explicit geographic ordering: lower latitude = more southern = further left.
+    # Site blocks are computed from the already ordered individual rows to avoid accidental
+    # alphabetical re-ordering of site names.
+    site_blocks <- build_site_blocks(base_order_df)
+    print_site_order_diagnostics(site_blocks)
+    
+    finite_lat <- is.finite(site_blocks$Latitude)
+    if (sum(finite_lat) > 1) {
+      if (is.unsorted(site_blocks$Latitude[finite_lat], strictly = FALSE)) {
+        stop("[03_structure] Site block latitude order is not south->north (ascending).")
+      }
+    }
+    
     separators <- site_blocks$xmax[-nrow(site_blocks)] + 0.5
     
     k_levels <- sort(unique(as.integer(names(runs_by_k))))
@@ -708,8 +765,7 @@ if (length(scan$files) == 0) {
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
         scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-        scale_y_continuous(expand = c(0, 0)) +
-        coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
+        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
         theme_bw(base_size = 11) +
         theme(
           panel.grid = element_blank(),
@@ -751,8 +807,7 @@ if (length(scan$files) == 0) {
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
         scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
-        scale_y_continuous(expand = c(0, 0)) +
-        coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
+        scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
         facet_grid(rows = vars(KLabel)) +
         theme_bw(base_size = 11) +
         theme(

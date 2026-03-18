@@ -4,6 +4,7 @@
 # - Executes scripts in fixed order
 # - Stops on first error
 # - Anchors paths at project root
+# - Runs each script in a clean R session (--vanilla)
 ############################################################
 
 find_project_root <- function() {
@@ -32,8 +33,17 @@ cat("[00_run_all] Project root:", PROJECT_ROOT, "\n")
 run_script <- function(script_name) {
   path <- file.path(PROJECT_ROOT, "scripts", script_name)
   if (!file.exists(path)) stop("[00_run_all] Missing script: ", path)
-  cat("\n--- Running:", script_name, "\n")
-  source(path, local = FALSE, encoding = "UTF-8")
+  
+  cat("\n--- Running in clean session:", script_name, "\n")
+  res <- system2(
+    command = "Rscript",
+    args = c("--vanilla", path),
+    stdout = "",
+    stderr = ""
+  )
+  if (!identical(res, 0L)) {
+    stop("[00_run_all] Script failed: ", script_name, " (exit code ", res, ")")
+  }
   cat("--- Completed:", script_name, "\n")
 }
 
@@ -64,6 +74,7 @@ run_script("02_hwe.R")
 run_script("05_pca_dapc.R")
 run_script("04_amova.R")
 run_script("06_distance_matrices.R")
+run_script("06a_bruvo_distance.R")
 run_script("11_isolation_by_distance.R")
 run_script("03_structure_all_plots_S2N_bySite.R")
 

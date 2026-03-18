@@ -79,6 +79,25 @@ ensure_square_named <- function(m, fallback_names, name = "matrix") {
   m
 }
 
+assert_symmetric <- function(m, name = "matrix", tol = 1e-10) {
+  if (!isTRUE(all.equal(m, t(m), tolerance = tol, check.attributes = FALSE))) {
+    stop("[06_distance_matrices] ", name, " is not symmetric within tolerance ", tol)
+  }
+}
+
+validate_population_alignment <- function(gobj, df_ids_tbl) {
+  cols <- resolve_df_ids_columns(df_ids_tbl, context = "[06_distance_matrices]", require = TRUE)
+  id_map <- setNames(as.character(df_ids_tbl[[cols$site_col]]), normalize_id(df_ids_tbl[[cols$id_col]]))
+  mapped <- id_map[normalize_id(adegenet::indNames(gobj))]
+  if (any(is.na(mapped))) {
+    stop("[06_distance_matrices] Could not map Site labels for all gi_mll individuals.")
+  }
+  pop_chr <- as.character(adegenet::pop(gobj))
+  if (!identical(mapped, pop_chr)) {
+    stop("[06_distance_matrices] pop(gi_mll) is not aligned with df_ids Site metadata.")
+  }
+}
+
 make_long_pairwise <- function(m, value_name) {
   long_all <- as.data.frame(as.table(m), stringsAsFactors = FALSE)
   names(long_all) <- c("Site1", "Site2", value_name)
@@ -99,6 +118,11 @@ make_long_pairwise <- function(m, value_name) {
 }
 
 # ------------------------------------------------------------
+# 0) Population alignment checks
+# ------------------------------------------------------------
+validate_population_alignment(gi_mll, df_ids)
+
+# ------------------------------------------------------------
 # 1) Pairwise Jost's D (primary)
 # ------------------------------------------------------------
 jost_raw <- mmod::pairwise_D(gi_mll, linearized = FALSE)
@@ -107,6 +131,7 @@ pairwise_jostD <- to_numeric_matrix(jost_raw, name = "Jost's D")
 site_levels <- sort(unique(as.character(adegenet::pop(gi_mll))))
 pairwise_jostD <- ensure_square_named(pairwise_jostD, fallback_names = site_levels, name = "Jost's D")
 diag(pairwise_jostD) <- 0
+assert_symmetric(pairwise_jostD, "Jost's D")
 message("[06_distance_matrices] Set Jost's D diagonal to 0 for downstream distance compatibility.")
 
 message("[06_distance_matrices] Jost's D matrix dimensions: ", nrow(pairwise_jostD), " x ", ncol(pairwise_jostD))
@@ -158,6 +183,7 @@ if (length(site_lookup) == nrow(pairwise_fst)) {
 
 pairwise_fst <- ensure_square_named(pairwise_fst, fallback_names = sort(unique(as.character(adegenet::pop(gi_mll)))), name = "pairwise FST")
 diag(pairwise_fst) <- 0
+assert_symmetric(pairwise_fst, "pairwise FST")
 message("[06_distance_matrices] Set FST diagonal to 0 for downstream distance compatibility.")
 
 message("[06_distance_matrices] FST matrix dimensions: ", nrow(pairwise_fst), " x ", ncol(pairwise_fst))

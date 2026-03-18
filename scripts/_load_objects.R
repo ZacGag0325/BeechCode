@@ -8,7 +8,13 @@
 ############################################################
 
 suppressPackageStartupMessages({
+  library(poppr)
   library(adegenet)
+  library(vegan)
+  library(hierfstat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
 })
 
 # ----------------------------

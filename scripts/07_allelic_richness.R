@@ -8,7 +8,7 @@
 # Metrics:
 # - Ho, He, FIS
 # - Allelic richness (+ SE)
-# - merged with clonality summary (N, MLG, MLL, R)
+# - merged with clonality summary (N, N_MLG, R)
 ############################################################
 
 suppressPackageStartupMessages({
@@ -76,8 +76,7 @@ clonality_by_site <- read.csv(clonality_file, stringsAsFactors = FALSE) %>%
   transmute(
     Site = as.character(Site),
     N_individuals = as.numeric(N_individuals),
-    MLG = as.numeric(MLG),
-    MLL = as.numeric(MLL),
+    N_MLG = as.numeric(N_MLG),
     Clonal_Richness_R = as.numeric(Clonal_Richness_R)
   )
 
@@ -88,8 +87,7 @@ site_genetic_summary <- clonality_by_site %>%
   select(
     Site,
     N_individuals,
-    MLG,
-    MLL,
+    N_MLG,
     Clonal_Richness_R,
     Ho,
     He,

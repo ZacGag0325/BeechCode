@@ -408,11 +408,12 @@ build_objects <- function() {
   )
   gi <- built$gi
   
+  # Clone-correction must be biologically meaningful (exact MLG identity).
+  # We intentionally avoid constructing a "fake" MLL label from MLG IDs.
+  # gi_mll is produced by keeping one representative per exact multilocus genotype.
   mlg_raw <- tryCatch(poppr::mlg.vector(gi), error = function(e) as.integer(factor(poppr::mlg(gi))))
-  mll_id <- as.integer(factor(mlg_raw))
-  mll_label <- paste0("MLL", mll_id)
-  keep_mll <- !duplicated(mll_label)
-  gi_mll <- gi[keep_mll, ]
+  keep_mlg <- !duplicated(mlg_raw)
+  gi_mll <- gi[keep_mlg, ]
   
   gi_ids <- adegenet::indNames(gi)
   gi_ids_norm <- normalize_id(gi_ids)
@@ -421,7 +422,6 @@ build_objects <- function() {
   df_ids <- data.frame(
     ind_id = gi_ids,
     Site = as.character(adegenet::pop(gi)),
-    mll = mll_label,
     stringsAsFactors = FALSE
   )
   

@@ -95,6 +95,43 @@ resolve_df_ids_columns <- function(df_ids_tbl, context = "[df_ids]", require = T
   list(id_col = id_col, site_col = site_col)
 }
 
+validate_columns <- function(df, required_cols, df_name = "data.frame") {
+  missing_cols <- setdiff(required_cols, names(df))
+  if (length(missing_cols) > 0) {
+    stop(df_name, " is missing required columns: ", paste(missing_cols, collapse = ", "))
+  }
+  invisible(TRUE)
+}
+
+align_df_ids_to_genind <- function(gobj, df_ids_tbl, context = "[_load_objects]") {
+  cols <- resolve_df_ids_columns(df_ids_tbl, context = context, require = TRUE)
+  validate_columns(df_ids_tbl, c(cols$id_col, cols$site_col), df_name = paste0(context, " df_ids"))
+  
+  id_norm <- normalize_id(df_ids_tbl[[cols$id_col]])
+  if (anyDuplicated(id_norm)) {
+    dup_ids <- unique(as.character(df_ids_tbl[[cols$id_col]])[duplicated(id_norm)])
+    stop(context, " df_ids contains duplicated individual IDs. Examples: ", paste(head(dup_ids, 10), collapse = ", "))
+  }
+  
+  idx <- match(normalize_id(adegenet::indNames(gobj)), id_norm)
+  if (any(is.na(idx))) {
+    missing_ids <- adegenet::indNames(gobj)[is.na(idx)]
+    stop(context, " could not align metadata to genind object. Missing IDs: ", paste(head(missing_ids, 10), collapse = ", "))
+  }
+  
+  out <- df_ids_tbl[idx, , drop = FALSE]
+  names(out)[names(out) == cols$id_col] <- "ind_id"
+  names(out)[names(out) == cols$site_col] <- "Site"
+  out$ind_id <- as.character(out$ind_id)
+  out$Site <- as.character(out$Site)
+  
+  if (!all(adegenet::indNames(gobj) == out$ind_id)) {
+    stop(context, " gi object and aligned metadata are not in identical individual order.")
+  }
+  
+  out
+}
+
 # ----------------------------
 # 4) Load canonical objects
 # ----------------------------
@@ -116,6 +153,10 @@ df_ids <- readRDS(file.path(OBJ_DIR, "df_ids.rds"))
 meta   <- readRDS(file.path(OBJ_DIR, "meta.rds"))
 
 df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[_load_objects]", require = TRUE)
+validate_columns(df_ids, c(df_ids_cols$id_col, df_ids_cols$site_col), df_name = "[_load_objects] df_ids")
+if (anyDuplicated(normalize_id(df_ids[[df_ids_cols$id_col]]))) {
+  stop("[_load_objects] df_ids contains duplicated individual IDs.")
+}
 
 # ----------------------------
 # 5) Site resolver and pop assignment
@@ -150,7 +191,21 @@ resolve_site_for_genind <- function(gobj, df_ids_tbl, cols = NULL) {
 }
 
 adegenet::pop(gi) <- resolve_site_for_genind(gi, df_ids, cols = df_ids_cols)
-adegenet::pop(gi_mll) <- resolve_site_for_genind(gi_mll, df_ids, cols = df_ids_cols)
+df_ids_mll <- align_df_ids_to_genind(gi_mll, df_ids, context = "[_load_objects gi_mll]")
+adegenet::pop(gi_mll) <- as.factor(df_ids_mll$Site)
+
+if (adegenet::nInd(gi_mll) != nrow(df_ids_mll)) {
+  stop("[_load_objects] nInd(gi_mll) does not match nrow(df_ids_mll).")
+}
+if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) {
+  stop("[_load_objects] gi_mll and df_ids_mll are not perfectly aligned.")
+}
+if ("MLL" %in% names(df_ids)) {
+  n_unique_mll <- length(unique(as.character(df_ids$MLL)))
+  if (adegenet::nInd(gi_mll) != n_unique_mll) {
+    stop("[_load_objects] nInd(gi_mll) does not equal the number of unique MLLs in df_ids.")
+  }
+}
 
 # ----------------------------
 # 6) Console summary
@@ -158,6 +213,7 @@ adegenet::pop(gi_mll) <- resolve_site_for_genind(gi_mll, df_ids, cols = df_ids_c
 message("[_load_objects] Loaded objects from: ", OBJ_DIR)
 message("[_load_objects] nInd(gi) = ", adegenet::nInd(gi), ", nLoc(gi) = ", adegenet::nLoc(gi))
 message("[_load_objects] nInd(gi_mll) = ", adegenet::nInd(gi_mll), ", nLoc(gi_mll) = ", adegenet::nLoc(gi_mll))
+message("[_load_objects] nrow(df_ids_mll) = ", nrow(df_ids_mll))
 message("[_load_objects] Detected df_ids ID column: ", df_ids_cols$id_col)
 message("[_load_objects] Detected df_ids Site column: ", df_ids_cols$site_col)
 message("[_load_objects] Output directories ready:")

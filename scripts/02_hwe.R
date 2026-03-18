@@ -27,6 +27,8 @@ suppressPackageStartupMessages({
 source("scripts/_load_objects.R")
 
 message("[02_hwe] Running HWE tests on gi_mll (clone-corrected)...")
+validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "02_hwe df_ids_mll")
+if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) stop("[02_hwe] gi_mll and df_ids_mll are not aligned.")
 
 # ------------------------------------------------------------
 # Helper: robust allele-pair parsing

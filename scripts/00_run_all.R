@@ -30,6 +30,10 @@ setwd(PROJECT_ROOT)
 
 cat("[00_run_all] Project root:", PROJECT_ROOT, "\n")
 
+validate_file_exists <- function(path, context) {
+  if (!file.exists(path)) stop("[00_run_all] Missing expected file after ", context, ": ", path)
+}
+
 run_script <- function(script_name) {
   path <- file.path(PROJECT_ROOT, "scripts", script_name)
   if (!file.exists(path)) stop("[00_run_all] Missing script: ", path)
@@ -67,8 +71,10 @@ if (length(missing_obj) > 0) {
   stop("[00_run_all] Object build incomplete. Missing: ", paste(missing_obj, collapse = ", "))
 }
 cat("[00_run_all] Verified canonical objects in", obj_dir, "\n")
+validate_file_exists(file.path(obj_dir, "df_ids.rds"), "00_master_pipeline.R")
 
 run_script("01_clonality.R")
+validate_file_exists(file.path(PROJECT_ROOT, "outputs", "tables", "clonality_summary.csv"), "01_clonality.R")
 run_script("07_allelic_richness.R")
 run_script("02_hwe.R")
 run_script("05_pca_dapc.R")

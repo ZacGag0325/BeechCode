@@ -79,6 +79,7 @@ ensure_square_named <- function(m, fallback_names, name = "matrix") {
   m
 }
 
+
 assert_symmetric <- function(m, name = "matrix", tol = 1e-10) {
   if (!isTRUE(all.equal(m, t(m), tolerance = tol, check.attributes = FALSE))) {
     stop("[06_distance_matrices] ", name, " is not symmetric within tolerance ", tol)
@@ -86,18 +87,15 @@ assert_symmetric <- function(m, name = "matrix", tol = 1e-10) {
 }
 
 validate_population_alignment <- function(gobj, df_ids_tbl) {
-  cols <- resolve_df_ids_columns(df_ids_tbl, context = "[06_distance_matrices]", require = TRUE)
-  id_map <- setNames(as.character(df_ids_tbl[[cols$site_col]]), normalize_id(df_ids_tbl[[cols$id_col]]))
-  mapped <- id_map[normalize_id(adegenet::indNames(gobj))]
-  if (any(is.na(mapped))) {
-    stop("[06_distance_matrices] Could not map Site labels for all gi_mll individuals.")
+  validate_columns(df_ids_tbl, c("ind_id", "Site"), df_name = "[06_distance_matrices] df_ids_mll")
+  if (!all(adegenet::indNames(gobj) == df_ids_tbl$ind_id)) {
+    stop("[06_distance_matrices] gi_mll and df_ids_mll are not perfectly aligned.")
   }
   pop_chr <- as.character(adegenet::pop(gobj))
-  if (!identical(mapped, pop_chr)) {
-    stop("[06_distance_matrices] pop(gi_mll) is not aligned with df_ids Site metadata.")
+  if (!identical(as.character(df_ids_tbl$Site), pop_chr)) {
+    stop("[06_distance_matrices] pop(gi_mll) is not aligned with df_ids_mll$Site.")
   }
 }
-
 make_long_pairwise <- function(m, value_name) {
   long_all <- as.data.frame(as.table(m), stringsAsFactors = FALSE)
   names(long_all) <- c("Site1", "Site2", value_name)
@@ -120,7 +118,7 @@ make_long_pairwise <- function(m, value_name) {
 # ------------------------------------------------------------
 # 0) Population alignment checks
 # ------------------------------------------------------------
-validate_population_alignment(gi_mll, df_ids)
+validate_population_alignment(gi_mll, df_ids_mll)
 
 # ------------------------------------------------------------
 # 1) Pairwise Jost's D (primary)

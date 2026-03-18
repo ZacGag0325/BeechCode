@@ -24,6 +24,8 @@ suppressPackageStartupMessages({
 source("scripts/_load_objects.R")
 
 message("[05_pca_dapc] Running PCA and DAPC on gi_mll...")
+validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "05_pca_dapc df_ids_mll")
+if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) stop("[05_pca_dapc] gi_mll and df_ids_mll are not aligned.")
 
 # ------------------------------------------------------------
 # 1) PCA

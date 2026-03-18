@@ -183,7 +183,12 @@ by_site <- clonality_df %>%
   mutate(Level = "site") %>%
   select(Level, Site, everything())
 
-clonality_summary <- bind_rows(overall, by_site)
+clonality_summary <- bind_rows(overall, by_site) %>%
+  mutate(
+    N = N_individuals,
+    G = N_MLL,
+    Clonal_Richness_R = Clonal_Richness_MLL
+  )
 
 if (length(bruvo_threshold) > 0) {
   clonality_summary$Bruvo_MLL_threshold <- bruvo_threshold[1]

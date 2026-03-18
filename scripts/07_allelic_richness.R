@@ -20,6 +20,8 @@ suppressPackageStartupMessages({
 source("scripts/_load_objects.R")
 
 message("[07_allelic_richness] Calculating heterozygosity/FIS and allelic richness...")
+validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "07_allelic_richness df_ids_mll")
+if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) stop("[07_allelic_richness] gi_mll and df_ids_mll are not aligned.")
 
 hf <- hierfstat::genind2hierfstat(gi_mll)
 bs <- hierfstat::basic.stats(hf)
@@ -71,15 +73,31 @@ if (!file.exists(clonality_file)) {
   stop("Missing clonality_summary.csv. Run scripts/01_clonality.R first.")
 }
 
-clonality_by_site <- read.csv(clonality_file, stringsAsFactors = FALSE) %>%
+clonality_raw <- read.csv(clonality_file, stringsAsFactors = FALSE)
+validate_columns(clonality_raw, c("Level", "Site"), df_name = "clonality_summary.csv")
+
+if (!"N" %in% names(clonality_raw) && "N_individuals" %in% names(clonality_raw)) {
+  clonality_raw$N <- as.numeric(clonality_raw$N_individuals)
+}
+if (!"G" %in% names(clonality_raw) && "N_MLL" %in% names(clonality_raw)) {
+  clonality_raw$G <- as.numeric(clonality_raw$N_MLL)
+}
+if (!"Clonal_Richness_R" %in% names(clonality_raw) && all(c("N", "G") %in% names(clonality_raw))) {
+  clonality_raw$Clonal_Richness_R <- ifelse(clonality_raw$N > 1, (clonality_raw$G - 1) / (clonality_raw$N - 1), NA_real_)
+}
+validate_columns(clonality_raw, c("N", "G", "Clonal_Richness_R"), df_name = "clonality_summary.csv")
+
+clonality_by_site <- clonality_raw %>%
   filter(Level == "site") %>%
   transmute(
     Site = as.character(Site),
-    N_individuals = as.numeric(N_individuals),
-    N_MLG = as.numeric(N_MLG),
-    N_MLL = as.numeric(N_MLL),
-    Clonal_Richness_MLG = as.numeric(Clonal_Richness_MLG),
-    Clonal_Richness_MLL = as.numeric(Clonal_Richness_MLL)
+    N = as.numeric(N),
+    G = as.numeric(G),
+    Clonal_Richness_R = as.numeric(Clonal_Richness_R),
+    N_MLG = if ("N_MLG" %in% names(clonality_raw)) as.numeric(N_MLG) else NA_real_,
+    N_MLL = if ("N_MLL" %in% names(clonality_raw)) as.numeric(N_MLL) else as.numeric(G),
+    Clonal_Richness_MLG = if ("Clonal_Richness_MLG" %in% names(clonality_raw)) as.numeric(Clonal_Richness_MLG) else NA_real_,
+    Clonal_Richness_MLL = if ("Clonal_Richness_MLL" %in% names(clonality_raw)) as.numeric(Clonal_Richness_MLL) else as.numeric(Clonal_Richness_R)
   )
 
 site_genetic_summary <- clonality_by_site %>%
@@ -88,7 +106,9 @@ site_genetic_summary <- clonality_by_site %>%
   arrange(Site) %>%
   select(
     Site,
-    N_individuals,
+    N,
+    G,
+    Clonal_Richness_R,
     N_MLG,
     N_MLL,
     Clonal_Richness_MLG,

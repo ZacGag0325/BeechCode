@@ -110,13 +110,13 @@ run_amova_model <- function(gi_use, strata_df, model_formula, model_label, group
 # ------------------------------------------------------------
 # 1) Resolve and validate grouping variables
 # ------------------------------------------------------------
-df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[04_amova]", require = TRUE)
-id_col <- df_ids_cols$id_col
-site_col <- df_ids_cols$site_col
-region_col <- resolve_region_col(df_ids)
+validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[04_amova] df_ids_mll")
+id_col <- "ind_id"
+site_col <- "Site"
+region_col <- resolve_region_col(df_ids_mll)
 
-id_to_site <- setNames(as.character(df_ids[[site_col]]), normalize_id(df_ids[[id_col]]))
-id_to_region <- if (!is.na(region_col)) setNames(as.character(df_ids[[region_col]]), normalize_id(df_ids[[id_col]])) else NULL
+id_to_site <- setNames(as.character(df_ids_mll[[site_col]]), normalize_id(df_ids_mll[[id_col]]))
+id_to_region <- if (!is.na(region_col)) setNames(as.character(df_ids_mll[[region_col]]), normalize_id(df_ids_mll[[id_col]])) else NULL
 
 inds <- adegenet::indNames(gi_mll)
 site_from_dfids <- id_to_site[normalize_id(inds)]

@@ -74,7 +74,6 @@ run_script("02_hwe.R")
 run_script("05_pca_dapc.R")
 run_script("04_amova.R")
 run_script("06_distance_matrices.R")
-run_script("06a_bruvo_distance.R")
 run_script("11_isolation_by_distance.R")
 run_script("03_structure_all_plots_S2N_bySite.R")
 

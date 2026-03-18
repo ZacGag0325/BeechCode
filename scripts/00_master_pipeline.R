@@ -10,12 +10,20 @@
 # - Prefer real workbook sources in data/raw/ and inputs/.
 # - Do not require inputs/meta_ind.csv if workbook metadata exist.
 # - Exclude genotype IDs outside the canonical metadata universe.
+#
+# Microsatellite clone-correction policy:
+# - gi = full dataset for clonality and individual-level diagnostics.
+# - gi_mll = clone-corrected dataset based on MLLs defined from Bruvo distance.
+# - Exact MLG assignments are retained alongside MLL assignments in df_ids.
 ############################################################
 
 suppressPackageStartupMessages({
   library(adegenet)
   library(poppr)
 })
+
+BRUVO_MLL_THRESHOLD <- 0.09
+BRUVO_ALGORITHM <- "farthest_neighbor"
 
 find_project_root <- function() {
   candidates <- c(getwd(), normalizePath(file.path(getwd(), ".."), mustWork = FALSE))
@@ -48,7 +56,6 @@ resolve_col <- function(df, choices) {
   nms[idx]
 }
 
-
 DF_IDS_ID_CHOICES <- c("ind", "individual", "sample", "sampleid", "id", "ind_id")
 DF_IDS_SITE_CHOICES <- c("Site", "site", "pop", "population")
 
@@ -57,6 +64,14 @@ normalize_id <- function(x) {
   x <- gsub("\uFEFF", "", x, fixed = TRUE)
   x <- gsub("[[:cntrl:]]", "", x)
   toupper(x)
+}
+
+clean_column_names <- function(nms) {
+  nms <- trimws(as.character(nms))
+  nms[is.na(nms) | !nzchar(nms)] <- "unnamed_col"
+  nms <- gsub("\r|\n|\t", "_", nms)
+  nms <- gsub("\\s+", "_", nms)
+  make.unique(nms, sep = "__dup")
 }
 
 read_csv_with_comments <- function(path) {
@@ -100,7 +115,7 @@ read_table_file <- function(path, sheet = NULL) {
     if (!requireNamespace("readxl", quietly = TRUE)) {
       stop("[00_master_pipeline] readxl package is required to read Excel sources: ", path)
     }
-    df <- as.data.frame(readxl::read_excel(path, sheet = sheet), stringsAsFactors = FALSE, check.names = FALSE)
+    df <- as.data.frame(readxl::read_excel(path, sheet = sheet, .name_repair = "minimal"), stringsAsFactors = FALSE, check.names = FALSE)
   } else if (ext == "csv") {
     df <- read_csv_with_comments(path)
   } else if (ext %in% c("tsv", "txt")) {
@@ -109,7 +124,7 @@ read_table_file <- function(path, sheet = NULL) {
     stop("Unsupported source file extension: ", ext)
   }
   if (ncol(df) == 0) return(df)
-  names(df) <- trimws(names(df))
+  names(df) <- clean_column_names(names(df))
   df
 }
 
@@ -177,6 +192,7 @@ scan_sources <- function() {
   }
   out
 }
+
 select_meta_ind <- function(scanned) {
   cands <- Filter(function(x) {
     !is.na(x$summary$id_col) && !is.na(x$summary$site_col) && x$summary$n_paired_loci < 3
@@ -385,6 +401,48 @@ build_genind_from_table <- function(tbl, table_summary, canonical_ids_norm, id_t
   )
 }
 
+build_mll_clone_corrected_object <- function(gi) {
+  gc_mlg <- poppr::as.genclone(gi)
+  mlg_raw <- tryCatch(poppr::mlg.vector(gc_mlg), error = function(e) as.integer(factor(poppr::mlg(gc_mlg))))
+  mlg_labels <- paste0("MLG_", as.integer(factor(mlg_raw)))
+  
+  replen <- rep(2, adegenet::nLoc(gi))
+  names(replen) <- adegenet::locNames(gi)
+  
+  gc_mll <- gc_mlg
+  poppr::mlg.filter(
+    gc_mll,
+    distance = poppr::bruvo.dist,
+    replen = replen,
+    algorithm = BRUVO_ALGORITHM
+  ) <- BRUVO_MLL_THRESHOLD
+  
+  mll_raw <- poppr::mll(gc_mll)
+  mll_labels <- paste0("MLL_", as.integer(factor(mll_raw)))
+  
+  if (length(mll_labels) != adegenet::nInd(gi)) {
+    stop("[00_master_pipeline] MLL assignment length does not match nInd(gi).")
+  }
+  
+  keep_mll <- !duplicated(mll_labels)
+  gi_mll <- gi[keep_mll, ]
+  
+  if (adegenet::nInd(gi_mll) != length(unique(mll_labels))) {
+    stop("[00_master_pipeline] gi_mll size is inconsistent with unique MLL count.")
+  }
+  
+  list(
+    gi_mll = gi_mll,
+    mlg_labels = mlg_labels,
+    mll_labels = mll_labels,
+    threshold = BRUVO_MLL_THRESHOLD,
+    algorithm = BRUVO_ALGORITHM,
+    n_mlg = length(unique(mlg_labels)),
+    n_mll = length(unique(mll_labels)),
+    n_clonal_repeats = adegenet::nInd(gi) - length(unique(mll_labels))
+  )
+}
+
 build_objects <- function() {
   scanned <- scan_sources()
   
@@ -408,12 +466,8 @@ build_objects <- function() {
   )
   gi <- built$gi
   
-  # Clone-correction must be biologically meaningful (exact MLG identity).
-  # We intentionally avoid constructing a "fake" MLL label from MLG IDs.
-  # gi_mll is produced by keeping one representative per exact multilocus genotype.
-  mlg_raw <- tryCatch(poppr::mlg.vector(gi), error = function(e) as.integer(factor(poppr::mlg(gi))))
-  keep_mlg <- !duplicated(mlg_raw)
-  gi_mll <- gi[keep_mlg, ]
+  mll_build <- build_mll_clone_corrected_object(gi)
+  gi_mll <- mll_build$gi_mll
   
   gi_ids <- adegenet::indNames(gi)
   gi_ids_norm <- normalize_id(gi_ids)
@@ -422,6 +476,10 @@ build_objects <- function() {
   df_ids <- data.frame(
     ind_id = gi_ids,
     Site = as.character(adegenet::pop(gi)),
+    MLG = mll_build$mlg_labels,
+    MLL = mll_build$mll_labels,
+    Bruvo_MLL_threshold = mll_build$threshold,
+    Bruvo_algorithm = mll_build$algorithm,
     stringsAsFactors = FALSE
   )
   
@@ -439,6 +497,12 @@ build_objects <- function() {
     message("[00_master_pipeline] Missing genotype ID examples (up to 20): ",
             paste(head(missing_in_gi, 20), collapse = ", "))
   }
+  cat("[00_master_pipeline] Bruvo MLL threshold: ", BRUVO_MLL_THRESHOLD, "\n", sep = "")
+  cat("[00_master_pipeline] Bruvo clustering algorithm: ", BRUVO_ALGORITHM, "\n", sep = "")
+  cat("[00_master_pipeline] Number of unique MLGs: ", mll_build$n_mlg, "\n", sep = "")
+  cat("[00_master_pipeline] Number of unique MLLs: ", mll_build$n_mll, "\n", sep = "")
+  cat("[00_master_pipeline] Number of clones (nInd - unique MLL): ", mll_build$n_clonal_repeats, "\n", sep = "")
+  cat("[00_master_pipeline] Confirmed df_ids contains columns: ind_id, Site, MLG, MLL\n", sep = "")
   
   saveRDS(gi, file.path(OBJ_DIR, "gi.rds"))
   saveRDS(gi_mll, file.path(OBJ_DIR, "gi_mll.rds"))

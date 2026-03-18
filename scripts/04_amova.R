@@ -6,10 +6,11 @@
 # - Clone-corrected genotypes reduce bias from repeated ramets.
 #
 # Main analysis: Site-level AMOVA.
-# Optional extension: hierarchical AMOVA (Region/Site) if Region metadata exist.
+# Hierarchical extension: North/South region (derived from site latitude rank) within Site.
 #
 # Outputs:
 # - outputs/tables/amova_results.csv
+# - outputs/tables/amova_site_region_groups.csv
 # - outputs/tables/supplementary/amova_randtest_summary.csv
 ############################################################
 
@@ -24,8 +25,71 @@ source("scripts/_load_objects.R")
 
 message("[04_amova] Running AMOVA on gi_mll...")
 
-resolve_region_col <- function(df) {
-  resolve_col_ci(df, c("Region", "region", "REGION", "Area", "area", "Zone", "zone"))
+normalize_site <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x <- gsub("\\s+", " ", x)
+  toupper(x)
+}
+
+resolve_site_latitude <- function(meta_df) {
+  site_col <- resolve_col_ci(meta_df, c("site", "population", "pop"))
+  lat_col <- resolve_col_ci(meta_df, c("latitude", "lat"))
+  
+  if (is.na(site_col) || is.na(lat_col)) {
+    stop(
+      "[04_amova] Could not find Site and Latitude columns in meta. ",
+      "Latitude is required to build North/South AMOVA groups."
+    )
+  }
+  
+  coords <- data.frame(
+    Site = trimws(as.character(meta_df[[site_col]])),
+    Latitude = suppressWarnings(as.numeric(meta_df[[lat_col]])),
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(nzchar(Site), !is.na(Latitude)) %>%
+    mutate(Site_norm = normalize_site(Site)) %>%
+    group_by(Site_norm) %>%
+    summarise(
+      Site = dplyr::first(Site),
+      Latitude = mean(Latitude, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(Latitude, Site)
+  
+  if (nrow(coords) < 2) {
+    stop("[04_amova] Need latitude values for at least two sites to define North/South regions.")
+  }
+  
+  coords
+}
+
+build_latitude_regions <- function(site_levels, meta_df) {
+  site_lat_tbl <- resolve_site_latitude(meta_df)
+  site_levels_norm <- normalize_site(site_levels)
+  idx <- match(site_levels_norm, site_lat_tbl$Site_norm)
+  
+  if (any(is.na(idx))) {
+    missing_sites <- site_levels[is.na(idx)]
+    stop(
+      "[04_amova] Missing latitude for AMOVA site(s): ",
+      paste(missing_sites, collapse = ", "),
+      ". Cannot derive North/South regional groups."
+    )
+  }
+  
+  ranked_tbl <- site_lat_tbl[idx, c("Site_norm", "Site", "Latitude"), drop = FALSE]
+  ranked_tbl$Site_from_AMOVA <- site_levels
+  ranked_tbl <- ranked_tbl %>%
+    arrange(Latitude, Site_from_AMOVA) %>%
+    mutate(
+      Rank_south_to_north = dplyr::row_number(),
+      Region = ifelse(Rank_south_to_north <= floor(n() / 2), "South", "North")
+    )
+  
+  setNames(ranked_tbl$Region, ranked_tbl$Site_from_AMOVA)
 }
 
 run_amova_model <- function(gi_use, strata_df, model_formula, model_label, grouping_source, n_drop) {
@@ -113,10 +177,8 @@ run_amova_model <- function(gi_use, strata_df, model_formula, model_label, group
 validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[04_amova] df_ids_mll")
 id_col <- "ind_id"
 site_col <- "Site"
-region_col <- resolve_region_col(df_ids_mll)
 
 id_to_site <- setNames(as.character(df_ids_mll[[site_col]]), normalize_id(df_ids_mll[[id_col]]))
-id_to_region <- if (!is.na(region_col)) setNames(as.character(df_ids_mll[[region_col]]), normalize_id(df_ids_mll[[id_col]])) else NULL
 
 inds <- adegenet::indNames(gi_mll)
 site_from_dfids <- id_to_site[normalize_id(inds)]
@@ -130,8 +192,6 @@ if (all(!is.na(site_from_dfids))) {
   grouping_source <- "pop(gi_mll)"
 }
 
-group_region <- if (!is.null(id_to_region)) id_to_region[normalize_id(inds)] else rep(NA_character_, length(inds))
-
 valid <- !is.na(group_site) & nzchar(group_site)
 n_drop <- sum(!valid)
 
@@ -139,7 +199,6 @@ if (n_drop > 0) message("[04_amova] Dropping ", n_drop, " individuals with missi
 
 gi_use <- gi_mll[valid, , drop = FALSE]
 site_use <- as.factor(group_site[valid])
-region_use <- as.factor(group_region[valid])
 
 if (adegenet::nInd(gi_use) < 2) stop("[04_amova] Fewer than 2 individuals remain after grouping alignment.")
 
@@ -150,12 +209,36 @@ if (length(keep_groups) < 2) stop("[04_amova] Need at least two sites with >=2 i
 keep_idx <- site_use %in% keep_groups
 gi_use <- gi_use[keep_idx, , drop = FALSE]
 site_use <- droplevels(site_use[keep_idx])
-region_use <- droplevels(region_use[keep_idx])
 
 adegenet::pop(gi_use) <- site_use
 
 message("[04_amova] Individuals used: ", adegenet::nInd(gi_use))
 message("[04_amova] Site groups included: ", nlevels(site_use), " -> ", paste(levels(site_use), collapse = ", "))
+
+site_latitudes <- resolve_site_latitude(meta)
+site_region_map <- build_latitude_regions(levels(site_use), meta)
+region_use <- factor(
+  site_region_map[as.character(site_use)],
+  levels = c("South", "North")
+)
+
+site_region_assignments <- data.frame(
+  Site = names(site_region_map),
+  Region = unname(site_region_map),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(Site_norm = normalize_site(Site)) %>%
+  left_join(site_latitudes %>% select(Site_norm, Latitude), by = "Site_norm") %>%
+  select(-Site_norm) %>%
+  arrange(Latitude, Site)
+
+message(
+  "[04_amova] Derived North/South regional groups from site latitude: ",
+  paste(
+    paste0(site_region_assignments$Site, "=", site_region_assignments$Region),
+    collapse = ", "
+  )
+)
 
 # ------------------------------------------------------------
 # 2) Run Site-only AMOVA (main)
@@ -180,11 +263,11 @@ amova_results <- site_fit$result
 amova_randtest_summary <- site_fit$rand
 
 # ------------------------------------------------------------
-# 3) Optional hierarchical AMOVA (Region/Site)
+# 3) Hierarchical AMOVA (derived North/South region within Site)
 # ------------------------------------------------------------
 has_region <- !all(is.na(region_use) | !nzchar(as.character(region_use)))
 if (has_region && nlevels(droplevels(region_use)) >= 2) {
-  message("[04_amova] Region column detected (", region_col, "); running hierarchical AMOVA: ~Region/Site")
+  message("[04_amova] Running hierarchical AMOVA with derived latitude-ranked regions: ~Region/Site")
   
   keep_region <- !is.na(region_use) & nzchar(as.character(region_use))
   gi_h <- gi_use[keep_region, , drop = FALSE]
@@ -204,15 +287,15 @@ if (has_region && nlevels(droplevels(region_use)) >= 2) {
     gi_use = gi_h,
     strata_df = strata_h,
     model_formula = ~Region/Site,
-    model_label = "Region_Site_hierarchical",
-    grouping_source = paste0(grouping_source, " + df_ids$", region_col),
+    model_label = "NorthSouth_Site_hierarchical",
+    grouping_source = "derived_from_site_latitude_rank",
     n_drop = n_drop
   )
   
   amova_results <- bind_rows(amova_results, h_fit$result)
   amova_randtest_summary <- bind_rows(amova_randtest_summary, h_fit$rand)
 } else {
-  message("[04_amova] Region variable not available with >=2 levels; keeping Site-only AMOVA.")
+  warning("[04_amova] Could not derive >=2 North/South region levels; keeping Site-only AMOVA.")
 }
 
 amova_file <- file.path(TABLES_DIR, "amova_results.csv")
@@ -222,3 +305,7 @@ message("[04_amova] Saved: ", amova_file)
 supp_file <- file.path(TABLES_SUPP_DIR, "amova_randtest_summary.csv")
 write.csv(amova_randtest_summary, supp_file, row.names = FALSE)
 message("[04_amova] Saved: ", supp_file)
+
+site_region_file <- file.path(TABLES_DIR, "amova_site_region_groups.csv")
+write.csv(site_region_assignments, site_region_file, row.names = FALSE)
+message("[04_amova] Saved: ", site_region_file)

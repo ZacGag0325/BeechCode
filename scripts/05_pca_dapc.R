@@ -23,6 +23,7 @@
 # - outputs/tables/dapc_coordinates.csv
 # - outputs/tables/dapc_group_centroids.csv
 # - outputs/tables/dapc_model_metadata.csv
+# - outputs/tables/dapc_assignment_summary.csv
 # - outputs/figures/dapc_plot.jpeg
 ############################################################
 
@@ -179,36 +180,118 @@ if (n_pc >= 3) {
 # ------------------------------------------------------------
 # 2) DAPC using Site as the a priori group
 # ------------------------------------------------------------
-# We keep the retained number of PCs moderate and explicit. For a thesis
-# workflow, this is preferable to a hidden default because it makes the model
-# choice reportable and reproducible. The number of discriminant axes is bound
-# by (number of groups - 1).
+# We retain the existing Site-group DAPC, but now choose n.pca more
+# defensibly. We first fit a broad candidate model, then attempt
+# adegenet::optim.a.score on that candidate to select a conservative,
+# reportable number of retained PCs. If optimisation fails or is unstable,
+# we fall back to a reproducible variance-based rule.
 set.seed(123)
 max_n_pca <- min(50L, adegenet::nInd(gi_mll) - 1L, ncol(X))
 if (max_n_pca < 1) {
   stop("[05_pca_dapc] Not enough informative dimensions to fit DAPC.")
 }
 
-suggested_n_pca <- min(
-  max_n_pca,
-  max(10L, floor(adegenet::nInd(gi_mll) / 3), nlevels(site_factor) + 1L)
-)
-suggested_n_pca <- max(1L, suggested_n_pca)
-n_da <- min(nlevels(site_factor) - 1L, 10L)
+n_da_max <- min(nlevels(site_factor) - 1L, nrow(X) - 1L, max_n_pca)
+if (n_da_max < 1) {
+  stop("[05_pca_dapc] DAPC requires at least one valid discriminant axis.")
+}
 
-if (n_da < 1) {
+n_da_final <- min(n_da_max, 10L)
+if (n_da_final < 1) {
   stop("[05_pca_dapc] DAPC requires at least two Site groups with non-empty membership.")
 }
 
+fallback_n_pca <- min(
+  max_n_pca,
+  max(
+    n_da_final + 1L,
+    nlevels(site_factor) + 1L,
+    min(which(cumsum(pca_eigenvalues$Percent_Variance) >= 80))
+  )
+)
+fallback_n_pca <- max(1L, as.integer(fallback_n_pca))
+
 message("[05_pca_dapc] DAPC grouping variable: Site")
-message("[05_pca_dapc] Retained principal components (n.pca): ", suggested_n_pca)
-message("[05_pca_dapc] Retained discriminant axes (n.da): ", n_da)
+message("[05_pca_dapc] Candidate maximum retained principal components for optimisation: ", max_n_pca)
+message("[05_pca_dapc] Final discriminant axes retained (n.da): ", n_da_final)
+
+initial_dapc <- adegenet::dapc(
+  x = gi_mll,
+  pop = site_factor,
+  n.pca = max_n_pca,
+  n.da = n_da_final,
+  pca.loadings = TRUE,
+  var.contrib = FALSE,
+  var.loadings = FALSE
+)
+
+optim_used <- FALSE
+optim_best_n_pca <- NA_integer_
+optim_note <- "optim.a.score_not_attempted"
+optim_error_message <- NA_character_
+
+# optim.a.score expects a dapc object. We try it on the broad candidate fit,
+# but keep a conservative fallback because optimisation can be unstable in some
+# small or uneven microsatellite data sets.
+optim_result <- tryCatch({
+  adegenet::optim.a.score(
+    initial_dapc,
+    n.pca = seq_len(max_n_pca),
+    smart = TRUE,
+    plot = FALSE,
+    n = 25,
+    n.sim = 30,
+    n.da = n_da_final
+  )
+}, error = function(e) {
+  optim_error_message <<- conditionMessage(e)
+  NULL
+})
+
+if (!is.null(optim_result) && !is.null(optim_result$best)) {
+  optim_candidate <- suppressWarnings(as.integer(round(optim_result$best[1])))
+  if (length(optim_candidate) == 1 && is.finite(optim_candidate) && !is.na(optim_candidate)) {
+    optim_best_n_pca <- max(1L, min(max_n_pca, optim_candidate))
+    optim_used <- TRUE
+    optim_note <- "optim.a.score_success"
+  } else {
+    optim_note <- "optim.a.score_returned_non_finite_best"
+  }
+} else if (!is.null(optim_error_message) && nzchar(optim_error_message)) {
+  optim_note <- paste0("optim.a.score_failed: ", optim_error_message)
+}
+
+n_pca_final <- if (optim_used && !is.na(optim_best_n_pca)) {
+  max(n_da_final + 1L, optim_best_n_pca)
+} else {
+  fallback_n_pca
+}
+n_pca_final <- min(max_n_pca, as.integer(n_pca_final))
+n_pca_final <- max(1L, n_pca_final)
+
+if (n_pca_final <= n_da_final) {
+  n_pca_final <- min(max_n_pca, n_da_final + 1L)
+}
+if (n_pca_final <= n_da_final) {
+  n_da_final <- max(1L, n_pca_final - 1L)
+}
+
+if (n_da_final > nlevels(site_factor) - 1L) {
+  n_da_final <- nlevels(site_factor) - 1L
+}
+
+message("[05_pca_dapc] Final retained principal components (n.pca): ", n_pca_final)
+message("[05_pca_dapc] Final retained discriminant axes (n.da): ", n_da_final)
+message("[05_pca_dapc] n.pca selection note: ", optim_note)
 
 dapc_fit <- adegenet::dapc(
   x = gi_mll,
   pop = site_factor,
-  n.pca = suggested_n_pca,
-  n.da = n_da
+  n.pca = n_pca_final,
+  n.da = n_da_final,
+  pca.loadings = TRUE,
+  var.contrib = FALSE,
+  var.loadings = FALSE
 )
 
 dapc_coords <- as.data.frame(dapc_fit$ind.coord)
@@ -252,13 +335,50 @@ centroids_file <- file.path(TABLES_DIR, "dapc_group_centroids.csv")
 write.csv(dapc_centroids, centroids_file, row.names = FALSE)
 message("[05_pca_dapc] Saved: ", centroids_file)
 
+posterior_df <- if (!is.null(dapc_fit$posterior)) {
+  as.data.frame(dapc_fit$posterior, stringsAsFactors = FALSE)
+} else {
+  data.frame(matrix(nrow = adegenet::nInd(gi_mll), ncol = 0))
+}
+
+assignment_summary <- data.frame(
+  Individual = adegenet::indNames(gi_mll),
+  observed_site = as.character(site_factor),
+  assigned_site = if (!is.null(dapc_fit$assign)) as.character(dapc_fit$assign) else NA_character_,
+  max_posterior = if (ncol(posterior_df) > 0) apply(as.matrix(posterior_df), 1, max, na.rm = TRUE) else NA_real_,
+  stringsAsFactors = FALSE
+)
+
+if (ncol(posterior_df) > 0) {
+  colnames(posterior_df) <- paste0("posterior_", make.names(colnames(posterior_df), unique = TRUE))
+  assignment_summary <- cbind(assignment_summary, posterior_df)
+}
+
+assignment_file <- file.path(TABLES_DIR, "dapc_assignment_summary.csv")
+write.csv(assignment_summary, assignment_file, row.names = FALSE)
+message("[05_pca_dapc] Saved: ", assignment_file)
+
+constraint_notes <- c(
+  paste0("max_n_pca=min(50, nInd-1, informative_allele_columns) => ", max_n_pca),
+  paste0("n_da capped at min(n_groups-1, n_individuals-1, max_n_pca, 10) => ", n_da_final),
+  if (optim_used) {
+    paste0("optim.a.score_best=", optim_best_n_pca, "; final_n_pca adjusted to remain > n.da if needed")
+  } else {
+    paste0("fallback_n_pca=", fallback_n_pca, " based on cumulative_PCA_variance>=80% and group-count safeguards")
+  }
+)
+
 dapc_metadata <- data.frame(
   grouping_variable = "Site",
   genotype_object = "gi_mll",
   n_sites = nlevels(site_factor),
   n_individuals = adegenet::nInd(gi_mll),
-  n_pca_retained = suggested_n_pca,
-  n_da_retained = n_da,
+  n_pca_retained = n_pca_final,
+  n_da_retained = n_da_final,
+  optim_a_score_used = optim_used,
+  optim_a_score_best_n_pca = ifelse(is.na(optim_best_n_pca), NA_integer_, optim_best_n_pca),
+  optimisation_note = optim_note,
+  constraint_notes = paste(constraint_notes, collapse = " | "),
   stringsAsFactors = FALSE
 )
 
@@ -267,16 +387,29 @@ write.csv(dapc_metadata, metadata_file, row.names = FALSE)
 message("[05_pca_dapc] Saved: ", metadata_file)
 
 ellipse_sites <- dapc_coordinates %>%
-  count(Site, name = "n_site") %>%
-  filter(n_site >= 3) %>%
+  group_by(Site) %>%
+  summarise(
+    n_site = n(),
+    var_ld1 = stats::var(LD1, na.rm = TRUE),
+    var_ld2 = stats::var(LD2, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    n_site >= 3,
+    is.finite(var_ld1),
+    is.finite(var_ld2),
+    var_ld1 > 0,
+    var_ld2 > 0
+  ) %>%
   pull(Site)
 
 if (length(ellipse_sites) == 0) {
-  warning("[05_pca_dapc] No Site group has >=3 clone-corrected individuals; confidence ellipses cannot be drawn.")
+  warning("[05_pca_dapc] No Site group has enough spread for confidence ellipses; DAPC plot will show points and centroids only.")
 }
 
-# The DAPC plot uses site-level 95% ellipses where possible, which makes group
-# overlap and outliers much easier to interpret in a publication figure.
+# The DAPC plot uses site-level 95% confidence ellipses where possible.
+# These are not literal circles; they summarize multivariate dispersion and
+# help visual interpretation of site clusters without changing the analysis.
 dapc_plot <- ggplot(dapc_coordinates, aes(LD1, LD2, color = Site)) +
   {
     if (length(ellipse_sites) > 0) {
@@ -284,9 +417,9 @@ dapc_plot <- ggplot(dapc_coordinates, aes(LD1, LD2, color = Site)) +
         data = subset(dapc_coordinates, Site %in% ellipse_sites),
         aes(fill = Site),
         geom = "polygon",
-        alpha = 0.12,
+        alpha = 0.10,
         level = 0.95,
-        linewidth = 0.35,
+        linewidth = 0.3,
         show.legend = FALSE,
         type = "t"
       )
@@ -296,7 +429,7 @@ dapc_plot <- ggplot(dapc_coordinates, aes(LD1, LD2, color = Site)) +
     if (length(ellipse_sites) > 0) {
       stat_ellipse(
         data = subset(dapc_coordinates, Site %in% ellipse_sites),
-        linewidth = 0.55,
+        linewidth = 0.6,
         level = 0.95,
         show.legend = FALSE,
         type = "t"
@@ -316,11 +449,11 @@ dapc_plot <- ggplot(dapc_coordinates, aes(LD1, LD2, color = Site)) +
   plot_theme +
   labs(
     title = "DAPC by Site (clone-corrected microsatellite data)",
-    subtitle = "Points are clone-corrected MLL representatives; ellipses show 95% site-level dispersion when n ≥ 3",
+    subtitle = "Points are clone-corrected MLL representatives; 95% confidence ellipses are shown when site sample size and spread allow estimation",
     x = "Discriminant axis 1",
     y = "Discriminant axis 2"
   )
 
 dapc_plot_file <- file.path(FIGURES_DIR, "dapc_plot.jpeg")
-ggsave(dapc_plot_file, plot = dapc_plot, width = 8.6, height = 6.4, dpi = 320)
+ggsave(dapc_plot_file, plot = dapc_plot, width = 8, height = 6, dpi = 320)
 message("[05_pca_dapc] Saved: ", dapc_plot_file)

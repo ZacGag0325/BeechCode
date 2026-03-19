@@ -34,6 +34,7 @@ source("scripts/_load_objects.R")
 HWE_MONTE_CARLO_REPS <- 9999L
 HWE_MIN_NON_MISSING_N <- 8L
 HWE_MIN_UNIQUE_GENOTYPES <- 2L
+HWE_ALPHA <- 0.05
 
 message("[02_hwe] Running HWE tests on gi_mll (clone-corrected)...")
 message("[02_hwe] genind handler: adegenet")
@@ -77,6 +78,42 @@ split_genotype <- function(x) {
   }
   
   sort(parts)
+}
+
+# ------------------------------------------------------------
+# Helper: multiple-testing correction with NA-safe handling
+# ------------------------------------------------------------
+add_hwe_multipletest_columns <- function(df,
+                                         p_col = "p_value_raw",
+                                         alpha = HWE_ALPHA,
+                                         include_legacy_aliases = FALSE) {
+  if (!p_col %in% names(df)) {
+    stop("[02_hwe] Requested p-value column not found: ", p_col)
+  }
+  
+  pv <- suppressWarnings(as.numeric(df[[p_col]]))
+  ok <- is.finite(pv) & !is.na(pv)
+  
+  p_bonf <- rep(NA_real_, length(pv))
+  p_fdr <- rep(NA_real_, length(pv))
+  
+  if (sum(ok) > 0) {
+    p_bonf[ok] <- p.adjust(pv[ok], method = "bonferroni")
+    p_fdr[ok] <- p.adjust(pv[ok], method = "BH")
+  }
+  
+  df$p_value_bonferroni <- p_bonf
+  df$p_value_fdr <- p_fdr
+  df$significant_raw <- !is.na(pv) & pv < alpha
+  df$significant_bonferroni <- !is.na(p_bonf) & p_bonf < alpha
+  df$significant_fdr <- !is.na(p_fdr) & p_fdr < alpha
+  
+  if (include_legacy_aliases) {
+    df$p_adjust_bh <- df$p_value_fdr
+    df$significant_bh <- df$significant_fdr
+  }
+  
+  df
 }
 
 # ------------------------------------------------------------
@@ -226,7 +263,12 @@ for (s in sites) {
         n_alleles = NA_integer_,
         n_unique_genotypes = NA_integer_,
         p_value = NA_real_,
+        p_value_raw = NA_real_,
         significant_raw = FALSE,
+        p_value_bonferroni = NA_real_,
+        p_value_fdr = NA_real_,
+        significant_bonferroni = FALSE,
+        significant_fdr = FALSE,
         p_adjust_bh = NA_real_,
         significant_bh = FALSE,
         status = "skipped",
@@ -247,7 +289,12 @@ for (s in sites) {
       n_alleles = as.integer(test$n_alleles),
       n_unique_genotypes = as.integer(test$n_unique_genotypes),
       p_value = as.numeric(test$p_value),
-      significant_raw = isTRUE(!is.na(test$p_value) && test$p_value < 0.05),
+      p_value_raw = as.numeric(test$p_value),
+      significant_raw = isTRUE(!is.na(test$p_value) && test$p_value < HWE_ALPHA),
+      p_value_bonferroni = NA_real_,
+      p_value_fdr = NA_real_,
+      significant_bonferroni = FALSE,
+      significant_fdr = FALSE,
       p_adjust_bh = NA_real_,
       significant_bh = FALSE,
       status = as.character(test$status),
@@ -259,20 +306,11 @@ for (s in sites) {
 }
 
 hwe_site_locus <- dplyr::bind_rows(rows) %>%
-  group_by(Site) %>%
-  mutate(
-    p_adjust_bh = {
-      pv <- p_value
-      ok <- !is.na(pv)
-      out <- rep(NA_real_, length(pv))
-      if (sum(ok) > 0) {
-        out[ok] <- p.adjust(pv[ok], method = "BH")
-      }
-      out
-    },
-    significant_bh = !is.na(p_adjust_bh) & p_adjust_bh < 0.05
+  add_hwe_multipletest_columns(
+    p_col = "p_value_raw",
+    alpha = HWE_ALPHA,
+    include_legacy_aliases = TRUE
   ) %>%
-  ungroup() %>%
   arrange(Site, Locus)
 
 if (all(hwe_site_locus$status != "ok")) {
@@ -296,7 +334,11 @@ hwe_methods <- data.frame(
   hwe_test_function = "pegas::hw.test",
   loci_conversion_function = "pegas::as.loci",
   monte_carlo_replicates = HWE_MONTE_CARLO_REPS,
-  bh_correction_scope = "within_site_across_loci",
+  multiple_testing_alpha = HWE_ALPHA,
+  by_locus_correction_scope = "across_loci",
+  by_site_correction_scope = "across_sites",
+  by_site_by_locus_correction_scope = "across_all_valid_site_locus_tests",
+  multiple_testing_methods = "Bonferroni and Benjamini-Hochberg_FDR",
   stringsAsFactors = FALSE
 )
 
@@ -324,13 +366,15 @@ hwe_by_locus <- hwe_site_locus %>%
     n_sites_significant_bh = sum(significant_bh, na.rm = TRUE),
     mean_clone_corrected_N = mean(N[status == "ok"], na.rm = TRUE),
     mean_missing_fraction = mean(missing_fraction, na.rm = TRUE),
-    p_value = combine_fisher(p_value[status == "ok"]),
+    p_value = combine_fisher(p_value_raw[status == "ok"]),
     .groups = "drop"
+  ) %>%
+  mutate(p_value_raw = p_value) %>%
+  add_hwe_multipletest_columns(
+    p_col = "p_value_raw",
+    alpha = HWE_ALPHA,
+    include_legacy_aliases = TRUE
   )
-
-hwe_by_locus$p_adjust_bh <- p.adjust(hwe_by_locus$p_value, method = "BH")
-hwe_by_locus$significant_raw <- !is.na(hwe_by_locus$p_value) & hwe_by_locus$p_value < 0.05
-hwe_by_locus$significant_bh <- !is.na(hwe_by_locus$p_adjust_bh) & hwe_by_locus$p_adjust_bh < 0.05
 
 hwe_by_site <- hwe_site_locus %>%
   group_by(Site) %>%
@@ -339,14 +383,16 @@ hwe_by_site <- hwe_site_locus %>%
     loci_significant_raw = sum(significant_raw, na.rm = TRUE),
     loci_significant_bh = sum(significant_bh, na.rm = TRUE),
     mean_missing_fraction = mean(missing_fraction, na.rm = TRUE),
-    p_value = combine_fisher(p_value[status == "ok"]),
+    p_value = combine_fisher(p_value_raw[status == "ok"]),
     .groups = "drop"
   ) %>%
-  left_join(site_sizes, by = "Site")
-
-hwe_by_site$p_adjust_bh <- p.adjust(hwe_by_site$p_value, method = "BH")
-hwe_by_site$significant_raw <- !is.na(hwe_by_site$p_value) & hwe_by_site$p_value < 0.05
-hwe_by_site$significant_bh <- !is.na(hwe_by_site$p_adjust_bh) & hwe_by_site$p_adjust_bh < 0.05
+  mutate(p_value_raw = p_value) %>%
+  left_join(site_sizes, by = "Site") %>%
+  add_hwe_multipletest_columns(
+    p_col = "p_value_raw",
+    alpha = HWE_ALPHA,
+    include_legacy_aliases = TRUE
+  )
 
 hwe_by_locus_within_site <- hwe_site_locus
 

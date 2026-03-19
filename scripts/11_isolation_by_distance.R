@@ -284,38 +284,48 @@ collapse_site_coordinates <- function(meta_df, site_col, lat_col, lon_col, sourc
   coord_audit <- coords_raw %>%
     group_by(Site_norm) %>%
     summarise(
-      Site = dplyr::first(Site),
-      n_rows = n(),
-      n_unique_lat = n_distinct(round(Latitude, 8)),
-      n_unique_lon = n_distinct(round(Longitude, 8)),
-      Latitude_mean = mean(Latitude, na.rm = TRUE),
-      Longitude_mean = mean(Longitude, na.rm = TRUE),
-      Latitude_min = min(Latitude, na.rm = TRUE),
-      Latitude_max = max(Latitude, na.rm = TRUE),
-      Longitude_min = min(Longitude, na.rm = TRUE),
-      Longitude_max = max(Longitude, na.rm = TRUE),
-      inconsistent_within_site = n_unique_lat > 1 | n_unique_lon > 1,
+      site = dplyr::first(Site),
+      n_records = n(),
+      mean_latitude = mean(Latitude, na.rm = TRUE),
+      mean_longitude = mean(Longitude, na.rm = TRUE),
+      min_latitude = min(Latitude, na.rm = TRUE),
+      max_latitude = max(Latitude, na.rm = TRUE),
+      min_longitude = min(Longitude, na.rm = TRUE),
+      max_longitude = max(Longitude, na.rm = TRUE),
+      coordinates_inconsistent_within_site =
+        n_distinct(round(Latitude, 8)) > 1 | n_distinct(round(Longitude, 8)) > 1,
       .groups = "drop"
     ) %>%
-    arrange(Site)
+    arrange(site)
   
-  inconsistent_sites <- coord_audit$Site[coord_audit$inconsistent_within_site]
+  centroid_sites <- coord_audit$site[coord_audit$n_records > 1]
+  if (length(centroid_sites) > 0) {
+    message(
+      "[11_isolation_by_distance] Multiple coordinate records were detected for site(s): ",
+      paste(centroid_sites, collapse = ", "),
+      ". Mean latitude/longitude are being used as site centroids for site-level Mantel/IBD."
+    )
+  } else {
+    message("[11_isolation_by_distance] One coordinate record per site detected; those coordinates are used directly as site centroids for site-level Mantel/IBD.")
+  }
+  
+  inconsistent_sites <- coord_audit$site[coord_audit$coordinates_inconsistent_within_site]
   if (length(inconsistent_sites) > 0) {
     warning(
       "[11_isolation_by_distance] Inconsistent duplicate coordinates detected within site(s): ",
       paste(inconsistent_sites, collapse = ", "),
-      ". Using the mean latitude/longitude per site as the site centroid for Mantel/IBD."
+      ". Mean latitude/longitude per site are being used as site centroids for Mantel/IBD; review site_coordinate_audit.csv for ranges."
     )
   }
   
   coords <- coord_audit %>%
     transmute(
-      Site = Site,
+      Site = site,
       Site_norm = Site_norm,
-      Latitude = Latitude_mean,
-      Longitude = Longitude_mean,
-      n_rows_collapsed = n_rows,
-      inconsistent_within_site = inconsistent_within_site
+      Latitude = mean_latitude,
+      Longitude = mean_longitude,
+      n_rows_collapsed = n_records,
+      inconsistent_within_site = coordinates_inconsistent_within_site
     )
   
   list(coords = coords, audit = coord_audit)

@@ -2,11 +2,16 @@
 ############################################################
 # Hardy-Weinberg Equilibrium tests (clone-corrected: gi_mll)
 #
-# Design goals:
-# - Use clone-corrected data for population-level inference.
-# - Avoid pegas::loci (not exported in current pegas versions).
-# - Run by Site x Locus with robust failure handling.
-# - Continue even if one locus fails.
+# Biological/statistical rationale:
+# - HWE is evaluated on the clone-corrected object (gi_mll), not on gi,
+#   because repeated ramets inflate genotype counts and can create
+#   artifactual departures from equilibrium.
+# - adegenet is retained for handling genind objects and site labels.
+# - pegas::hw.test is used for the actual HWE test because pegas provides
+#   an exact/Monte Carlo HWE workflow once locus data are converted into a
+#   loci-compatible object. adegenet does not provide a dedicated exact HWE
+#   testing function for genind objects, and hierfstat is retained elsewhere
+#   in the pipeline for F-statistics rather than HWE testing.
 #
 # Main required output:
 # - outputs/tables/hwe_by_site_by_locus.csv
@@ -26,40 +31,84 @@ suppressPackageStartupMessages({
 
 source("scripts/_load_objects.R")
 
+HWE_MONTE_CARLO_REPS <- 9999L
+HWE_MIN_NON_MISSING_N <- 8L
+HWE_MIN_UNIQUE_GENOTYPES <- 2L
+
 message("[02_hwe] Running HWE tests on gi_mll (clone-corrected)...")
-validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "02_hwe df_ids_mll")
-if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) stop("[02_hwe] gi_mll and df_ids_mll are not aligned.")
+message("[02_hwe] genind handler: adegenet")
+message("[02_hwe] HWE test function: pegas::hw.test via pegas::as.loci")
+message("[02_hwe] Monte Carlo replicates per exact test: ", HWE_MONTE_CARLO_REPS)
+
+if (!inherits(gi_mll, "genind")) {
+  stop("[02_hwe] gi_mll must be a genind object. Run scripts/00_master_pipeline.R first.")
+}
+
+validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[02_hwe] df_ids_mll")
+if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) {
+  stop("[02_hwe] gi_mll and df_ids_mll are not aligned.")
+}
+
+site_vec <- as.character(adegenet::pop(gi_mll))
+if (all(is.na(site_vec)) || !any(nzchar(site_vec))) {
+  stop("[02_hwe] pop(gi_mll) is missing; Site assignments are required for by-site HWE.")
+}
+if (!identical(site_vec, as.character(df_ids_mll$Site))) {
+  stop("[02_hwe] pop(gi_mll) does not match df_ids_mll$Site. This would invalidate by-site HWE tests.")
+}
 
 # ------------------------------------------------------------
-# Helper: robust allele-pair parsing
+# Helper: robust allele-pair parsing from genind2df() strings
 # ------------------------------------------------------------
 split_genotype <- function(x) {
   x <- trimws(as.character(x))
-  if (is.na(x) || x == "" || x %in% c("NA", "0", "0/0", "NA/NA", "-")) return(c(NA_character_, NA_character_))
+  if (is.na(x) || x == "" || x %in% c("NA", "0", "0/0", "NA/NA", "-")) {
+    return(c(NA_character_, NA_character_))
+  }
+  
   parts <- strsplit(x, "/", fixed = TRUE)[[1]]
-  if (length(parts) != 2) return(c(NA_character_, NA_character_))
+  if (length(parts) != 2) {
+    return(c(NA_character_, NA_character_))
+  }
+  
   parts <- trimws(parts)
-  if (any(parts == "")) return(c(NA_character_, NA_character_))
+  if (any(!nzchar(parts))) {
+    return(c(NA_character_, NA_character_))
+  }
+  
   sort(parts)
 }
 
 # ------------------------------------------------------------
 # Helper: single-locus HWE test with defensive checks
 # ------------------------------------------------------------
-run_single_locus_hwe <- function(geno_vec, B = 1000, min_n = 8, min_unique_genotypes = 2) {
+run_single_locus_hwe <- function(geno_vec,
+                                 B = HWE_MONTE_CARLO_REPS,
+                                 min_n = HWE_MIN_NON_MISSING_N,
+                                 min_unique_genotypes = HWE_MIN_UNIQUE_GENOTYPES) {
   parsed <- t(vapply(geno_vec, split_genotype, character(2)))
   a1 <- parsed[, 1]
   a2 <- parsed[, 2]
   
   keep <- !(is.na(a1) | is.na(a2))
   n_non_missing <- sum(keep)
+  raw_missing_fraction <- 1 - (n_non_missing / length(geno_vec))
   
   base_row <- list(
     N = as.integer(n_non_missing),
+    missing_fraction = as.numeric(raw_missing_fraction),
+    n_alleles = NA_integer_,
+    n_unique_genotypes = NA_integer_,
     p_value = NA_real_,
     status = "not_tested",
     note = ""
   )
+  
+  if (length(geno_vec) == 0) {
+    base_row$status <- "failed"
+    base_row$note <- "empty_genotype_vector"
+    return(base_row)
+  }
   
   if (n_non_missing < min_n) {
     base_row$status <- "skipped"
@@ -67,54 +116,63 @@ run_single_locus_hwe <- function(geno_vec, B = 1000, min_n = 8, min_unique_genot
     return(base_row)
   }
   
-  g <- paste(a1[keep], a2[keep], sep = "/")
-  n_genotypes <- dplyr::n_distinct(g)
+  genotype_strings <- paste(a1[keep], a2[keep], sep = "/")
+  n_genotypes <- dplyr::n_distinct(genotype_strings)
+  base_row$n_unique_genotypes <- as.integer(n_genotypes)
+  
   if (n_genotypes < min_unique_genotypes) {
     base_row$status <- "skipped"
     base_row$note <- sprintf("insufficient_genotype_diversity (unique_genotypes=%d)", n_genotypes)
     return(base_row)
   }
   
-  # Invariant locus check
   alleles <- c(a1[keep], a2[keep])
   n_alleles <- dplyr::n_distinct(alleles)
+  base_row$n_alleles <- as.integer(n_alleles)
+  
   if (n_alleles < 2) {
     base_row$status <- "skipped"
     base_row$note <- "invariant_locus"
     return(base_row)
   }
   
-  # Build a single-locus data.frame and convert with pegas::as.loci (NOT pegas::loci)
-  loc_df <- data.frame(Locus = factor(g), stringsAsFactors = TRUE)
+  # pegas::hw.test operates on a loci-style data.frame/object.
+  # We convert the single locus genotype strings into a factor column and
+  # then into a loci object. This keeps the workflow compatible with a genind
+  # source object without forcing a full file-format conversion.
+  loc_df <- data.frame(Locus = factor(genotype_strings), stringsAsFactors = TRUE)
   
+  error_msg <- NULL
   pval <- tryCatch({
     loci_obj <- pegas::as.loci(loc_df)
-    ht <- pegas::hw.test(loci_obj, B = B)
+    hw_fit <- pegas::hw.test(loci_obj, B = B)
     
-    # Robust p-value extraction across pegas output shapes
-    if (is.list(ht) && !is.null(ht$p.value)) {
-      as.numeric(ht$p.value[1])
-    } else if (is.matrix(ht) || is.data.frame(ht)) {
-      htm <- as.matrix(ht)
-      cn <- tolower(colnames(htm))
+    if (is.list(hw_fit) && !is.null(hw_fit$p.value)) {
+      as.numeric(hw_fit$p.value[1])
+    } else if (is.matrix(hw_fit) || is.data.frame(hw_fit)) {
+      hw_mat <- as.matrix(hw_fit)
+      cn <- tolower(colnames(hw_mat))
       pick <- which(cn %in% c("p.value", "pvalue", "p", "pr(>chi)", "pr(prob)") | grepl("p", cn))
       if (length(pick) == 0) {
-        suppressWarnings(as.numeric(htm[1, ncol(htm)]))
+        suppressWarnings(as.numeric(hw_mat[1, ncol(hw_mat)]))
       } else {
-        suppressWarnings(as.numeric(htm[1, pick[1]]))
+        suppressWarnings(as.numeric(hw_mat[1, pick[1]]))
       }
     } else {
-      suppressWarnings(as.numeric(ht[1]))
+      suppressWarnings(as.numeric(hw_fit[1]))
     }
   }, error = function(e) {
-    attr(base_row, "error_msg") <<- conditionMessage(e)
+    error_msg <<- conditionMessage(e)
     NA_real_
   })
   
-  if (is.na(pval) || !is.finite(pval)) {
+  if (!is.finite(pval) || is.na(pval)) {
     base_row$status <- "failed"
-    err <- attr(base_row, "error_msg")
-    base_row$note <- if (!is.null(err) && nzchar(err)) paste0("hw_test_failed: ", err) else "hw_test_failed"
+    base_row$note <- if (!is.null(error_msg) && nzchar(error_msg)) {
+      paste0("hw_test_failed: ", error_msg)
+    } else {
+      "hw_test_failed"
+    }
     return(base_row)
   }
   
@@ -125,32 +183,48 @@ run_single_locus_hwe <- function(geno_vec, B = 1000, min_n = 8, min_unique_genot
 }
 
 # ------------------------------------------------------------
-# Build Site x Locus table
+# Build Site x Locus table from clone-corrected genotypes
 # ------------------------------------------------------------
 gdf <- adegenet::genind2df(gi_mll, sep = "/")
 loci <- setdiff(names(gdf), "pop")
-site_vec <- as.character(adegenet::pop(gi_mll))
 
-if (length(loci) == 0) stop("[02_hwe] No loci detected in gi_mll.")
-if (all(is.na(site_vec))) stop("[02_hwe] pop(gi_mll) is all NA; cannot run by-site HWE.")
+if (length(loci) == 0) {
+  stop("[02_hwe] No loci detected in gi_mll.")
+}
 
-sites <- sort(unique(site_vec))
+sites <- sort(unique(site_vec[!is.na(site_vec) & nzchar(site_vec)]))
+if (length(sites) == 0) {
+  stop("[02_hwe] No valid Site labels found in gi_mll.")
+}
+
+site_sizes <- data.frame(
+  Site = names(table(site_vec)),
+  N_clone_corrected = as.integer(table(site_vec)),
+  stringsAsFactors = FALSE
+) %>%
+  arrange(Site)
+
+message("[02_hwe] Sites detected: ", length(sites))
+message("[02_hwe] Loci detected: ", length(loci))
 
 rows <- vector("list", length(sites) * length(loci))
 k <- 1L
 
 for (s in sites) {
   idx_site <- which(site_vec == s)
+  
   for (loc in loci) {
     geno_site <- gdf[idx_site, loc]
-    
-    # all-missing check before full parsing
     raw_non_missing <- sum(!is.na(geno_site) & trimws(as.character(geno_site)) != "")
+    
     if (raw_non_missing == 0) {
       rows[[k]] <- data.frame(
         Site = s,
         Locus = loc,
         N = 0L,
+        missing_fraction = 1,
+        n_alleles = NA_integer_,
+        n_unique_genotypes = NA_integer_,
         p_value = NA_real_,
         significant_raw = FALSE,
         p_adjust_bh = NA_real_,
@@ -163,12 +237,15 @@ for (s in sites) {
       next
     }
     
-    test <- run_single_locus_hwe(geno_site, B = 1000, min_n = 8, min_unique_genotypes = 2)
+    test <- run_single_locus_hwe(geno_site)
     
     rows[[k]] <- data.frame(
       Site = s,
       Locus = loc,
       N = as.integer(test$N),
+      missing_fraction = as.numeric(test$missing_fraction),
+      n_alleles = as.integer(test$n_alleles),
+      n_unique_genotypes = as.integer(test$n_unique_genotypes),
       p_value = as.numeric(test$p_value),
       significant_raw = isTRUE(!is.na(test$p_value) && test$p_value < 0.05),
       p_adjust_bh = NA_real_,
@@ -181,17 +258,16 @@ for (s in sites) {
   }
 }
 
-hwe_site_locus <- dplyr::bind_rows(rows)
-
-# BH correction within each Site across loci actually tested (status == ok)
-hwe_site_locus <- hwe_site_locus %>%
+hwe_site_locus <- dplyr::bind_rows(rows) %>%
   group_by(Site) %>%
   mutate(
     p_adjust_bh = {
       pv <- p_value
       ok <- !is.na(pv)
       out <- rep(NA_real_, length(pv))
-      if (sum(ok) > 0) out[ok] <- p.adjust(pv[ok], method = "BH")
+      if (sum(ok) > 0) {
+        out[ok] <- p.adjust(pv[ok], method = "BH")
+      }
       out
     },
     significant_bh = !is.na(p_adjust_bh) & p_adjust_bh < 0.05
@@ -199,24 +275,46 @@ hwe_site_locus <- hwe_site_locus %>%
   ungroup() %>%
   arrange(Site, Locus)
 
+if (all(hwe_site_locus$status != "ok")) {
+  warning("[02_hwe] No Site x Locus HWE tests could be evaluated. Review sample sizes, missingness, and locus variability.")
+}
+
 # Main required output
 main_required <- file.path(TABLES_DIR, "hwe_by_site_by_locus.csv")
 write.csv(hwe_site_locus, main_required, row.names = FALSE)
 message("[02_hwe] Saved: ", main_required)
 
+# Also write a compact provenance table so methods choices remain explicit.
+hwe_methods <- data.frame(
+  analysis = "Hardy_Weinberg_test",
+  genotype_object = "gi_mll",
+  genotype_object_class = paste(class(gi_mll), collapse = ";"),
+  clone_correction = "MLL_clone_corrected",
+  grouping_variable = "Site",
+  genind_handler_package = "adegenet",
+  hwe_test_package = "pegas",
+  hwe_test_function = "pegas::hw.test",
+  loci_conversion_function = "pegas::as.loci",
+  monte_carlo_replicates = HWE_MONTE_CARLO_REPS,
+  bh_correction_scope = "within_site_across_loci",
+  stringsAsFactors = FALSE
+)
+
+methods_file <- file.path(TABLES_DIR, "hwe_methods_metadata.csv")
+write.csv(hwe_methods, methods_file, row.names = FALSE)
+message("[02_hwe] Saved: ", methods_file)
+
+# ------------------------------------------------------------
 # Compatibility outputs for downstream scripts / supplements
+# ------------------------------------------------------------
 combine_fisher <- function(pv) {
   pv <- pv[is.finite(pv) & !is.na(pv) & pv > 0]
-  if (length(pv) == 0) return(NA_real_)
+  if (length(pv) == 0) {
+    return(NA_real_)
+  }
   stat <- -2 * sum(log(pv))
   pchisq(stat, df = 2 * length(pv), lower.tail = FALSE)
 }
-
-site_sizes <- data.frame(
-  Site = as.character(levels(adegenet::pop(gi_mll))),
-  N = as.integer(table(adegenet::pop(gi_mll))[levels(adegenet::pop(gi_mll))]),
-  stringsAsFactors = FALSE
-)
 
 hwe_by_locus <- hwe_site_locus %>%
   group_by(Locus) %>%
@@ -224,6 +322,8 @@ hwe_by_locus <- hwe_site_locus %>%
     n_sites_tested = sum(status == "ok"),
     n_sites_significant_raw = sum(significant_raw, na.rm = TRUE),
     n_sites_significant_bh = sum(significant_bh, na.rm = TRUE),
+    mean_clone_corrected_N = mean(N[status == "ok"], na.rm = TRUE),
+    mean_missing_fraction = mean(missing_fraction, na.rm = TRUE),
     p_value = combine_fisher(p_value[status == "ok"]),
     .groups = "drop"
   )
@@ -238,6 +338,7 @@ hwe_by_site <- hwe_site_locus %>%
     loci_tested = sum(status == "ok"),
     loci_significant_raw = sum(significant_raw, na.rm = TRUE),
     loci_significant_bh = sum(significant_bh, na.rm = TRUE),
+    mean_missing_fraction = mean(missing_fraction, na.rm = TRUE),
     p_value = combine_fisher(p_value[status == "ok"]),
     .groups = "drop"
   ) %>%

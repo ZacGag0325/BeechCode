@@ -9,10 +9,20 @@
 #
 # Why use Site as the DAPC grouping variable?
 # - In this workflow, Site is the biologically interpretable a priori group
-#   used throughout population-level summaries (HWE, differentiation, AMOVA,
-#   IBD). Using Site here keeps the DAPC directly comparable to the rest of
-#   the thesis pipeline.
-# - STRUCTURE was run externally on the full dataset and remains separate.
+#   used throughout the population-level summaries (HWE, differentiation,
+#   AMOVA, and site-level IBD). Using Site here keeps DAPC directly comparable
+#   to the rest of the pipeline.
+# - STRUCTURE remains a separate, externally run analysis on the full dataset.
+#
+# Biological interpretation notes:
+# - PCA is unsupervised. It summarizes multivariate genetic variation without
+#   using site labels to build axes.
+# - Site-level confidence ellipses in PCA are added ONLY as a visualization
+#   aid to help readers see overlap among sampling localities; they do not
+#   imply that discrete clusters truly exist.
+# - DAPC is supervised by the Site grouping variable. It is therefore useful
+#   for describing separation among known sampling localities, but it should
+#   be interpreted alongside unsupervised PCA and the distance-based analyses.
 #
 # Outputs:
 # - outputs/tables/pca_scores.csv
@@ -63,12 +73,38 @@ if (any(site_counts < 2)) {
   )
 }
 
+plot_theme <- theme_bw(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+eligible_ellipse_groups <- function(df, x_col, y_col, group_col = "Site") {
+  df %>%
+    group_by(.data[[group_col]]) %>%
+    summarise(
+      n_group = n(),
+      var_x = stats::var(.data[[x_col]], na.rm = TRUE),
+      var_y = stats::var(.data[[y_col]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    filter(
+      n_group >= 3,
+      is.finite(var_x),
+      is.finite(var_y),
+      var_x > 0,
+      var_y > 0
+    ) %>%
+    pull(.data[[group_col]])
+}
+
 # ------------------------------------------------------------
-# 1) PCA
+# 1) PCA (unsupervised)
 # ------------------------------------------------------------
-# adegenet::tab gives allele frequencies/coded counts from the genind object.
-# Missing data are replaced by mean allele frequencies so the PCA can proceed
-# without discarding entire individuals or loci.
+# adegenet::tab converts the genind object into allele-frequency / coded-count
+# data for multivariate analysis. Missing values are replaced by mean allele
+# frequencies so that individuals and loci are not discarded unnecessarily.
 X <- adegenet::tab(gi_mll, freq = TRUE, NA.method = "mean")
 
 if (!is.matrix(X) || nrow(X) < 2 || ncol(X) < 2) {
@@ -111,23 +147,50 @@ pca_eig_file <- file.path(TABLES_DIR, "pca_eigenvalues.csv")
 write.csv(pca_eigenvalues, pca_eig_file, row.names = FALSE)
 message("[05_pca_dapc] Saved: ", pca_eig_file)
 
-plot_theme <- theme_bw(base_size = 12) +
-  theme(
-    legend.position = "right",
-    plot.title = element_text(face = "bold"),
-    panel.grid.minor = element_blank()
-  )
-
 plot_12_df <- pca_scores %>% filter(is.finite(PC1), is.finite(PC2))
 if (nrow(plot_12_df) == 0) {
   stop("[05_pca_dapc] No valid rows for PC1 vs PC2 plot.")
 }
 
+pca_ellipse_sites <- eligible_ellipse_groups(plot_12_df, x_col = "PC1", y_col = "PC2", group_col = "Site")
+if (length(pca_ellipse_sites) == 0) {
+  warning("[05_pca_dapc] No Site group has enough spread for PCA confidence ellipses; PCA plot will show points only.")
+}
+
+# PCA remains unsupervised. Ellipses are added beneath the points with low
+# alpha so they help readability without obscuring observations.
 pca_plot_12 <- ggplot(plot_12_df, aes(PC1, PC2, color = Site)) +
-  geom_point(size = 2.3, alpha = 0.9) +
+  {
+    if (length(pca_ellipse_sites) > 0) {
+      stat_ellipse(
+        data = subset(plot_12_df, Site %in% pca_ellipse_sites),
+        aes(fill = Site),
+        geom = "polygon",
+        alpha = 0.12,
+        level = 0.95,
+        linewidth = 0.25,
+        show.legend = FALSE,
+        type = "t"
+      )
+    }
+  } +
+  {
+    if (length(pca_ellipse_sites) > 0) {
+      stat_ellipse(
+        data = subset(plot_12_df, Site %in% pca_ellipse_sites),
+        linewidth = 0.5,
+        alpha = 0.8,
+        level = 0.95,
+        show.legend = FALSE,
+        type = "t"
+      )
+    }
+  } +
+  geom_point(size = 2.4, alpha = 0.92) +
   plot_theme +
   labs(
     title = "PCA (PC1 vs PC2)",
+    subtitle = "PCA is unsupervised; ellipses are for visualization only and do not imply discrete clusters",
     x = sprintf("PC1 (%.1f%%)", ifelse(length(var_exp) >= 1, var_exp[1], NA_real_)),
     y = sprintf("PC2 (%.1f%%)", ifelse(length(var_exp) >= 2, var_exp[2], NA_real_))
   )
@@ -146,6 +209,7 @@ if (n_pc >= 3) {
       plot_theme +
       labs(
         title = "PCA (PC1 vs PC3)",
+        subtitle = "PCA is unsupervised; points only are shown for supplementary axes",
         x = sprintf("PC1 (%.1f%%)", var_exp[1]),
         y = sprintf("PC3 (%.1f%%)", var_exp[3])
       )
@@ -163,6 +227,7 @@ if (n_pc >= 3) {
       plot_theme +
       labs(
         title = "PCA (PC2 vs PC3)",
+        subtitle = "PCA is unsupervised; points only are shown for supplementary axes",
         x = sprintf("PC2 (%.1f%%)", var_exp[2]),
         y = sprintf("PC3 (%.1f%%)", var_exp[3])
       )
@@ -180,11 +245,10 @@ if (n_pc >= 3) {
 # ------------------------------------------------------------
 # 2) DAPC using Site as the a priori group
 # ------------------------------------------------------------
-# We retain the existing Site-group DAPC, but now choose n.pca more
-# defensibly. We first fit a broad candidate model, then attempt
-# adegenet::optim.a.score on that candidate to select a conservative,
-# reportable number of retained PCs. If optimisation fails or is unstable,
-# we fall back to a reproducible variance-based rule.
+# We retain the existing Site-group DAPC, but choose n.pca more defensibly.
+# First, a broad candidate model is fit. Then optim.a.score is attempted to
+# identify a conservative number of retained PCs. If optimisation is unstable,
+# the workflow falls back to a reproducible variance-based rule.
 set.seed(123)
 max_n_pca <- min(50L, adegenet::nInd(gi_mll) - 1L, ncol(X))
 if (max_n_pca < 1) {
@@ -201,12 +265,13 @@ if (n_da_final < 1) {
   stop("[05_pca_dapc] DAPC requires at least two Site groups with non-empty membership.")
 }
 
+cumvar_threshold_idx <- which(cumsum(pca_eigenvalues$Percent_Variance) >= 80)
 fallback_n_pca <- min(
   max_n_pca,
   max(
     n_da_final + 1L,
     nlevels(site_factor) + 1L,
-    min(which(cumsum(pca_eigenvalues$Percent_Variance) >= 80))
+    ifelse(length(cumvar_threshold_idx) > 0, min(cumvar_threshold_idx), max_n_pca)
   )
 )
 fallback_n_pca <- max(1L, as.integer(fallback_n_pca))
@@ -230,9 +295,6 @@ optim_best_n_pca <- NA_integer_
 optim_note <- "optim.a.score_not_attempted"
 optim_error_message <- NA_character_
 
-# optim.a.score expects a dapc object. We try it on the broad candidate fit,
-# but keep a conservative fallback because optimisation can be unstable in some
-# small or uneven microsatellite data sets.
 optim_result <- tryCatch({
   adegenet::optim.a.score(
     initial_dapc,
@@ -275,14 +337,25 @@ if (n_pca_final <= n_da_final) {
 if (n_pca_final <= n_da_final) {
   n_da_final <- max(1L, n_pca_final - 1L)
 }
-
 if (n_da_final > nlevels(site_factor) - 1L) {
   n_da_final <- nlevels(site_factor) - 1L
+}
+
+if (optim_used) {
+  n_pca_justification <- paste0(
+    "n.pca selected from optim.a.score (best=", optim_best_n_pca,
+    ") and constrained to remain > n.da for stable DAPC interpretation."
+  )
+} else {
+  n_pca_justification <- paste0(
+    "n.pca selected by reproducible fallback rule: retain at least the number required to exceed n.da and preserve >=80% cumulative PCA variance when possible (fallback=", fallback_n_pca, ")."
+  )
 }
 
 message("[05_pca_dapc] Final retained principal components (n.pca): ", n_pca_final)
 message("[05_pca_dapc] Final retained discriminant axes (n.da): ", n_da_final)
 message("[05_pca_dapc] n.pca selection note: ", optim_note)
+message("[05_pca_dapc] n.pca justification: ", n_pca_justification)
 
 dapc_fit <- adegenet::dapc(
   x = gi_mll,
@@ -301,7 +374,6 @@ if (ncol(dapc_coords) < 1) {
 if (ncol(dapc_coords) < 2) {
   dapc_coords$LD2 <- 0
 }
-
 colnames(dapc_coords)[1:2] <- c("LD1", "LD2")
 
 dapc_coordinates <- data.frame(
@@ -360,7 +432,7 @@ message("[05_pca_dapc] Saved: ", assignment_file)
 
 constraint_notes <- c(
   paste0("max_n_pca=min(50, nInd-1, informative_allele_columns) => ", max_n_pca),
-  paste0("n_da capped at min(n_groups-1, n_individuals-1, max_n_pca, 10) => ", n_da_final),
+  paste0("n.da capped at min(n_groups-1, n_individuals-1, max_n_pca, 10) => ", n_da_final),
   if (optim_used) {
     paste0("optim.a.score_best=", optim_best_n_pca, "; final_n_pca adjusted to remain > n.da if needed")
   } else {
@@ -378,6 +450,7 @@ dapc_metadata <- data.frame(
   optim_a_score_used = optim_used,
   optim_a_score_best_n_pca = ifelse(is.na(optim_best_n_pca), NA_integer_, optim_best_n_pca),
   optimisation_note = optim_note,
+  n_pca_justification = n_pca_justification,
   constraint_notes = paste(constraint_notes, collapse = " | "),
   stringsAsFactors = FALSE
 )
@@ -386,74 +459,72 @@ metadata_file <- file.path(TABLES_DIR, "dapc_model_metadata.csv")
 write.csv(dapc_metadata, metadata_file, row.names = FALSE)
 message("[05_pca_dapc] Saved: ", metadata_file)
 
-ellipse_sites <- dapc_coordinates %>%
-  group_by(Site) %>%
-  summarise(
-    n_site = n(),
-    var_ld1 = stats::var(LD1, na.rm = TRUE),
-    var_ld2 = stats::var(LD2, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  filter(
-    n_site >= 3,
-    is.finite(var_ld1),
-    is.finite(var_ld2),
-    var_ld1 > 0,
-    var_ld2 > 0
-  ) %>%
-  pull(Site)
-
-if (length(ellipse_sites) == 0) {
-  warning("[05_pca_dapc] No Site group has enough spread for confidence ellipses; DAPC plot will show points and centroids only.")
+dapc_ellipse_sites <- eligible_ellipse_groups(dapc_coordinates, x_col = "LD1", y_col = "LD2", group_col = "Site")
+if (length(dapc_ellipse_sites) == 0) {
+  warning("[05_pca_dapc] No Site group has enough spread for DAPC confidence ellipses; DAPC plot will show points and centroids only.")
 }
 
-# The DAPC plot uses site-level 95% confidence ellipses where possible.
-# These are not literal circles; they summarize multivariate dispersion and
-# help visual interpretation of site clusters without changing the analysis.
+# The DAPC plot shows supervised separation among Site groups. Filled 95%
+# confidence ellipses summarize within-site dispersion and are drawn below the
+# points. Centroids are added to make the position of each site's average DAPC
+# score explicit for publication-ready interpretation.
 dapc_plot <- ggplot(dapc_coordinates, aes(LD1, LD2, color = Site)) +
   {
-    if (length(ellipse_sites) > 0) {
+    if (length(dapc_ellipse_sites) > 0) {
       stat_ellipse(
-        data = subset(dapc_coordinates, Site %in% ellipse_sites),
+        data = subset(dapc_coordinates, Site %in% dapc_ellipse_sites),
         aes(fill = Site),
         geom = "polygon",
-        alpha = 0.10,
+        alpha = 0.14,
         level = 0.95,
-        linewidth = 0.3,
+        linewidth = 0.35,
         show.legend = FALSE,
         type = "t"
       )
     }
   } +
   {
-    if (length(ellipse_sites) > 0) {
+    if (length(dapc_ellipse_sites) > 0) {
       stat_ellipse(
-        data = subset(dapc_coordinates, Site %in% ellipse_sites),
-        linewidth = 0.6,
+        data = subset(dapc_coordinates, Site %in% dapc_ellipse_sites),
+        linewidth = 0.7,
         level = 0.95,
         show.legend = FALSE,
         type = "t"
       )
     }
   } +
-  geom_point(size = 2.6, alpha = 0.92, shape = 16) +
+  geom_point(size = 2.6, alpha = 0.9, shape = 16) +
   geom_point(
     data = dapc_centroids,
     aes(x = LD1_centroid, y = LD2_centroid),
     inherit.aes = FALSE,
     shape = 4,
-    stroke = 1,
-    size = 3,
+    stroke = 1.2,
+    size = 3.4,
     color = "black"
+  ) +
+  geom_text(
+    data = dapc_centroids,
+    aes(x = LD1_centroid, y = LD2_centroid, label = Site),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 3,
+    fontface = "bold",
+    vjust = -0.7,
+    check_overlap = TRUE
   ) +
   plot_theme +
   labs(
     title = "DAPC by Site (clone-corrected microsatellite data)",
-    subtitle = "Points are clone-corrected MLL representatives; 95% confidence ellipses are shown when site sample size and spread allow estimation",
+    subtitle = paste0(
+      "Points are clone-corrected MLL representatives; 95% confidence ellipses summarize within-site dispersion when estimable. ",
+      "Centroids are labelled to support comparison among sites."
+    ),
     x = "Discriminant axis 1",
     y = "Discriminant axis 2"
   )
 
 dapc_plot_file <- file.path(FIGURES_DIR, "dapc_plot.jpeg")
-ggsave(dapc_plot_file, plot = dapc_plot, width = 8, height = 6, dpi = 320)
+ggsave(dapc_plot_file, plot = dapc_plot, width = 8.4, height = 6.4, dpi = 320)
 message("[05_pca_dapc] Saved: ", dapc_plot_file)

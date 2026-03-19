@@ -3,19 +3,44 @@
 # Isolation by Distance (Mantel test)
 # Genetic distance input: pairwise Jost's D (clone-corrected, site-level)
 #
-# Preconditions for a valid Mantel / IBD analysis in this workflow:
+# Biological rationale:
+# - The primary IBD analysis in this pipeline is site-level because the main
+#   differentiation summaries (Jost's D, FST, AMOVA) are all interpreted among
+#   sampling localities, not among ramets.
+# - Therefore, the primary Mantel test compares a site-by-site genetic
+#   distance matrix (pairwise Jost's D from gi_mll) against a site-by-site
+#   geographic distance matrix built from mean site centroids.
+# - A secondary OPTIONAL individual-level IBD analysis is added here only as a
+#   complementary diagnostic. It does not replace the main site-level result.
+#
+# Interpretation note:
+# - Site-level IBD asks whether genetically differentiated sites tend to be
+#   farther apart geographically.
+# - Individual-level IBD, when available, asks whether pairwise genetic
+#   differences among sampled individuals increase with pairwise geographic
+#   distance. Because that mixes within- and among-site structure, it should be
+#   interpreted as a secondary diagnostic rather than the main inference.
+#
+# Preconditions for the primary site-level Mantel / IBD analysis:
 # 1) A site-by-site genetic distance matrix already exists
-#    (here: outputs/matrices/pairwise_jostD.csv from gi_mll).
-# 2) Exactly one valid latitude/longitude pair can be assigned to each site.
+#    (outputs/matrices/pairwise_jostD.csv from gi_mll).
+# 2) Exactly one valid centroid can be assigned to each site after collapsing
+#    individual/site metadata to mean latitude and longitude.
 # 3) Site names in the genetic matrix and coordinate table either match
-#    directly or can be safely normalized and matched.
+#    directly or can be safely normalized and aligned.
 #
 # Outputs:
 # - outputs/tables/mantel_test_results.csv
 # - outputs/tables/site_coordinate_audit.csv
+# - outputs/tables/site_coordinates_clean.csv
 # - outputs/matrices/geographic_distance_matrix.csv
 # - outputs/tables/ibd_points.csv
 # - outputs/figures/isolation_by_distance.jpeg
+# - outputs/tables/individual_coordinate_audit.csv (optional)
+# - outputs/tables/individual_mantel_test_results.csv (optional)
+# - outputs/tables/individual_ibd_points.csv (optional)
+# - outputs/matrices/individual_geographic_distance_matrix.csv (optional)
+# - outputs/matrices/individual_genetic_distance_matrix.csv (optional)
 ############################################################
 
 suppressPackageStartupMessages({
@@ -29,6 +54,8 @@ source("scripts/_load_objects.R")
 
 cat("[11_isolation_by_distance] Running Mantel test: Jost's D vs geographic distance...\n")
 cat("[11_isolation_by_distance] Genetic distance matrix expected from scripts/06_distance_matrices.R using gi_mll.\n")
+cat("[11_isolation_by_distance] Primary interpretation = among-site IBD using mean site centroids.\n")
+cat("[11_isolation_by_distance] Secondary interpretation = among-individual IBD using per-individual GPS (optional; does not replace main result).\n")
 
 normalize_site <- function(x) {
   x <- trimws(as.character(x))
@@ -56,11 +83,21 @@ is_numeric_like <- function(x) {
   sum(!is.na(num)) > 0 && all(is.na(x) | !is.na(num))
 }
 
-coerce_numeric_safely <- function(x) {
-  x <- trimws(as.character(x))
-  x[x == ""] <- NA_character_
-  x <- gsub(",", ".", x, fixed = TRUE)
-  suppressWarnings(as.numeric(x))
+coerce_numeric_safely <- function(x, column_name = "unknown", context = "[11_isolation_by_distance]") {
+  raw <- trimws(as.character(x))
+  raw[raw == ""] <- NA_character_
+  raw <- gsub(",", ".", raw, fixed = TRUE)
+  num <- suppressWarnings(as.numeric(raw))
+  bad <- !is.na(raw) & is.na(num)
+  if (any(bad)) {
+    warning(
+      context,
+      " Non-numeric values detected in column '", column_name,
+      "'; affected rows will be excluded. Example values: ",
+      paste(head(unique(raw[bad]), 5), collapse = ", ")
+    )
+  }
+  num
 }
 
 safe_read_square_matrix <- function(path) {
@@ -199,6 +236,34 @@ score_site_column <- function(df) {
   nms[best_idx]
 }
 
+score_id_column <- function(df) {
+  nms <- names(df)
+  std <- normalize_name(nms)
+  scores <- rep(-Inf, length(nms))
+  
+  for (i in seq_along(nms)) {
+    nm <- std[i]
+    values <- trimws(as.character(df[[i]]))
+    values <- values[nzchar(values) & !is.na(values)]
+    if (length(values) == 0) next
+    
+    score <- 0
+    if (nm %in% c("ind", "individual", "sample", "sampleid", "id", "ind_id")) score <- score + 100
+    if (grepl("individual|sample|specimen|barcode|nom_labo|(^|_)id($|_)|(^|_)ind($|_)", nm)) score <- score + 50
+    if (grepl("latitude|longitude|site|population|pop", nm)) score <- score - 60
+    
+    uniq_prop <- length(unique(values)) / length(values)
+    if (uniq_prop >= 0.7) score <- score + 20
+    scores[i] <- score
+  }
+  
+  best_idx <- which.max(scores)
+  if (length(best_idx) == 0 || !is.finite(scores[best_idx]) || scores[best_idx] <= 0) {
+    return(NA_character_)
+  }
+  nms[best_idx]
+}
+
 score_coordinate_column <- function(df, type = c("lat", "lon")) {
   type <- match.arg(type)
   nms <- names(df)
@@ -208,33 +273,26 @@ score_coordinate_column <- function(df, type = c("lat", "lon")) {
   for (i in seq_along(nms)) {
     nm <- std[i]
     raw <- df[[i]]
-    num <- coerce_numeric_safely(raw)
+    if (!is_numeric_like(raw)) next
+    x <- trimws(as.character(raw))
+    x[x == ""] <- NA_character_
+    x <- gsub(",", ".", x, fixed = TRUE)
+    num <- suppressWarnings(as.numeric(x))
     non_missing <- !is.na(num)
     n_non_missing <- sum(non_missing)
     
-    if (n_non_missing == 0) {
-      next
-    }
-    if (!is_numeric_like(raw)) {
-      next
-    }
-    if (grepl("sample|individual|specimen|nom_labo|echant|barcode|clone|mll|mlg|id", nm)) {
-      next
-    }
+    if (n_non_missing == 0) next
+    if (grepl("sample|individual|specimen|nom_labo|echant|barcode|clone|mll|mlg|id", nm)) next
     
     val <- num[non_missing]
     if (type == "lat") {
-      if (any(val < -90 | val > 90)) {
-        next
-      }
+      if (any(val < -90 | val > 90)) next
       score <- 0
       if (nm %in% c("latitude", "lat", "decimal_latitude", "lat_dd")) score <- score + 100
       if (grepl("latitude|(^|_)lat($|_)", nm)) score <- score + 50
       if (grepl("longitude|(^|_)lon($|_)|(^|_)long($|_)", nm)) score <- score - 120
     } else {
-      if (any(val < -180 | val > 180)) {
-        next
-      }
+      if (any(val < -180 | val > 180)) next
       score <- 0
       if (nm %in% c("longitude", "lon", "long", "decimal_longitude", "decimal_long", "lon_dd", "long_dd")) score <- score + 100
       if (grepl("longitude|(^|_)lon($|_)|(^|_)long($|_)", nm)) score <- score + 50
@@ -253,15 +311,51 @@ score_coordinate_column <- function(df, type = c("lat", "lon")) {
   nms[best_idx]
 }
 
+assert_site_name_consistency <- function(reference_sites, candidate_sites, context) {
+  ref_norm <- unique(normalize_site(reference_sites))
+  cand_norm <- unique(normalize_site(candidate_sites))
+  missing_in_candidate <- setdiff(ref_norm, cand_norm)
+  extra_in_candidate <- setdiff(cand_norm, ref_norm)
+  
+  if (length(missing_in_candidate) > 0) {
+    warning(
+      context,
+      " Site names present in the primary object but absent from the comparison table: ",
+      paste(head(missing_in_candidate, 10), collapse = ", ")
+    )
+  }
+  if (length(extra_in_candidate) > 0) {
+    warning(
+      context,
+      " Site names present in the comparison table but absent from the primary object: ",
+      paste(head(extra_in_candidate, 10), collapse = ", ")
+    )
+  }
+}
+
 collapse_site_coordinates <- function(meta_df, site_col, lat_col, lon_col, source_name) {
   coords_raw <- data.frame(
     Site = trimws(as.character(meta_df[[site_col]])),
-    Latitude = coerce_numeric_safely(meta_df[[lat_col]]),
-    Longitude = coerce_numeric_safely(meta_df[[lon_col]]),
+    Latitude = coerce_numeric_safely(meta_df[[lat_col]], column_name = lat_col),
+    Longitude = coerce_numeric_safely(meta_df[[lon_col]], column_name = lon_col),
     stringsAsFactors = FALSE
   )
   
   coords_raw$Site_norm <- normalize_site(coords_raw$Site)
+  
+  missing_site <- sum(!nzchar(coords_raw$Site) | is.na(coords_raw$Site))
+  missing_lat <- sum(is.na(coords_raw$Latitude))
+  missing_lon <- sum(is.na(coords_raw$Longitude))
+  if (missing_site > 0 || missing_lat > 0 || missing_lon > 0) {
+    warning(
+      "[11_isolation_by_distance] Coordinate table '", source_name,
+      "' contains missing values (missing Site rows=", missing_site,
+      ", missing Latitude rows=", missing_lat,
+      ", missing Longitude rows=", missing_lon,
+      "). Incomplete rows will be excluded before computing site centroids."
+    )
+  }
+  
   coords_raw <- coords_raw %>%
     filter(nzchar(Site), nzchar(Site_norm), !is.na(Latitude), !is.na(Longitude))
   
@@ -296,7 +390,7 @@ collapse_site_coordinates <- function(meta_df, site_col, lat_col, lon_col, sourc
         n_distinct(round(Latitude, 8)) > 1 | n_distinct(round(Longitude, 8)) > 1,
       .groups = "drop"
     ) %>%
-    arrange(site)
+    arrange(mean_latitude, site)
   
   centroid_sites <- coord_audit$site[coord_audit$n_records > 1]
   if (length(centroid_sites) > 0) {
@@ -314,7 +408,7 @@ collapse_site_coordinates <- function(meta_df, site_col, lat_col, lon_col, sourc
     warning(
       "[11_isolation_by_distance] Inconsistent duplicate coordinates detected within site(s): ",
       paste(inconsistent_sites, collapse = ", "),
-      ". Mean latitude/longitude per site are being used as site centroids for Mantel/IBD; review site_coordinate_audit.csv for ranges."
+      ". Mean latitude/longitude per site are being used as centroids; review site_coordinate_audit.csv for coordinate ranges."
     )
   }
   
@@ -419,6 +513,231 @@ build_site_coordinates <- function(meta_df) {
   )
 }
 
+build_individual_coordinates <- function(meta_df, df_ids_tbl) {
+  if (!is.data.frame(meta_df) || ncol(meta_df) == 0) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: meta is empty.")
+    return(NULL)
+  }
+  
+  id_col <- score_id_column(meta_df)
+  site_col <- score_site_column(meta_df)
+  lat_col <- score_coordinate_column(meta_df, "lat")
+  lon_col <- score_coordinate_column(meta_df, "lon")
+  
+  if (is.na(id_col) || is.na(lat_col) || is.na(lon_col)) {
+    warning(
+      "[11_isolation_by_distance] Optional individual-level IBD skipped: could not identify an ID / Latitude / Longitude column set in meta."
+    )
+    return(NULL)
+  }
+  
+  id_norm_meta <- normalize_id(meta_df[[id_col]])
+  if (anyDuplicated(id_norm_meta[nzchar(id_norm_meta)])) {
+    dup_ids <- unique(trimws(as.character(meta_df[[id_col]])[duplicated(id_norm_meta) & nzchar(id_norm_meta)]))
+    warning(
+      "[11_isolation_by_distance] Duplicate individual IDs detected in the metadata used for optional individual-level IBD. Keeping the first record per ID. Examples: ",
+      paste(head(dup_ids, 10), collapse = ", ")
+    )
+  }
+  
+  indiv_raw <- data.frame(
+    Individual = trimws(as.character(meta_df[[id_col]])),
+    Site = if (!is.na(site_col)) trimws(as.character(meta_df[[site_col]])) else NA_character_,
+    Latitude = coerce_numeric_safely(meta_df[[lat_col]], column_name = lat_col),
+    Longitude = coerce_numeric_safely(meta_df[[lon_col]], column_name = lon_col),
+    stringsAsFactors = FALSE
+  )
+  indiv_raw$Individual_norm <- normalize_id(indiv_raw$Individual)
+  indiv_raw <- indiv_raw[!duplicated(indiv_raw$Individual_norm), , drop = FALSE]
+  
+  missing_rows <- sum(!nzchar(indiv_raw$Individual) | is.na(indiv_raw$Latitude) | is.na(indiv_raw$Longitude))
+  if (missing_rows > 0) {
+    warning(
+      "[11_isolation_by_distance] Optional individual-level IBD: ", missing_rows,
+      " metadata row(s) have missing individual ID or coordinates and will be excluded."
+    )
+  }
+  
+  indiv_raw <- indiv_raw %>%
+    filter(nzchar(Individual), !is.na(Latitude), !is.na(Longitude))
+  
+  if (nrow(indiv_raw) == 0) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: no individuals retained after filtering coordinates.")
+    return(NULL)
+  }
+  
+  if (any(indiv_raw$Latitude < -90 | indiv_raw$Latitude > 90)) {
+    bad_ids <- unique(indiv_raw$Individual[indiv_raw$Latitude < -90 | indiv_raw$Latitude > 90])
+    warning(
+      "[11_isolation_by_distance] Optional individual-level IBD skipped: latitude outside [-90, 90] for individual(s): ",
+      paste(head(bad_ids, 10), collapse = ", ")
+    )
+    return(NULL)
+  }
+  if (any(indiv_raw$Longitude < -180 | indiv_raw$Longitude > 180)) {
+    bad_ids <- unique(indiv_raw$Individual[indiv_raw$Longitude < -180 | indiv_raw$Longitude > 180])
+    warning(
+      "[11_isolation_by_distance] Optional individual-level IBD skipped: longitude outside [-180, 180] for individual(s): ",
+      paste(head(bad_ids, 10), collapse = ", ")
+    )
+    return(NULL)
+  }
+  
+  site_map <- setNames(as.character(df_ids_tbl$Site), normalize_id(df_ids_tbl$ind_id))
+  matched_site <- site_map[indiv_raw$Individual_norm]
+  missing_site_match <- sum(is.na(matched_site) | !nzchar(matched_site))
+  if (missing_site_match > 0) {
+    warning(
+      "[11_isolation_by_distance] Optional individual-level IBD: ", missing_site_match,
+      " metadata individual(s) with coordinates could not be matched to df_ids and will be excluded."
+    )
+  }
+  
+  indiv_raw$Site <- matched_site
+  indiv_raw <- indiv_raw %>%
+    filter(!is.na(Site), nzchar(Site))
+  
+  if (nrow(indiv_raw) < 3) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: fewer than 3 individuals remain after alignment to df_ids.")
+    return(NULL)
+  }
+  
+  missing_in_meta <- setdiff(normalize_id(df_ids_tbl$ind_id), indiv_raw$Individual_norm)
+  if (length(missing_in_meta) > 0) {
+    warning(
+      "[11_isolation_by_distance] Optional individual-level IBD: ", length(missing_in_meta),
+      " gi individuals do not have usable per-individual coordinates in meta and will be omitted from the optional analysis."
+    )
+  }
+  
+  audit <- indiv_raw %>%
+    transmute(
+      Individual = Individual,
+      Site = Site,
+      Latitude = Latitude,
+      Longitude = Longitude,
+      source_id_column = id_col,
+      source_latitude_column = lat_col,
+      source_longitude_column = lon_col
+    )
+  
+  list(data = indiv_raw, audit = audit, id_col = id_col, lat_col = lat_col, lon_col = lon_col)
+}
+
+run_individual_ibd_optional <- function(individual_coords) {
+  if (is.null(individual_coords)) return(invisible(NULL))
+  
+  indiv_tbl <- individual_coords$data
+  keep_idx <- match(normalize_id(adegenet::indNames(gi)), indiv_tbl$Individual_norm)
+  keep <- !is.na(keep_idx)
+  
+  if (sum(keep) < 3) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: fewer than 3 gi individuals matched to per-individual coordinates.")
+    return(invisible(NULL))
+  }
+  
+  gi_ind <- gi[keep, , drop = FALSE]
+  indiv_tbl <- indiv_tbl[keep_idx[keep], , drop = FALSE]
+  
+  if (!all(normalize_id(adegenet::indNames(gi_ind)) == indiv_tbl$Individual_norm)) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: gi and coordinate table could not be aligned identically.")
+    return(invisible(NULL))
+  }
+  
+  if (nrow(indiv_tbl) < 3) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped after alignment: fewer than 3 individuals remain.")
+    return(invisible(NULL))
+  }
+  
+  coords_ind <- as.matrix(indiv_tbl[, c("Longitude", "Latitude")])
+  storage.mode(coords_ind) <- "numeric"
+  if (any(!is.finite(coords_ind))) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: non-finite individual coordinates remain after alignment.")
+    return(invisible(NULL))
+  }
+  
+  geographic_ind_km <- geosphere::distm(coords_ind, fun = geosphere::distHaversine) / 1000
+  rownames(geographic_ind_km) <- indiv_tbl$Individual
+  colnames(geographic_ind_km) <- indiv_tbl$Individual
+  
+  genetic_ind <- as.matrix(poppr::prevosti.dist(gi_ind))
+  storage.mode(genetic_ind) <- "numeric"
+  rownames(genetic_ind) <- indiv_tbl$Individual
+  colnames(genetic_ind) <- indiv_tbl$Individual
+  
+  if (!identical(rownames(genetic_ind), rownames(geographic_ind_km))) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: label mismatch between individual genetic and geographic matrices.")
+    return(invisible(NULL))
+  }
+  
+  diag(genetic_ind) <- 0
+  diag(geographic_ind_km) <- 0
+  
+  if (any(!is.finite(genetic_ind[row(genetic_ind) != col(genetic_ind)]))) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: individual genetic distance matrix contains non-finite off-diagonal values.")
+    return(invisible(NULL))
+  }
+  if (any(!is.finite(geographic_ind_km[row(geographic_ind_km) != col(geographic_ind_km)]))) {
+    warning("[11_isolation_by_distance] Optional individual-level IBD skipped: individual geographic distance matrix contains non-finite off-diagonal values.")
+    return(invisible(NULL))
+  }
+  
+  mantel_ind <- vegan::mantel(
+    as.dist(genetic_ind),
+    as.dist(geographic_ind_km),
+    method = "pearson",
+    permutations = 9999
+  )
+  
+  ind_geo_file <- file.path(MATRICES_DIR, "individual_geographic_distance_matrix.csv")
+  write.csv(geographic_ind_km, ind_geo_file, row.names = TRUE)
+  cat("[11_isolation_by_distance] Saved optional individual geographic matrix: ", ind_geo_file, "\n", sep = "")
+  
+  ind_gen_file <- file.path(MATRICES_DIR, "individual_genetic_distance_matrix.csv")
+  write.csv(genetic_ind, ind_gen_file, row.names = TRUE)
+  cat("[11_isolation_by_distance] Saved optional individual genetic matrix: ", ind_gen_file, "\n", sep = "")
+  
+  upper_idx <- upper.tri(genetic_ind)
+  ind_points <- data.frame(
+    Individual1 = rownames(genetic_ind)[row(genetic_ind)[upper_idx]],
+    Individual2 = colnames(genetic_ind)[col(genetic_ind)[upper_idx]],
+    Site1 = indiv_tbl$Site[row(genetic_ind)[upper_idx]],
+    Site2 = indiv_tbl$Site[col(genetic_ind)[upper_idx]],
+    Geographic_km = as.numeric(geographic_ind_km[upper_idx]),
+    Genetic_distance_prevosti = as.numeric(genetic_ind[upper_idx]),
+    stringsAsFactors = FALSE
+  )
+  
+  ind_points_file <- file.path(TABLES_DIR, "individual_ibd_points.csv")
+  write.csv(ind_points, ind_points_file, row.names = FALSE)
+  cat("[11_isolation_by_distance] Saved optional individual IBD points: ", ind_points_file, "\n", sep = "")
+  
+  ind_results <- data.frame(
+    test = "Mantel_Individual_Prevosti_vs_Geographic",
+    statistic_r = as.numeric(mantel_ind$statistic),
+    p_value = as.numeric(mantel_ind$signif),
+    permutations = as.integer(mantel_ind$permutations),
+    n_individuals = nrow(indiv_tbl),
+    genotype_object = "gi",
+    genetic_distance_input = "poppr::prevosti.dist(gi)",
+    coordinate_source = "meta object (per-individual GPS)",
+    id_column = individual_coords$id_col,
+    latitude_column = individual_coords$lat_col,
+    longitude_column = individual_coords$lon_col,
+    interpretation_note = paste(
+      "Optional secondary analysis.",
+      "Unlike the primary site-level Mantel test, this individual-level analysis mixes within-site and among-site structure and should be interpreted cautiously."
+    ),
+    stringsAsFactors = FALSE
+  )
+  
+  ind_results_file <- file.path(TABLES_DIR, "individual_mantel_test_results.csv")
+  write.csv(ind_results, ind_results_file, row.names = FALSE)
+  cat("[11_isolation_by_distance] Saved optional individual Mantel results: ", ind_results_file, "\n", sep = "")
+  
+  invisible(NULL)
+}
+
 # ----------------------------
 # 1) Load genetic distance matrix (Jost's D)
 # ----------------------------
@@ -432,9 +751,16 @@ coord_build <- build_site_coordinates(meta)
 site_meta <- coord_build$coords
 coord_audit <- coord_build$audit
 
+assert_site_name_consistency(rownames(pairwise_jostD), site_meta$Site, "[11_isolation_by_distance]")
+assert_site_name_consistency(unique(as.character(df_ids_mll$Site)), site_meta$Site, "[11_isolation_by_distance]")
+
 audit_file <- file.path(TABLES_DIR, "site_coordinate_audit.csv")
 write.csv(coord_audit, audit_file, row.names = FALSE)
 cat("[11_isolation_by_distance] Saved coordinate audit: ", audit_file, "\n", sep = "")
+
+site_coord_file <- file.path(TABLES_DIR, "site_coordinates_clean.csv")
+write.csv(site_meta, site_coord_file, row.names = FALSE)
+cat("[11_isolation_by_distance] Saved clean site coordinates: ", site_coord_file, "\n", sep = "")
 
 # ----------------------------
 # 3) Align shared sites and build geographic distance matrix
@@ -456,12 +782,16 @@ shared_norm <- intersect(gen_sites_norm, meta_sites_norm)
 cat("[11_isolation_by_distance] Shared site count after normalization: ", length(shared_norm), "\n", sep = "")
 
 if (length(setdiff(gen_sites_norm, shared_norm)) > 0) {
-  cat("[11_isolation_by_distance] Dropping genetic-only normalized sites: ",
-      paste(setdiff(gen_sites_norm, shared_norm), collapse = ", "), "\n", sep = "")
+  warning(
+    "[11_isolation_by_distance] Dropping genetic-only normalized sites: ",
+    paste(setdiff(gen_sites_norm, shared_norm), collapse = ", ")
+  )
 }
 if (length(setdiff(meta_sites_norm, shared_norm)) > 0) {
-  cat("[11_isolation_by_distance] Dropping coordinate-only normalized sites: ",
-      paste(setdiff(meta_sites_norm, shared_norm), collapse = ", "), "\n", sep = "")
+  warning(
+    "[11_isolation_by_distance] Dropping coordinate-only normalized sites: ",
+    paste(setdiff(meta_sites_norm, shared_norm), collapse = ", ")
+  )
 }
 
 if (length(shared_norm) < 3) {
@@ -508,7 +838,7 @@ write.csv(geographic_km, geo_file, row.names = TRUE)
 cat("[11_isolation_by_distance] Saved geographic matrix: ", geo_file, "\n", sep = "")
 
 # ----------------------------
-# 4) Mantel test
+# 4) Mantel test (primary site-level analysis)
 # ----------------------------
 pairwise_jostD <- as.matrix(pairwise_jostD)
 geographic_km <- as.matrix(geographic_km)
@@ -553,6 +883,10 @@ mantel_results <- data.frame(
   site_column = coord_build$site_col,
   latitude_column = coord_build$lat_col,
   longitude_column = coord_build$lon_col,
+  interpretation_note = paste(
+    "Primary site-level IBD analysis.",
+    "Geographic distances are calculated among mean site centroids, not among individual tree coordinates."
+  ),
   stringsAsFactors = FALSE
 )
 
@@ -561,7 +895,7 @@ write.csv(mantel_results, mantel_file, row.names = FALSE)
 cat("[11_isolation_by_distance] Saved Mantel results: ", mantel_file, "\n", sep = "")
 
 # ----------------------------
-# 5) Export IBD points and plot
+# 5) Export IBD points and plot (primary site-level)
 # ----------------------------
 upper_idx <- upper.tri(pairwise_jostD)
 
@@ -591,7 +925,7 @@ ibd_plot <- ggplot(ibd_points, aes(Geographic_km, JostD)) +
   theme_bw(base_size = 12) +
   labs(
     title = "Isolation by distance",
-    subtitle = "Clone-corrected pairwise Jost's D by site versus geographic distance",
+    subtitle = "Primary analysis: clone-corrected pairwise Jost's D by site versus geographic distance among mean site centroids",
     x = "Geographic distance (km)",
     y = "Pairwise Jost's D"
   )
@@ -599,3 +933,14 @@ ibd_plot <- ggplot(ibd_points, aes(Geographic_km, JostD)) +
 ibd_plot_file <- file.path(FIGURES_DIR, "isolation_by_distance.jpeg")
 ggsave(ibd_plot_file, plot = ibd_plot, width = 8, height = 6, dpi = 320)
 cat("[11_isolation_by_distance] Saved figure: ", ibd_plot_file, "\n", sep = "")
+
+# ----------------------------
+# 6) OPTIONAL secondary individual-level IBD using per-individual GPS
+# ----------------------------
+individual_coords <- build_individual_coordinates(meta, df_ids)
+if (!is.null(individual_coords)) {
+  individual_audit_file <- file.path(TABLES_DIR, "individual_coordinate_audit.csv")
+  write.csv(individual_coords$audit, individual_audit_file, row.names = FALSE)
+  cat("[11_isolation_by_distance] Saved optional individual coordinate audit: ", individual_audit_file, "\n", sep = "")
+}
+run_individual_ibd_optional(individual_coords)

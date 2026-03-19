@@ -1,16 +1,36 @@
 # scripts/03_structure_all_plots_S2N_bySite.R
 ############################################################
 # STRUCTURE helper outputs (final individual barplots only)
+#
+# Biological rationale:
+# - STRUCTURE was run externally on the full microsatellite dataset (gi),
+#   not on the clone-corrected object, so this script is strictly a reader /
+#   plotting / interpretation-support layer for those external results.
+# - Ordering sites from south to north is used only to make geographic
+#   gradients easier to compare visually across K values.
+# - STRUCTURE cluster labels are arbitrary between analyses and across K
+#   (for example, Q1 is not inherently the "northern" cluster and Q2 is not
+#   inherently the "southern" cluster). Cluster interpretation must always be
+#   compared explicitly with geography and the other population-genetic results.
+#
+# This script IMPROVES readability while keeping the existing analysis intact:
 # - Reads externally generated STRUCTURE Q files
 # - Builds ONE final individual plot per K (no per-run figures)
 # - Builds ONE combined all-K figure
-# - Individuals ordered SOUTH -> NORTH by site latitude
-# - Plot data are validated immediately before each geom_col() call
+# - Computes mean latitude per site from metadata
+# - Orders sites strictly SOUTH -> NORTH by mean latitude
+# - Reorders individuals so they are grouped by site in that same order
+# - Adds separator lines and site labels for publication-ready readability
+# - Exports site-level mean Q summaries to support biological interpretation
+# - Optionally exports a cross-method site diagnostic summary
+#
 # Outputs:
 # - outputs/figures/structure_individual_barplot_K{K}.jpeg
 # - outputs/figures/structure_individual_barplot_allK.jpeg
 # - outputs/tables/supplementary/structure_run_inventory.csv
 # - outputs/tables/supplementary/structure_selected_runs.csv
+# - outputs/tables/structure_meanQ_by_site.csv
+# - outputs/tables/site_genetic_diagnostic_summary.csv (optional, best-effort)
 ############################################################
 
 suppressPackageStartupMessages({
@@ -21,7 +41,12 @@ suppressPackageStartupMessages({
 
 source("scripts/_load_objects.R")
 
-message("[03_structure] Preparing final STRUCTURE individual barplots...")
+message("[03_structure] Preparing final STRUCTURE individual barplots and interpretation-support outputs...")
+
+STRUCTURE_INTERPRETATION_NOTE <- paste(
+  "STRUCTURE cluster labels are arbitrary (for example, Q1 is not inherently north and Q2 is not inherently south).",
+  "Interpretation must be compared with geography, AMOVA grouping, DAPC, and differentiation metrics."
+)
 
 clamp01 <- function(x, tol = 1e-6) {
   x[x < 0 & x >= -tol] <- 0
@@ -39,6 +64,53 @@ fail_validation <- function(k, file_base, run_id, msg) {
     ),
     call. = FALSE
   )
+}
+
+normalize_site <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x <- gsub("\\s+", " ", x)
+  toupper(x)
+}
+
+coerce_numeric_warn <- function(x, column_name, context) {
+  raw <- trimws(as.character(x))
+  raw[raw == ""] <- NA_character_
+  raw <- gsub(",", ".", raw, fixed = TRUE)
+  out <- suppressWarnings(as.numeric(raw))
+  bad <- !is.na(raw) & is.na(out)
+  if (any(bad)) {
+    warning(
+      context,
+      " Non-numeric values detected in ", column_name,
+      "; affected rows will be excluded. Example values: ",
+      paste(head(unique(raw[bad]), 5), collapse = ", ")
+    )
+  }
+  out
+}
+
+assert_site_alignment <- function(reference_sites, candidate_sites, context) {
+  ref_norm <- unique(normalize_site(reference_sites))
+  cand_norm <- unique(normalize_site(candidate_sites))
+  missing_in_candidate <- setdiff(ref_norm, cand_norm)
+  extra_in_candidate <- setdiff(cand_norm, ref_norm)
+  
+  if (length(missing_in_candidate) > 0) {
+    warning(
+      context,
+      " Site names present in STRUCTURE-linked metadata but absent from the comparison object: ",
+      paste(head(missing_in_candidate, 10), collapse = ", ")
+    )
+  }
+  if (length(extra_in_candidate) > 0) {
+    message(
+      context,
+      " Extra site names present in comparison object but not required for plotting: ",
+      paste(head(extra_in_candidate, 10), collapse = ", ")
+    )
+  }
 }
 
 # ----------------------------
@@ -88,7 +160,6 @@ extract_structure_order_from_results <- function() {
     return(list(ids = character(0), pop = integer(0), source = "STRUCTURE results (empty)"))
   }
   
-  # use first K>=2 file if available
   b <- basename(files)
   k_vals <- suppressWarnings(as.integer(gsub(".*K([0-9]+).*", "\\1", b, perl = TRUE)))
   ord <- order(ifelse(is.na(k_vals) | k_vals < 2, Inf, k_vals), b)
@@ -123,12 +194,13 @@ ids_order_raw <- load_ids_order_from_raw()
 ids_results <- extract_structure_order_from_results()
 
 # ----------------------------
-# 2) Site latitude map (for SOUTH -> NORTH ordering)
+# 2) Site latitude map and south->north ordering
 # ----------------------------
-load_site_latitude <- function(meta_df) {
+resolve_site_latitude_table <- function(meta_df) {
   site_col <- resolve_col_ci(meta_df, c("site", "population", "pop"))
   lat_col <- resolve_col_ci(meta_df, c("latitude", "lat"))
   
+  source_name <- "meta object (outputs/v1/objects/meta.rds)"
   if (is.na(site_col) || is.na(lat_col)) {
     fallback <- file.path(PROJECT_ROOT, "inputs", "site_metadata.csv")
     if (!file.exists(fallback)) {
@@ -137,39 +209,96 @@ load_site_latitude <- function(meta_df) {
     meta_df <- read.csv(fallback, stringsAsFactors = FALSE, check.names = FALSE)
     site_col <- resolve_col_ci(meta_df, c("site", "population", "pop"))
     lat_col <- resolve_col_ci(meta_df, c("latitude", "lat"))
+    source_name <- fallback
     if (is.na(site_col) || is.na(lat_col)) {
       stop("[03_structure] site_metadata.csv must contain Site and Latitude columns.")
     }
   }
   
-  out <- data.frame(
-    Site = trimws(as.character(meta_df[[site_col]])),
-    Latitude = suppressWarnings(as.numeric(meta_df[[lat_col]])),
+  lat_num <- coerce_numeric_warn(meta_df[[lat_col]], lat_col, context = "[03_structure]")
+  site_chr <- trimws(as.character(meta_df[[site_col]]))
+  
+  if (any(!is.na(lat_num) & (lat_num < -90 | lat_num > 90))) {
+    bad_sites <- unique(site_chr[!is.na(lat_num) & (lat_num < -90 | lat_num > 90)])
+    warning(
+      "[03_structure] Latitude values outside [-90, 90] detected for site(s): ",
+      paste(head(bad_sites, 10), collapse = ", "),
+      ". These rows will be excluded from site-ordering calculations."
+    )
+    lat_num[lat_num < -90 | lat_num > 90] <- NA_real_
+  }
+  
+  raw_tbl <- data.frame(
+    Site = site_chr,
+    Latitude = lat_num,
     stringsAsFactors = FALSE
-  ) %>%
+  )
+  
+  missing_coord_rows <- sum(!nzchar(raw_tbl$Site) | is.na(raw_tbl$Latitude))
+  if (missing_coord_rows > 0) {
+    warning(
+      "[03_structure] ", missing_coord_rows,
+      " metadata row(s) have missing or invalid Site/Latitude values and will be excluded from site mean-latitude calculations."
+    )
+  }
+  
+  out <- raw_tbl %>%
     filter(nzchar(Site), !is.na(Latitude)) %>%
-    group_by(Site) %>%
-    summarise(Latitude = mean(Latitude, na.rm = TRUE), .groups = "drop")
+    mutate(Site_norm = normalize_site(Site)) %>%
+    group_by(Site_norm) %>%
+    summarise(
+      Site = dplyr::first(Site),
+      mean_latitude = mean(Latitude, na.rm = TRUE),
+      n_records = n(),
+      .groups = "drop"
+    ) %>%
+    arrange(mean_latitude, Site)
   
   if (nrow(out) == 0) stop("[03_structure] No valid site latitude information available.")
-  setNames(out$Latitude, out$Site)
+  out$latitude_source <- source_name
+  out
 }
 
-site_lat_map <- load_site_latitude(meta)
+site_lat_tbl <- resolve_site_latitude_table(meta)
+site_lat_map <- setNames(site_lat_tbl$mean_latitude, site_lat_tbl$Site)
+site_lat_map_norm <- setNames(site_lat_tbl$mean_latitude, site_lat_tbl$Site_norm)
 
-build_base_order <- function(ids_vec, site_map_final) {
+build_base_order <- function(ids_vec, site_map_final, site_lat_tbl) {
   out <- data.frame(
     Individual = ids_vec,
     Site = site_map_final[normalize_id(ids_vec)],
     stringsAsFactors = FALSE
   )
-  out$SiteLat <- as.numeric(site_lat_map[out$Site])
+  
+  out$Site_norm <- normalize_site(out$Site)
+  out$SiteLat <- as.numeric(site_lat_tbl$mean_latitude[match(out$Site_norm, site_lat_tbl$Site_norm)])
+  out$SiteOrder <- match(out$Site_norm, site_lat_tbl$Site_norm)
+  
+  missing_site_label <- sum(is.na(out$Site) | !nzchar(out$Site))
+  if (missing_site_label > 0) {
+    warning(
+      "[03_structure] ", missing_site_label,
+      " individual(s) could not be assigned to a site from df_ids / STRUCTURE metadata. They will be plotted in an 'Unknown' block after ordered sites."
+    )
+  }
+  
+  missing_site_lat <- sum(!is.na(out$Site) & nzchar(out$Site) & is.na(out$SiteLat))
+  if (missing_site_lat > 0) {
+    warning(
+      "[03_structure] ", missing_site_lat,
+      " individual(s) belong to site(s) without valid mean latitude. Those sites will be plotted after fully ordered south->north sites."
+    )
+  }
+  
   out <- out %>%
     mutate(
-      Site = as.character(Site),
-      SiteLat = ifelse(is.na(SiteLat), Inf, SiteLat)
+      Site = ifelse(is.na(Site) | !nzchar(Site), "Unknown", Site),
+      Site_norm = ifelse(Site == "Unknown", "UNKNOWN", Site_norm),
+      SiteLat = ifelse(is.na(SiteLat), Inf, SiteLat),
+      SiteOrder = ifelse(is.na(SiteOrder), Inf, SiteOrder)
     ) %>%
-    arrange(SiteLat, Site, Individual)
+    arrange(SiteOrder, SiteLat, Site, Individual)
+  
   out$PlotIndex <- seq_len(nrow(out))
   out
 }
@@ -506,6 +635,109 @@ validate_plotting_df <- function(plot_df, y_col = "Q", context = "", tol = 1e-6,
   plot_df
 }
 
+build_structure_mean_q_table <- function(per_k_q_list, site_summary_tbl) {
+  if (length(per_k_q_list) == 0) {
+    return(data.frame())
+  }
+  
+  out <- bind_rows(lapply(per_k_q_list, function(x) {
+    q_df <- x$q_df
+    q_cols <- x$q_cols
+    q_df %>%
+      select(Site, SiteLat, all_of(q_cols)) %>%
+      group_by(Site, SiteLat) %>%
+      summarise(across(all_of(q_cols), ~mean(.x, na.rm = TRUE), .names = "mean_{.col}"), .groups = "drop") %>%
+      mutate(K = x$K)
+  })) %>%
+    rename(mean_latitude = SiteLat) %>%
+    mutate(mean_latitude = ifelse(is.infinite(mean_latitude), NA_real_, mean_latitude)) %>%
+    mutate(site_order_south_to_north = match(normalize_site(Site), site_summary_tbl$Site_norm)) %>%
+    relocate(K, site_order_south_to_north, Site, mean_latitude)
+  
+  out$interpretation_note <- STRUCTURE_INTERPRETATION_NOTE
+  out %>% arrange(K, site_order_south_to_north, Site)
+}
+
+build_optional_site_diagnostic <- function(site_summary_tbl, structure_mean_q) {
+  amova_path <- file.path(TABLES_DIR, "amova_site_region_groups.csv")
+  dapc_centroids_path <- file.path(TABLES_DIR, "dapc_group_centroids.csv")
+  jost_path <- file.path(MATRICES_DIR, "pairwise_jostD.csv")
+  
+  missing_inputs <- c(
+    if (!file.exists(amova_path)) "amova_site_region_groups.csv" else character(0),
+    if (!file.exists(dapc_centroids_path)) "dapc_group_centroids.csv" else character(0),
+    if (!file.exists(jost_path)) "pairwise_jostD.csv" else character(0)
+  )
+  
+  if (length(missing_inputs) > 0) {
+    warning(
+      "[03_structure] Optional site genetic diagnostic summary will be skipped because required input(s) are missing: ",
+      paste(missing_inputs, collapse = ", ")
+    )
+    return(NULL)
+  }
+  
+  amova_tbl <- read.csv(amova_path, stringsAsFactors = FALSE, check.names = FALSE)
+  if (!all(c("Site", "Region") %in% names(amova_tbl))) {
+    warning("[03_structure] Optional diagnostic summary skipped: amova_site_region_groups.csv lacks required Site/Region columns.")
+    return(NULL)
+  }
+  
+  dapc_tbl <- read.csv(dapc_centroids_path, stringsAsFactors = FALSE, check.names = FALSE)
+  required_dapc_cols <- c("Site", "LD1_centroid", "LD2_centroid")
+  if (!all(required_dapc_cols %in% names(dapc_tbl))) {
+    warning("[03_structure] Optional diagnostic summary skipped: dapc_group_centroids.csv lacks required centroid columns.")
+    return(NULL)
+  }
+  
+  jost_df <- read.csv(jost_path, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
+  jost_mat <- as.matrix(jost_df)
+  suppressWarnings(storage.mode(jost_mat) <- "numeric")
+  if (!is.matrix(jost_mat) || nrow(jost_mat) != ncol(jost_mat)) {
+    warning("[03_structure] Optional diagnostic summary skipped: pairwise_jostD.csv is not a square numeric matrix.")
+    return(NULL)
+  }
+  
+  mean_jost <- data.frame(
+    Site = rownames(jost_mat),
+    mean_pairwise_JostD_to_other_sites = apply(jost_mat, 1, function(x) {
+      x <- as.numeric(x)
+      mean(x[is.finite(x) & x != 0], na.rm = TRUE)
+    }),
+    stringsAsFactors = FALSE
+  )
+  
+  assert_site_alignment(site_summary_tbl$Site, amova_tbl$Site, "[03_structure diagnostic]")
+  assert_site_alignment(site_summary_tbl$Site, dapc_tbl$Site, "[03_structure diagnostic]")
+  assert_site_alignment(site_summary_tbl$Site, rownames(jost_mat), "[03_structure diagnostic]")
+  
+  structure_wide <- structure_mean_q %>%
+    select(-interpretation_note) %>%
+    pivot_longer(
+      cols = starts_with("mean_Q"),
+      names_to = "cluster",
+      values_to = "mean_q"
+    ) %>%
+    mutate(cluster = paste0("K", K, "_", cluster)) %>%
+    select(-K) %>%
+    pivot_wider(names_from = cluster, values_from = mean_q)
+  
+  out <- site_summary_tbl %>%
+    transmute(
+      site_order_south_to_north = site_order_south_to_north,
+      Site = Site,
+      mean_latitude = mean_latitude
+    ) %>%
+    left_join(amova_tbl %>% select(Site, Region), by = "Site") %>%
+    left_join(structure_wide, by = c("Site", "site_order_south_to_north")) %>%
+    left_join(dapc_tbl %>% select(Site, LD1_centroid, LD2_centroid), by = "Site") %>%
+    left_join(mean_jost, by = "Site") %>%
+    arrange(site_order_south_to_north, Site)
+  
+  out$interpretation_note <- STRUCTURE_INTERPRETATION_NOTE
+  out
+}
+
 # ----------------------------
 # 5) Parse all runs and choose ONE final run per K
 # ----------------------------
@@ -606,7 +838,6 @@ if (length(scan$files) == 0) {
     }
     q_n <- row_counts[1]
     
-    # choose reference source with exact match to parsed Q row count
     ref_candidates <- list(
       list(name = ids_order_raw$source, ids = ids_order_raw$ids),
       list(name = ids_results$source, ids = unique(ids_results$ids)),
@@ -623,13 +854,11 @@ if (length(scan$files) == 0) {
            ". Check ids_order_from_raw.csv and STRUCTURE input export order.")
     }
     
-    # preference order already encoded above: raw IDs -> results labels -> df_ids
     ref_pick <- idx_match[1]
     id_reference <- ref_candidates[[ref_pick]]$ids
     ref_source_used <- ref_candidates[[ref_pick]]$name
     message("[03_structure] Using reference ID source: ", ref_source_used, " (n=", length(id_reference), ")")
     
-    # diagnose mismatch vs df_ids
     missing_in_df <- setdiff(normalize_id(id_reference), normalize_id(ids_dfids))
     extra_in_df <- setdiff(normalize_id(ids_dfids), normalize_id(id_reference))
     if (length(missing_in_df) > 0 || length(extra_in_df) > 0) {
@@ -640,7 +869,6 @@ if (length(scan$files) == 0) {
               ifelse(length(extra_in_df) > 0, paste0(" (e.g., ", paste(head(extra_in_df, 5), collapse = ", "), ")"), ""))
     }
     
-    # build best-available site map for all reference IDs
     site_map_final <- site_map_dfids
     missing_site_before <- sum(is.na(site_map_final[normalize_id(id_reference)]))
     
@@ -681,29 +909,49 @@ if (length(scan$files) == 0) {
               " (these are kept as unmatched and plotted in 'Unknown').")
     }
     
-    base_order_df <- build_base_order(id_reference, site_map_final)
+    base_order_df <- build_base_order(id_reference, site_map_final, site_lat_tbl)
     if (nrow(base_order_df) != q_n) {
       stop("[03_structure] Internal alignment error: reference order n=", nrow(base_order_df), " but parsed Q n=", q_n)
     }
     
-    missing_site_n <- sum(is.na(base_order_df$Site))
-    if (missing_site_n > 0) {
-      warning("[03_structure] ", missing_site_n,
-              " individuals have missing Site labels after site-map recovery; they will be plotted at end.")
-    }
+    site_blocks <- base_order_df %>%
+      group_by(Site) %>%
+      summarise(
+        n = n(),
+        SiteLat = dplyr::first(SiteLat),
+        SiteOrder = dplyr::first(SiteOrder),
+        .groups = "drop"
+      ) %>%
+      arrange(SiteOrder, SiteLat, Site) %>%
+      mutate(
+        xmin = cumsum(dplyr::lag(n, default = 0)) + 0.5,
+        xmax = cumsum(n) + 0.5,
+        xmid = (xmin + xmax) / 2
+      )
+    
+    final_site_order <- site_blocks$Site
+    message("[03_structure] Final ordered site list (south -> north for sites with valid latitude):")
+    message("[03_structure] ", paste(final_site_order, collapse = " -> "))
+    
+    site_summary_tbl <- site_blocks %>%
+      transmute(
+        site_order_south_to_north = seq_len(n()),
+        Site = Site,
+        Site_norm = normalize_site(Site),
+        mean_latitude = ifelse(is.infinite(SiteLat), NA_real_, SiteLat),
+        n_individuals = n
+      )
+    
+    assert_site_alignment(site_summary_tbl$Site, unique(as.character(df_ids_mll$Site)), "[03_structure]")
+    
+    separators <- site_blocks$xmax[-nrow(site_blocks)]
+    k_levels <- sort(unique(as.integer(names(split(parsed_runs, sapply(parsed_runs, function(x) x$K))))))
     
     runs_by_k <- split(parsed_runs, sapply(parsed_runs, function(x) x$K))
     selected_rows <- list()
     allk_plot_data <- list()
     validations_passed <- 0L
-    
-    site_blocks <- base_order_df %>%
-      mutate(Site = ifelse(is.na(Site), "Unknown", Site)) %>%
-      count(Site, name = "n") %>%
-      mutate(xmax = cumsum(n), xmin = xmax - n + 1, xmid = (xmin + xmax) / 2)
-    separators <- site_blocks$xmax[-nrow(site_blocks)] + 0.5
-    
-    k_levels <- sort(unique(as.integer(names(runs_by_k))))
+    per_k_q_for_summary <- list()
     
     for (k_name in names(runs_by_k)) {
       k_runs <- runs_by_k[[k_name]]
@@ -729,6 +977,7 @@ if (length(scan$files) == 0) {
               " (run=", ifelse(is.na(best$run), "NA", best$run),
               ", reader=", best$reader,
               ", mean|rowSum-1|=", signif(best$mad, 4), ")")
+      message("[03_structure] Reminder for K=", k_num, ": ", STRUCTURE_INTERPRETATION_NOTE)
       
       q_df <- cbind(base_order_df, as.data.frame(best$q, stringsAsFactors = FALSE, check.names = FALSE))
       q_cols <- grep("^Q", names(q_df), value = TRUE)
@@ -745,8 +994,9 @@ if (length(scan$files) == 0) {
         renormalize_rows = TRUE
       )
       
+      per_k_q_for_summary[[length(per_k_q_for_summary) + 1]] <- list(K = k_num, q_df = q_df, q_cols = q_cols)
+      
       plot_df <- q_df %>%
-        mutate(Site = ifelse(is.na(Site), "Unknown", Site)) %>%
         select(PlotIndex, Site, all_of(q_cols)) %>%
         pivot_longer(cols = all_of(q_cols), names_to = "Cluster", values_to = "Q")
       
@@ -765,7 +1015,11 @@ if (length(scan$files) == 0) {
       p <- ggplot(plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
-        scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
+        scale_x_continuous(
+          breaks = site_blocks$xmid,
+          labels = site_blocks$Site,
+          expand = c(0, 0)
+        ) +
         scale_y_continuous(expand = c(0, 0)) +
         coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
         theme_bw(base_size = 11) +
@@ -778,13 +1032,16 @@ if (length(scan$files) == 0) {
         ) +
         labs(
           title = sprintf("STRUCTURE ancestry barplot (K=%d)", k_num),
-          subtitle = "Individuals ordered south to north by site latitude",
+          subtitle = paste(
+            "Individuals grouped by site; sites ordered left-to-right from south to north by mean site latitude.",
+            STRUCTURE_INTERPRETATION_NOTE
+          ),
           x = "Site blocks (south -> north)",
           y = "Ancestry proportion"
         )
       
       out_fig <- file.path(FIGURES_DIR, sprintf("structure_individual_barplot_K%d.jpeg", k_num))
-      ggsave(out_fig, p, width = 13, height = 5.5, dpi = 320)
+      ggsave(out_fig, p, width = 13.5, height = 5.8, dpi = 320)
       message("[03_structure] Saved: ", out_fig)
       
       selected_rows[[length(selected_rows) + 1]] <- data.frame(
@@ -796,6 +1053,7 @@ if (length(scan$files) == 0) {
         mean_abs_row_sum_deviation = best$mad,
         n_runs_available = length(k_runs),
         method = "best_single_run_no_cluster_relabeling",
+        interpretation_note = STRUCTURE_INTERPRETATION_NOTE,
         stringsAsFactors = FALSE
       )
       
@@ -817,7 +1075,11 @@ if (length(scan$files) == 0) {
       p_all <- ggplot(combined_plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
-        scale_x_continuous(breaks = site_blocks$xmid, labels = site_blocks$Site, expand = c(0, 0)) +
+        scale_x_continuous(
+          breaks = site_blocks$xmid,
+          labels = site_blocks$Site,
+          expand = c(0, 0)
+        ) +
         scale_y_continuous(expand = c(0, 0)) +
         coord_cartesian(ylim = c(0, 1), expand = FALSE, clip = "on") +
         facet_grid(rows = vars(KLabel)) +
@@ -831,13 +1093,16 @@ if (length(scan$files) == 0) {
         ) +
         labs(
           title = "STRUCTURE ancestry barplots across K",
-          subtitle = "Individuals ordered south to north by site latitude",
+          subtitle = paste(
+            "The same individual and site order is used for every K so spatial comparisons are direct.",
+            STRUCTURE_INTERPRETATION_NOTE
+          ),
           x = "Site blocks (south -> north)",
           y = "Ancestry proportion"
         )
       
       out_all <- file.path(FIGURES_DIR, "structure_individual_barplot_allK.jpeg")
-      ggsave(out_all, p_all, width = 13, height = max(5.5, 2.2 * length(unique(combined_plot_df$K))), dpi = 320)
+      ggsave(out_all, p_all, width = 13.5, height = max(5.8, 2.3 * length(unique(combined_plot_df$K))), dpi = 320)
       message("[03_structure] Saved: ", out_all)
     }
     
@@ -848,9 +1113,26 @@ if (length(scan$files) == 0) {
       message("[03_structure] Saved selected-run summary: ", selected_file)
     }
     
+    structure_mean_q <- build_structure_mean_q_table(per_k_q_for_summary, site_summary_tbl)
+    if (nrow(structure_mean_q) > 0) {
+      mean_q_file <- file.path(TABLES_DIR, "structure_meanQ_by_site.csv")
+      write.csv(structure_mean_q, mean_q_file, row.names = FALSE)
+      message("[03_structure] Saved site-level mean Q summary: ", mean_q_file)
+    } else {
+      warning("[03_structure] structure_meanQ_by_site.csv was not written because no per-K Q summaries were available.")
+    }
+    
+    site_diag <- build_optional_site_diagnostic(site_summary_tbl, structure_mean_q)
+    if (!is.null(site_diag) && nrow(site_diag) > 0) {
+      diag_file <- file.path(TABLES_DIR, "site_genetic_diagnostic_summary.csv")
+      write.csv(site_diag, diag_file, row.names = FALSE)
+      message("[03_structure] Saved optional site genetic diagnostic summary: ", diag_file)
+    }
+    
     message("[03_structure] Validation summary: all K plots passed validation (", validations_passed, " K values).")
     message("[03_structure] Validation summary: plotting data verified finite and within [0,1] before each geom_col call.")
     message("[03_structure] Validation summary: combined figure built successfully.")
+    message("[03_structure] Interpretation reminder: ", STRUCTURE_INTERPRETATION_NOTE)
     message("[03_structure] Done.")
   }
 }

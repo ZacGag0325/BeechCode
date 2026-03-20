@@ -13,6 +13,8 @@
 #
 # Microsatellite clone-correction policy:
 # - gi = full dataset for clonality and individual-level diagnostics.
+#   Individuals with >35% missing allele data are removed from gi immediately
+#   after import and before any clone detection or downstream analysis.
 # - gi_mll = clone-corrected dataset based on MLLs defined from Bruvo distance.
 # - Exact MLG assignments are retained alongside MLL assignments in df_ids.
 ############################################################
@@ -24,6 +26,7 @@ suppressPackageStartupMessages({
 
 BRUVO_MLL_THRESHOLD <- 0.09
 BRUVO_ALGORITHM <- "farthest_neighbor"
+MISSING_ALLELE_FILTER_THRESHOLD <- 0.35
 
 find_project_root <- function() {
   candidates <- c(getwd(), normalizePath(file.path(getwd(), ".."), mustWork = FALSE))
@@ -47,7 +50,9 @@ PROJECT_ROOT <- find_project_root()
 setwd(PROJECT_ROOT)
 
 OBJ_DIR <- file.path(PROJECT_ROOT, "outputs", "v1", "objects")
+TABLES_SUPP_DIR <- file.path(PROJECT_ROOT, "outputs", "tables", "supplementary")
 dir.create(OBJ_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLES_SUPP_DIR, recursive = TRUE, showWarnings = FALSE)
 
 resolve_col <- function(df, choices) {
   nms <- names(df)
@@ -343,6 +348,11 @@ build_genind_from_table <- function(tbl, table_summary, canonical_ids_norm, id_t
     stop("[00_master_pipeline] No genotype rows matched canonical metadata IDs.")
   }
   
+  paired_loci_n <- length(paired_loci)
+  if (paired_loci_n == 0) {
+    stop("[00_master_pipeline] No paired microsatellite loci were available to build the genind object.")
+  }
+  
   dup <- duplicated(ids_norm)
   n_dups <- sum(dup)
   if (n_dups > 0) {
@@ -353,6 +363,12 @@ build_genind_from_table <- function(tbl, table_summary, canonical_ids_norm, id_t
     ids_raw <- ids_raw[keep_first]
     ids_norm <- ids_norm[keep_first]
   }
+  
+  missingness_tbl <- calculate_individual_missingness(
+    tbl = tbl,
+    table_summary = table_summary,
+    ids_raw = ids_raw
+  )
   
   locus_pattern <- function(loc, suffix) {
     paste0("^", gsub("([\\W])", "\\\\\\1", loc, perl = TRUE), "(_|\\\\.)", suffix, "$")
@@ -389,6 +405,7 @@ build_genind_from_table <- function(tbl, table_summary, canonical_ids_norm, id_t
   
   list(
     gi = gi,
+    missingness = missingness_tbl,
     id_col = id_col,
     pop_col = pop_col,
     diagnostics = list(
@@ -398,6 +415,142 @@ build_genind_from_table <- function(tbl, table_summary, canonical_ids_norm, id_t
       n_excluded = n_excluded,
       excluded_examples = head(excluded_examples, 20)
     )
+  )
+}
+
+calculate_individual_missingness <- function(tbl, table_summary, ids_raw) {
+  paired_loci <- table_summary$paired_loci
+  if (length(paired_loci) == 0) {
+    stop("[00_master_pipeline] Cannot calculate individual missingness: no paired loci were detected.")
+  }
+  
+  n_ind <- nrow(tbl)
+  total_alleles_expected <- 2L * length(paired_loci)
+  missing_allele_count <- integer(n_ind)
+  missing_locus_count <- integer(n_ind)
+  nms <- names(tbl)
+  
+  locus_pattern <- function(loc, suffix) {
+    paste0("^", gsub("([\\W])", "\\\\\\1", loc, perl = TRUE), "(_|\\\\.)", suffix, "$")
+  }
+  
+  is_missing_allele <- function(x) {
+    x_chr <- trimws(as.character(x))
+    is.na(x) | !nzchar(x_chr) | tolower(x_chr) %in% c("na", "n/a", "null", ".", "-", "?")
+  }
+  
+  for (loc in paired_loci) {
+    c1 <- nms[grep(locus_pattern(loc, "1"), nms, perl = TRUE)][1]
+    c2 <- nms[grep(locus_pattern(loc, "2"), nms, perl = TRUE)][1]
+    if (is.na(c1) || is.na(c2)) {
+      stop("[00_master_pipeline] Could not resolve allele columns for locus: ", loc)
+    }
+    m1 <- is_missing_allele(tbl[[c1]])
+    m2 <- is_missing_allele(tbl[[c2]])
+    missing_allele_count <- missing_allele_count + as.integer(m1) + as.integer(m2)
+    missing_locus_count <- missing_locus_count + as.integer(m1 | m2)
+  }
+  
+  data.frame(
+    ind_id = ids_raw,
+    missing_allele_count = missing_allele_count,
+    total_alleles_expected = total_alleles_expected,
+    percent_missing = missing_allele_count / total_alleles_expected,
+    missing_locus_count = missing_locus_count,
+    total_loci = length(paired_loci),
+    stringsAsFactors = FALSE
+  )
+}
+
+apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_ALLELE_FILTER_THRESHOLD, output_dir = TABLES_SUPP_DIR) {
+  if (!inherits(gi, "genind")) {
+    stop("[00_master_pipeline] Missing-data filter expects a genind object.")
+  }
+  if (!is.data.frame(missingness_tbl) || nrow(missingness_tbl) != adegenet::nInd(gi)) {
+    stop("[00_master_pipeline] Missingness table must be a data.frame aligned to all individuals in gi.")
+  }
+  required_cols <- c("ind_id", "percent_missing", "missing_allele_count", "total_alleles_expected")
+  if (!all(required_cols %in% names(missingness_tbl))) {
+    stop("[00_master_pipeline] Missingness table is missing required columns: ",
+         paste(setdiff(required_cols, names(missingness_tbl)), collapse = ", "))
+  }
+  
+  gi_ids <- adegenet::indNames(gi)
+  idx <- match(normalize_id(gi_ids), normalize_id(missingness_tbl$ind_id))
+  if (any(is.na(idx))) {
+    stop("[00_master_pipeline] Could not align missingness table to gi. Example missing IDs: ",
+         paste(head(gi_ids[is.na(idx)], 10), collapse = ", "))
+  }
+  missingness_tbl <- missingness_tbl[idx, , drop = FALSE]
+  if (!all(normalize_id(gi_ids) == normalize_id(missingness_tbl$ind_id))) {
+    stop("[00_master_pipeline] Missingness table order does not match gi individual order after alignment.")
+  }
+  if (any(!is.finite(missingness_tbl$percent_missing))) {
+    stop("[00_master_pipeline] Non-finite per-individual missing-data proportions detected.")
+  }
+  
+  remove_idx <- missingness_tbl$percent_missing > threshold
+  retained_n <- sum(!remove_idx)
+  removed_n <- sum(remove_idx)
+  
+  if (retained_n == 0) {
+    stop(
+      "[00_master_pipeline] Missing-data filter would remove all individuals at threshold > ",
+      sprintf("%.1f%%", threshold * 100),
+      ". Check genotype import and missing-data coding before continuing."
+    )
+  }
+  
+  removed_tbl <- data.frame(
+    individual_id = missingness_tbl$ind_id[remove_idx],
+    site = as.character(adegenet::pop(gi))[remove_idx],
+    percent_missing = round(missingness_tbl$percent_missing[remove_idx] * 100, 2),
+    removed_threshold = threshold * 100,
+    stringsAsFactors = FALSE
+  )
+  removed_tbl <- removed_tbl[order(-removed_tbl$percent_missing, removed_tbl$site, removed_tbl$individual_id), , drop = FALSE]
+  
+  removed_file <- file.path(output_dir, "individuals_removed_missing_gt35pct_allele_data.csv")
+  write.csv(removed_tbl, removed_file, row.names = FALSE)
+  
+  cat("[00_master_pipeline] Missing-data filter (>35% missing allele data; applied before clonality):\n")
+  cat("[00_master_pipeline] Individuals before filtering: ", adegenet::nInd(gi), "\n", sep = "")
+  cat("[00_master_pipeline] Individuals removed: ", removed_n, "\n", sep = "")
+  cat("[00_master_pipeline] Individuals retained: ", retained_n, "\n", sep = "")
+  if (removed_n > 0) {
+    removed_lines <- paste0(
+      removed_tbl$individual_id,
+      " (Site=", removed_tbl$site,
+      ", Missing=", sprintf("%.2f", removed_tbl$percent_missing), "%)"
+    )
+    cat("[00_master_pipeline] IDs removed: ", paste(removed_tbl$individual_id, collapse = ", "), "\n", sep = "")
+    cat("[00_master_pipeline] Removed individual missingness: ", paste(removed_lines, collapse = "; "), "\n", sep = "")
+  } else {
+    cat("[00_master_pipeline] IDs removed: none\n")
+  }
+  cat("[00_master_pipeline] Removed-individual table saved to: ", removed_file, "\n", sep = "")
+  
+  gi_filtered <- gi[!remove_idx, , drop = TRUE]
+  if (adegenet::nInd(gi_filtered) != retained_n) {
+    stop("[00_master_pipeline] Filtered gi size does not match retained-individual count.")
+  }
+  if (!all(adegenet::indNames(gi_filtered) == missingness_tbl$ind_id[!remove_idx])) {
+    stop("[00_master_pipeline] Filtered gi IDs are inconsistent with the retained missingness table.")
+  }
+  
+  retained_tbl <- missingness_tbl[!remove_idx, , drop = FALSE]
+  rownames(retained_tbl) <- NULL
+  
+  list(
+    gi = gi_filtered,
+    retained_missingness = retained_tbl,
+    removed_missingness = removed_tbl,
+    removed_ids = removed_tbl$individual_id,
+    threshold = threshold,
+    output_file = removed_file,
+    n_before = adegenet::nInd(gi),
+    n_removed = removed_n,
+    n_retained = retained_n
   )
 }
 
@@ -464,18 +617,46 @@ build_objects <- function() {
     canonical_ids_norm = canonical_ids_norm,
     id_to_site = id_to_site
   )
-  gi <- built$gi
+  gi_unfiltered <- built$gi
+  gi_unfiltered_ids <- adegenet::indNames(gi_unfiltered)
+  gi_unfiltered_ids_norm <- normalize_id(gi_unfiltered_ids)
+  missing_in_gi_before_filter <- canonical_ids[!(canonical_ids_norm %in% gi_unfiltered_ids_norm)]
+  
+  # Publication-defensible QC step:
+  # calculate per-individual missingness from the original paired allele
+  # columns (2 alleles per locus), then remove only those individuals whose
+  # missing allele proportion is strictly greater than 35% before clonality.
+  missing_filter <- apply_missing_data_filter(
+    gi = gi_unfiltered,
+    missingness_tbl = built$missingness,
+    threshold = MISSING_ALLELE_FILTER_THRESHOLD,
+    output_dir = TABLES_SUPP_DIR
+  )
+  gi <- missing_filter$gi
   
   mll_build <- build_mll_clone_corrected_object(gi)
   gi_mll <- mll_build$gi_mll
   
   gi_ids <- adegenet::indNames(gi)
   gi_ids_norm <- normalize_id(gi_ids)
-  missing_in_gi <- canonical_ids[!(canonical_ids_norm %in% gi_ids_norm)]
+  missing_in_gi_after_filter <- canonical_ids[!(canonical_ids_norm %in% gi_ids_norm)]
+  retained_missingness <- missing_filter$retained_missingness
+  match_idx <- match(gi_ids_norm, normalize_id(retained_missingness$ind_id))
+  if (any(is.na(match_idx))) {
+    stop("[00_master_pipeline] Failed to align retained missingness metrics to filtered gi IDs.")
+  }
+  retained_missingness <- retained_missingness[match_idx, , drop = FALSE]
+  if (!all(normalize_id(retained_missingness$ind_id) == gi_ids_norm)) {
+    stop("[00_master_pipeline] Retained missingness metrics are not in the same order as filtered gi IDs.")
+  }
   
   df_ids <- data.frame(
     ind_id = gi_ids,
     Site = as.character(adegenet::pop(gi)),
+    missing_allele_count = retained_missingness$missing_allele_count,
+    total_alleles_expected = retained_missingness$total_alleles_expected,
+    percent_missing_allele_data = retained_missingness$percent_missing,
+    missing_data_filter_threshold = missing_filter$threshold,
     MLG = mll_build$mlg_labels,
     MLL = mll_build$mll_labels,
     Bruvo_MLL_threshold = mll_build$threshold,
@@ -486,23 +667,30 @@ build_objects <- function() {
   message("[00_master_pipeline] Number of raw genotype IDs: ", built$diagnostics$n_raw_ids,
           " (unique normalized: ", built$diagnostics$n_unique_raw_ids, ")")
   message("[00_master_pipeline] Number of metadata IDs: ", length(canonical_ids))
-  message("[00_master_pipeline] Number matched: ", built$diagnostics$n_matched)
+  message("[00_master_pipeline] Number matched before missing-data filtering: ", built$diagnostics$n_matched)
   message("[00_master_pipeline] Number excluded (outside canonical metadata universe): ", built$diagnostics$n_excluded)
   if (built$diagnostics$n_excluded > 0) {
     message("[00_master_pipeline] Excluded genotype ID examples (up to 20): ",
             paste(built$diagnostics$excluded_examples, collapse = ", "))
   }
-  message("[00_master_pipeline] Canonical metadata IDs missing genotype rows: ", length(missing_in_gi))
-  if (length(missing_in_gi) > 0) {
-    message("[00_master_pipeline] Missing genotype ID examples (up to 20): ",
-            paste(head(missing_in_gi, 20), collapse = ", "))
+  message("[00_master_pipeline] Canonical metadata IDs missing genotype rows before missing-data filtering: ", length(missing_in_gi_before_filter))
+  if (length(missing_in_gi_before_filter) > 0) {
+    message("[00_master_pipeline] Missing genotype ID examples before filtering (up to 20): ",
+            paste(head(missing_in_gi_before_filter, 20), collapse = ", "))
+  }
+  message("[00_master_pipeline] Individuals removed for >", MISSING_ALLELE_FILTER_THRESHOLD * 100,
+          "% missing allele data: ", missing_filter$n_removed)
+  message("[00_master_pipeline] Canonical metadata IDs absent from final filtered gi: ", length(missing_in_gi_after_filter))
+  if (length(missing_in_gi_after_filter) > 0) {
+    message("[00_master_pipeline] Final absent ID examples (up to 20): ",
+            paste(head(missing_in_gi_after_filter, 20), collapse = ", "))
   }
   cat("[00_master_pipeline] Bruvo MLL threshold: ", BRUVO_MLL_THRESHOLD, "\n", sep = "")
   cat("[00_master_pipeline] Bruvo clustering algorithm: ", BRUVO_ALGORITHM, "\n", sep = "")
   cat("[00_master_pipeline] Number of unique MLGs: ", mll_build$n_mlg, "\n", sep = "")
   cat("[00_master_pipeline] Number of unique MLLs: ", mll_build$n_mll, "\n", sep = "")
   cat("[00_master_pipeline] Number of clones (nInd - unique MLL): ", mll_build$n_clonal_repeats, "\n", sep = "")
-  cat("[00_master_pipeline] Confirmed df_ids contains columns: ind_id, Site, MLG, MLL\n", sep = "")
+  cat("[00_master_pipeline] Confirmed df_ids contains columns: ind_id, Site, missing_allele_count, total_alleles_expected, percent_missing_allele_data, MLG, MLL\n", sep = "")
   
   saveRDS(gi, file.path(OBJ_DIR, "gi.rds"))
   saveRDS(gi_mll, file.path(OBJ_DIR, "gi_mll.rds"))

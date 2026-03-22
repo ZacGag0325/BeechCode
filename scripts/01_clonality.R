@@ -116,6 +116,132 @@ recover_or_recompute_clonality_columns <- function(df_ids_tbl, gi, gi_mll) {
   out
 }
 
+make_clone_group_table <- function(assignments_df, clone_col, individual_col = "Individual", site_col = "Site") {
+  clone_label <- rlang::sym(clone_col)
+  individual_label <- rlang::sym(individual_col)
+  has_site <- site_col %in% names(assignments_df)
+  
+  repeated_groups <- assignments_df %>%
+    filter(!is.na(!!clone_label)) %>%
+    group_by(!!clone_label) %>%
+    mutate(Group_Size = dplyr::n()) %>%
+    ungroup() %>%
+    filter(Group_Size > 1) %>%
+    arrange(!!clone_label, !!individual_label)
+  
+  if (!has_site) {
+    repeated_groups[[site_col]] <- NA_character_
+  }
+  
+  repeated_groups
+}
+
+print_separator <- function(char = "=", width = 72) {
+  cat(paste(rep(char, width), collapse = ""), "\n", sep = "")
+}
+
+print_clone_summary_block <- function(repeated_groups, clone_col, site_available, title) {
+  cat("\n")
+  print_separator("-", 72)
+  cat(title, "\n")
+  print_separator("-", 72)
+  
+  if (nrow(repeated_groups) == 0) {
+    cat("No repeated ", clone_col, " groups detected.\n", sep = "")
+    return(invisible(NULL))
+  }
+  
+  split_groups <- split(repeated_groups, repeated_groups[[clone_col]])
+  
+  for (group_name in names(split_groups)) {
+    grp <- split_groups[[group_name]]
+    cat("\n")
+    cat("* ", clone_col, ": ", group_name, "\n", sep = "")
+    cat("  Number of individuals: ", nrow(grp), "\n", sep = "")
+    cat("  Individuals:\n")
+    
+    for (i in seq_len(nrow(grp))) {
+      site_value <- grp$Site[i]
+      if (site_available && !is.na(site_value) && nzchar(site_value)) {
+        cat("    - ", grp$Individual[i], " [Site: ", site_value, "]\n", sep = "")
+      } else {
+        cat("    - ", grp$Individual[i], "\n", sep = "")
+      }
+    }
+  }
+  
+  invisible(NULL)
+}
+
+print_quick_clone_summary <- function(assignments_df, site_available = TRUE) {
+  mlg_repeated <- make_clone_group_table(assignments_df, clone_col = "MLG")
+  mll_repeated <- make_clone_group_table(assignments_df, clone_col = "MLL")
+  
+  n_unique_mlg <- dplyr::n_distinct(assignments_df$MLG, na.rm = TRUE)
+  n_unique_mll <- dplyr::n_distinct(assignments_df$MLL, na.rm = TRUE)
+  n_repeated_mlg_groups <- dplyr::n_distinct(mlg_repeated$MLG, na.rm = TRUE)
+  n_repeated_mll_groups <- dplyr::n_distinct(mll_repeated$MLL, na.rm = TRUE)
+  n_repeated_mlg_individuals <- nrow(mlg_repeated)
+  n_repeated_mll_individuals <- nrow(mll_repeated)
+  
+  cat("\n")
+  print_separator("=", 72)
+  cat("QUICK CLONE SUMMARY\n")
+  print_separator("=", 72)
+  cat("Dataset: gi (full, non-clone-corrected dataset)\n")
+  cat("Individuals analysed: ", nrow(assignments_df), "\n", sep = "")
+  if (site_available) {
+    cat("Site metadata: available\n")
+  } else {
+    cat("Site metadata: unavailable for one or more individuals; printing IDs only where needed\n")
+  }
+  
+  cat("\nSUMMARY COUNTS\n")
+  print_separator("-", 72)
+  cat("MLGs\n")
+  cat("  - Number of unique MLGs: ", n_unique_mlg, "\n", sep = "")
+  cat("  - Number of repeated MLG groups: ", n_repeated_mlg_groups, "\n", sep = "")
+  cat("  - Number of individuals involved in repeated MLGs: ", n_repeated_mlg_individuals, "\n", sep = "")
+  cat("MLLs\n")
+  cat("  - Number of unique MLLs: ", n_unique_mll, "\n", sep = "")
+  cat("  - Number of repeated MLL groups: ", n_repeated_mll_groups, "\n", sep = "")
+  cat("  - Number of individuals involved in repeated MLLs: ", n_repeated_mll_individuals, "\n", sep = "")
+  
+  print_clone_summary_block(
+    repeated_groups = mlg_repeated,
+    clone_col = "MLG",
+    site_available = site_available,
+    title = "INDIVIDUALS IN DUPLICATED MLGs"
+  )
+  
+  print_clone_summary_block(
+    repeated_groups = mll_repeated,
+    clone_col = "MLL",
+    site_available = site_available,
+    title = "INDIVIDUALS IN DUPLICATED MLLs"
+  )
+  
+  cat("\n")
+  print_separator("=", 72)
+  cat("END QUICK CLONE SUMMARY\n")
+  print_separator("=", 72)
+  
+  invisible(
+    list(
+      MLG_repeated = mlg_repeated,
+      MLL_repeated = mll_repeated,
+      counts = list(
+        n_unique_mlg = n_unique_mlg,
+        n_repeated_mlg_groups = n_repeated_mlg_groups,
+        n_repeated_mlg_individuals = n_repeated_mlg_individuals,
+        n_unique_mll = n_unique_mll,
+        n_repeated_mll_groups = n_repeated_mll_groups,
+        n_repeated_mll_individuals = n_repeated_mll_individuals
+      )
+    )
+  )
+}
+
 df_ids <- recover_or_recompute_clonality_columns(df_ids, gi, gi_mll)
 
 df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[01_clonality]", require = TRUE)
@@ -134,7 +260,10 @@ site_labels <- site_map[ind_key]
 mlg_labels <- mlg_map[ind_key]
 mll_labels <- mll_map[ind_key]
 
-if (any(is.na(site_labels))) stop("[01_clonality] Could not map all individuals to Site.")
+site_available <- !any(is.na(site_labels) | !nzchar(site_labels))
+if (!site_available) {
+  warning("[01_clonality] Site metadata were unavailable for one or more individuals; quick clone summary will print IDs without site where necessary.")
+}
 if (any(is.na(mlg_labels))) stop("[01_clonality] Could not map all individuals to MLG.")
 if (any(is.na(mll_labels))) stop("[01_clonality] Could not map all individuals to MLL.")
 
@@ -143,7 +272,7 @@ bruvo_algorithm <- if (!is.na(algorithm_col)) unique(stats::na.omit(df_ids[[algo
 
 clonality_df <- data.frame(
   Individual = adegenet::indNames(gi),
-  Site = site_labels,
+  Site = ifelse(is.na(site_labels) | !nzchar(site_labels), NA_character_, site_labels),
   MLG = mlg_labels,
   MLL = mll_labels,
   stringsAsFactors = FALSE
@@ -172,6 +301,7 @@ overall <- clonality_df %>%
   select(Level, Site, everything())
 
 by_site <- clonality_df %>%
+  mutate(Site = ifelse(is.na(Site) | !nzchar(Site), "SITE_UNAVAILABLE", Site)) %>%
   group_by(Site) %>%
   summarise(
     N_individuals = dplyr::n(),
@@ -209,6 +339,8 @@ if (length(bruvo_algorithm) > 0) {
 
 assign_file <- file.path(TABLES_DIR, "clonality_individual_assignments.csv")
 write.csv(clonality_df, assign_file, row.names = FALSE)
+
+print_quick_clone_summary(clonality_df, site_available = site_available)
 
 message("[01_clonality] Saved: ", out_file)
 message("[01_clonality] Saved: ", assign_file)

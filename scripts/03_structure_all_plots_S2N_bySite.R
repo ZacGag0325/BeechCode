@@ -48,6 +48,22 @@ suppressPackageStartupMessages({
 
 source("scripts/_load_objects.R")
 
+
+cluster_colors <- c(
+  Q1 = "#1b9e77",
+  Q2 = "#d95f02",
+  Q3 = "#7570b3",
+  Q4 = "#e7298a",
+  Q5 = "#66a61e",
+  Q6 = "#e6ab02",
+  Q7 = "#a6761d",
+  Q8 = "#666666",
+  Q9 = "#1f78b4",
+  Q10 = "#b2df8a",
+  Q11 = "#fb9a99",
+  Q12 = "#cab2d6"
+)
+
 message("[03_structure] Preparing final STRUCTURE individual barplots and interpretation-support outputs...")
 message("[03_structure] Species context: Fagus grandifolia")
 
@@ -541,7 +557,6 @@ build_base_order <- function(ids_vec, site_map_final, site_coord_tbl) {
       call. = FALSE
     )
   }
-  
   out <- out %>%
     arrange(SiteOrder, SiteLat, Site, Individual)
   
@@ -821,8 +836,7 @@ validate_plotting_df <- function(plot_df, y_col = "Q", context = "", tol = 1e-6,
   hard_gt1 <- sum(y > 1 + tol, na.rm = TRUE)
   if (hard_lt0 > 0 || hard_gt1 > 0) {
     stop("[03_structure] Invalid plotting data in ", context,
-         ": ancestry values outside [0,1] beyond tolerance (lt0=", hard_lt0,
-         ", gt1=", hard_gt1, ").", call. = FALSE)
+         ": ancestry values outside [0,1] beyond tolerance (lt0=", hard_lt0,         ", gt1=", hard_gt1, ").", call. = FALSE)
   }
   
   y <- clamp01(y, tol = tol)
@@ -1487,7 +1501,8 @@ if (length(scan$files) == 0) {
       
       plot_df <- q_df %>%
         select(PlotIndex, Site, all_of(q_cols)) %>%
-        pivot_longer(cols = all_of(q_cols), names_to = "Cluster", values_to = "Q")
+        pivot_longer(cols = all_of(q_cols), names_to = "Cluster", values_to = "Q") %>%
+        mutate(Cluster = factor(Cluster, levels = q_cols))
       
       plot_df <- validate_plotting_df(
         plot_df,
@@ -1504,6 +1519,7 @@ if (length(scan$files) == 0) {
       p <- ggplot(plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.25, color = "grey25") +
+        scale_fill_manual(values = cluster_colors[q_cols], breaks = q_cols, drop = FALSE) +
         scale_x_continuous(
           breaks = site_blocks$xmid,
           labels = site_blocks$Site,
@@ -1551,6 +1567,8 @@ if (length(scan$files) == 0) {
     
     if (length(allk_plot_data) > 0) {
       combined_plot_df <- bind_rows(allk_plot_data)
+      combined_clusters <- paste0("Q", seq_len(max(combined_plot_df$K, na.rm = TRUE)))
+      combined_plot_df$Cluster <- factor(combined_plot_df$Cluster, levels = combined_clusters)
       
       combined_plot_df <- validate_plotting_df(
         combined_plot_df,
@@ -1564,6 +1582,7 @@ if (length(scan$files) == 0) {
       p_all <- ggplot(combined_plot_df, aes(x = PlotIndex, y = Q, fill = Cluster)) +
         geom_col(width = 1) +
         geom_vline(xintercept = separators, linewidth = 0.2, color = "grey25") +
+        scale_fill_manual(values = cluster_colors[combined_clusters], breaks = combined_clusters, drop = FALSE) +
         scale_x_continuous(
           breaks = site_blocks$xmid,
           labels = site_blocks$Site,

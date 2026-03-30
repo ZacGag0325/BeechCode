@@ -250,63 +250,39 @@ df <- df %>%
     Stade_Development_clean = str_replace_all(Stade_Development_clean, "[;|/]", ","),
     
     Stade_Development_std = case_when(
-      # Missing / unspecified
-      is.na(Stade_Development_clean) |
-        Stade_Development_clean == "" |
-        str_detect(Stade_Development_clean, "^na$|^n/a$|^nd$|non renseign|non préc|not specified|not stated|unspecified|unknown|none") ~ "Not specified",
-      
-      # Explicitly mixed / multiple stages
-      str_detect(Stade_Development_clean, "mixed|multiple|plusieurs|all stages|all developmental|diverse") |
-        str_detect(Stade_Development_clean, "seedling") & str_detect(Stade_Development_clean, "sapling|juvenile|mature|adult|tree") |
-        str_detect(Stade_Development_clean, "sapling|gaulis") & str_detect(Stade_Development_clean, "juvenile|mature|adult|tree") |
-        str_detect(Stade_Development_clean, "juvenile|young tree|young stem") & str_detect(Stade_Development_clean, "mature|adult|tree|arbre mature") |
-        str_detect(Stade_Development_clean, "et|and|,") &
-        str_detect(Stade_Development_clean, "seedling|semis|sapling|gaulis|juvenile|young tree|young stem|mature|adult|arbre mature|tree") ~ "Mixed stages",
-      
       # Seedlings
       str_detect(Stade_Development_clean, "seedling|seedlings|semis") ~ "Seedling",
       
       # Saplings
-      str_detect(Stade_Development_clean, "sapling|saplings|gaulis") ~ "Sapling",
-      
-      # Juvenile trees
-      str_detect(Stade_Development_clean, "juvenile|young tree|young trees|young stem|young stems") ~ "Juvenile tree",
+      str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") ~ "Sapling",
       
       # Mature trees
       str_detect(Stade_Development_clean, "mature|adult|arbre mature") |
         (str_detect(Stade_Development_clean, "tree|trees|arbre|arbres") &
-           !str_detect(Stade_Development_clean, "young|juvenile|seedling|sapling|gaulis|semis")) ~ "Mature tree",
+           !str_detect(Stade_Development_clean, "young|juvenile")) ~ "Mature tree",
       
-      TRUE ~ "Other"
+      TRUE ~ NA_character_
     )
   )
 
 stage_order_en <- c(
   "Seedling",
   "Sapling",
-  "Juvenile tree",
-  "Mature tree",
-  "Mixed stages",
-  "Not specified",
-  "Other"
+  "Mature tree"
 )
 
 stage_labels_fr <- c(
   "Seedling" = "Semis",
   "Sapling" = "Gaulis",
-  "Juvenile tree" = "Jeune arbre",
-  "Mature tree" = "Arbre mature",
-  "Mixed stages" = "Stades mixtes",
-  "Not specified" = "Non précisé",
-  "Other" = "Autre"
+  "Mature tree" = "Arbre mature"
 )
 
 df <- df %>%
+  filter(!is.na(Stade_Development_std), Stade_Development_std %in% stage_order_en) %>%
   mutate(Stade_Development_std = factor(Stade_Development_std, levels = stage_order_en))
 
 stage_summary <- df %>%
-  count(Stade_Development_std, name = "n") %>%
-  complete(Stade_Development_std = factor(stage_order_en, levels = stage_order_en), fill = list(n = 0))
+  count(Stade_Development_std, name = "n")
 
 print(stage_summary)
 

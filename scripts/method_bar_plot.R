@@ -47,82 +47,69 @@ df <- df %>%
   )
 
 # 6) Recode method categories --------------------------------------------------
-# Keep original logic: Excavation pooled as one main category,
-# while preserving stacked subcategories.
-df <- df %>%
+df_method <- df %>%
   mutate(
-    Method_Main = case_when(
-      str_detect(Method_Category, "Excavation") ~ "Excavation",
-      str_detect(Method_Category, "Lien racinaire") &
-        !str_detect(Method_Category, "Excavation") ~ "Root connection",
-      str_detect(Method_Category, "Proximité") ~ "Spatial proximity",
-      str_detect(Method_Category, "Identification génétique") ~ "Genetic identification",
-      TRUE ~ "Other"
-    ),
-    
-    Method_Sub = case_when(
-      str_detect(Method_Category, "Morphologie du collet") &
-        str_detect(Method_Category, "Lien racinaire") ~ "Morphology + root link",
-      str_detect(Method_Category, "Morphologie du collet") ~ "Morphology",
-      str_detect(Method_Category, "Lien racinaire") ~ "Root link",
-      str_detect(Method_Category, "Non explicite") ~ "Not specified",
-      TRUE ~ "Other"
+    Method_Category_clean_lower = str_to_lower(str_squish(Method_Category)),
+    Method_Category_clean = case_when(
+      str_detect(Method_Category_clean_lower, "excavation") &
+        str_detect(Method_Category_clean_lower, "morphologie") &
+        str_detect(Method_Category_clean_lower, "lien racinaire") ~ "Excavation - Morphologie du collet et lien racinaire",
+      str_detect(Method_Category_clean_lower, "excavation") &
+        str_detect(Method_Category_clean_lower, "morphologie") ~ "Excavation - Morphologie du collet",
+      str_detect(Method_Category_clean_lower, "excavation") &
+        str_detect(Method_Category_clean_lower, "lien racinaire") ~ "Excavation - Lien racinaire entre individus",
+      str_detect(Method_Category_clean_lower, "excavation") &
+        str_detect(Method_Category_clean_lower, "non explicite") ~ "Excavation - Non explicite",
+      str_detect(Method_Category_clean_lower, "lien racinaire") &
+        str_detect(Method_Category_clean_lower, "horizon de surface") ~ "Lien racinaire - Horizon de surface",
+      str_detect(Method_Category_clean_lower, "proximité|proximite") ~ "Proximité des individus",
+      str_detect(Method_Category_clean_lower, "identification génétique|identification genetique|génétique|genetique") ~ "Identification génétique",
+      TRUE ~ NA_character_
     )
-  )
-
-# Force subcategory for non-excavation
-df <- df %>%
-  mutate(Method_Sub = ifelse(Method_Main != "Excavation", Method_Main, Method_Sub))
+  ) %>%
+  filter(!is.na(Method_Category_clean))
 
 # 7) Define EN/FR dictionaries -------------------------------------------------
-method_main_levels_en <- c(
-  "Excavation",
-  "Genetic identification",
-  "Spatial proximity",
-  "Root connection",
-  "Other"
+method_levels_en <- c(
+  "Excavation - Morphologie du collet et lien racinaire",
+  "Excavation - Morphologie du collet",
+  "Excavation - Lien racinaire entre individus",
+  "Excavation - Non explicite",
+  "Lien racinaire - Horizon de surface",
+  "Proximité des individus",
+  "Identification génétique"
 )
 
-method_main_labels_fr <- c(
-  "Excavation" = "Excavation",
-  "Genetic identification" = "Identification génétique",
-  "Spatial proximity" = "Proximité spatiale",
-  "Root connection" = "Connexion racinaire",
-  "Other" = "Autre"
+method_labels_fr <- c(
+  "Excavation - Morphologie du collet et lien racinaire" = "Excavation - Morphologie du collet et lien racinaire",
+  "Excavation - Morphologie du collet" = "Excavation - Morphologie du collet",
+  "Excavation - Lien racinaire entre individus" = "Excavation - Lien racinaire entre individus",
+  "Excavation - Non explicite" = "Excavation - Non explicite",
+  "Lien racinaire - Horizon de surface" = "Lien racinaire - Horizon de surface",
+  "Proximité des individus" = "Proximité des individus",
+  "Identification génétique" = "Identification génétique"
 )
 
-method_sub_labels_fr <- c(
-  "Morphology + root link" = "Morphologie + lien racinaire",
-  "Morphology" = "Morphologie",
-  "Root link" = "Lien racinaire",
-  "Not specified" = "Non précisé",
-  "Excavation" = "Excavation",
-  "Genetic identification" = "Identification génétique",
-  "Spatial proximity" = "Proximité spatiale",
-  "Root connection" = "Connexion racinaire",
-  "Other" = "Autre"
-)
-
-# Apply ordering for method main categories
-df <- df %>%
-  mutate(Method_Main = factor(Method_Main, levels = method_main_levels_en))
+# Apply ordering for method categories
+df_method <- df_method %>%
+  mutate(Method_Category_clean = factor(Method_Category_clean, levels = method_levels_en))
 
 # 8) Count data for method plot ------------------------------------------------
-summary_df <- df %>%
-  count(Method_Main, Method_Sub)
+summary_df <- df_method %>%
+  count(Method_Category_clean)
 
 print(summary_df)
 
 # 9) Method stacked bar plot (EN + FR) ----------------------------------------
 # English
-p_method_en <- ggplot(summary_df, aes(x = Method_Main, y = n, fill = Method_Sub)) +
+p_method_en <- ggplot(summary_df, aes(x = Method_Category_clean, y = n, fill = Method_Category_clean)) +
   geom_col(width = 0.75) +
-  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3.2, color = "black") +
+  geom_text(aes(label = n), hjust = -0.15, size = 3.2, color = "black") +
   coord_flip() +
   labs(
     x = "Method category",
     y = "Number of studies",
-    fill = "Method detail",
+    fill = "Method category",
     title = NULL
   ) +
   theme_minimal(base_size = 12) +
@@ -145,26 +132,24 @@ ggsave(
 # French (translate visible plotted labels)
 summary_df_fr <- summary_df %>%
   mutate(
-    Method_Main_fr = recode(as.character(Method_Main), !!!method_main_labels_fr),
-    Method_Sub_fr = recode(as.character(Method_Sub), !!!method_sub_labels_fr)
+    Method_Category_clean_fr = recode(as.character(Method_Category_clean), !!!method_labels_fr)
   )
 
-method_main_levels_fr <- unname(method_main_labels_fr[method_main_levels_en])
+method_levels_fr <- unname(method_labels_fr[method_levels_en])
 
 summary_df_fr <- summary_df_fr %>%
   mutate(
-    Method_Main_fr = factor(Method_Main_fr, levels = method_main_levels_fr),
-    Method_Sub_fr = factor(Method_Sub_fr)
+    Method_Category_clean_fr = factor(Method_Category_clean_fr, levels = method_levels_fr)
   )
 
-p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Main_fr, y = n, fill = Method_Sub_fr)) +
+p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n, fill = Method_Category_clean_fr)) +
   geom_col(width = 0.75) +
-  geom_text(aes(label = n), position = position_stack(vjust = 0.5), size = 3.2, color = "black") +
+  geom_text(aes(label = n), hjust = -0.15, size = 3.2, color = "black") +
   coord_flip() +
   labs(
     x = "Catégorie de méthode",
     y = "Nombre d’études",
-    fill = "Détail de méthode",
+    fill = "Catégorie de méthode",
     title = NULL
   ) +
   theme_minimal(base_size = 12) +
@@ -250,17 +235,20 @@ df <- df %>%
     Stade_Development_clean = str_replace_all(Stade_Development_clean, "[;|/]", ","),
     
     Stade_Development_std = case_when(
-      # Seedlings
+      is.na(Stade_Development_clean) | Stade_Development_clean == "" ~ "Unspecified",
+      str_detect(Stade_Development_clean, "mixed stages|stades? mixtes|juvenile tree|arbre juvenile|\\bother\\b|\\bautre\\b") ~ NA_character_,
+      str_detect(Stade_Development_clean, "^sapling\\s*(and|&)\\s*seedling|^saplings\\s*(and|&)\\s*seedlings|^gaulis\\s*(et|&)\\s*semis|^gaule\\s*(et|&)\\s*semis") ~ "Sapling and Seedling",
+      str_detect(Stade_Development_clean, "all trees|all stages|all developmental stages|all individuals|all size classes") ~ "All trees",
+      str_detect(Stade_Development_clean, "^(na|n/a|nd|none)$|non renseign|non préc|non prec|not specified|not stated|unspecified|unknown") ~ "Unspecified",
+      str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") &
+        str_detect(Stade_Development_clean, "mature|adult|arbre mature") ~ "Sapling and Mature",
+      str_detect(Stade_Development_clean, "seedling|seedlings|semis") &
+        str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") ~ "Seedling and Sapling",
       str_detect(Stade_Development_clean, "seedling|seedlings|semis") ~ "Seedling",
-      
-      # Saplings
       str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") ~ "Sapling",
-      
-      # Mature trees
       str_detect(Stade_Development_clean, "mature|adult|arbre mature") |
         (str_detect(Stade_Development_clean, "tree|trees|arbre|arbres") &
            !str_detect(Stade_Development_clean, "young|juvenile")) ~ "Mature tree",
-      
       TRUE ~ NA_character_
     )
   )
@@ -268,13 +256,23 @@ df <- df %>%
 stage_order_en <- c(
   "Seedling",
   "Sapling",
-  "Mature tree"
+  "Mature tree",
+  "Seedling and Sapling",
+  "Sapling and Seedling",
+  "Sapling and Mature",
+  "All trees",
+  "Unspecified"
 )
 
 stage_labels_fr <- c(
   "Seedling" = "Semis",
   "Sapling" = "Gaulis",
-  "Mature tree" = "Arbre mature"
+  "Mature tree" = "Arbre mature",
+  "Seedling and Sapling" = "Semis et gaulis",
+  "Sapling and Seedling" = "Gaulis et semis",
+  "Sapling and Mature" = "Gaulis et arbre mature",
+  "All trees" = "Tous les arbres",
+  "Unspecified" = "Non précisé"
 )
 
 df <- df %>%

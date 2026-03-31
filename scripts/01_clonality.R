@@ -16,6 +16,7 @@ suppressPackageStartupMessages({
   library(poppr)
   library(adegenet)
   library(dplyr)
+  library(ggplot2)
 })
 
 source("scripts/_load_objects.R")
@@ -342,5 +343,157 @@ write.csv(clonality_df, assign_file, row.names = FALSE)
 
 print_quick_clone_summary(clonality_df, site_available = site_available)
 
+# -----------------------------------------------------------------------------
+# MLG barplots by site (FR + EN) for presentation
+# -----------------------------------------------------------------------------
+# Objective:
+# - x axis: Site
+# - y axis: Number of distinct MLGs observed in each site
+# - reference line at theoretical maximum = 24 sampled individuals per site
+# - robust behavior even when some sites have <24 valid individuals
+
+find_latitude_col <- function(df) {
+  find_synonym_col(
+    df,
+    c("Latitude", "latitude", "lat", "LAT", "Lat", "y", "Y")
+  )
+}
+
+build_site_mlg_summary <- function(assignments_df, df_ids_tbl = NULL) {
+  summary_tbl <- assignments_df %>%
+    mutate(Site = ifelse(is.na(Site) | !nzchar(Site), "SITE_UNAVAILABLE", Site)) %>%
+    group_by(Site) %>%
+    summarise(
+      N_MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
+      N_individuals = dplyr::n(),
+      .groups = "drop"
+    )
+  
+  if (!is.null(df_ids_tbl)) {
+    lat_col <- find_latitude_col(df_ids_tbl)
+    if (!is.na(lat_col)) {
+      df_ids_cols_local <- resolve_df_ids_columns(df_ids_tbl, context = "[01_clonality]", require = TRUE)
+      lat_by_site <- df_ids_tbl %>%
+        transmute(
+          Site = as.character(.data[[df_ids_cols_local$site_col]]),
+          Latitude = suppressWarnings(as.numeric(.data[[lat_col]]))
+        ) %>%
+        filter(!is.na(Site), nzchar(Site)) %>%
+        group_by(Site) %>%
+        summarise(
+          Latitude = if (all(is.na(Latitude))) NA_real_ else mean(Latitude, na.rm = TRUE),
+          .groups = "drop"
+        )
+      
+      summary_tbl <- summary_tbl %>%
+        left_join(lat_by_site, by = "Site")
+    } else {
+      summary_tbl$Latitude <- NA_real_
+    }
+  } else {
+    summary_tbl$Latitude <- NA_real_
+  }
+  
+  if ("Latitude" %in% names(summary_tbl) && any(!is.na(summary_tbl$Latitude))) {
+    # Sort south -> north when latitude is available
+    summary_tbl <- summary_tbl %>%
+      arrange(Latitude, Site)
+  } else {
+    summary_tbl <- summary_tbl %>%
+      arrange(Site)
+  }
+  
+  summary_tbl$Site <- factor(summary_tbl$Site, levels = summary_tbl$Site)
+  summary_tbl
+}
+
+make_mlg_barplot <- function(summary_tbl, lang = c("fr", "en"), max_theoretical = 24) {
+  lang <- match.arg(lang)
+  
+  labels <- switch(
+    lang,
+    fr = list(
+      title = "Nombre de génotypes multilocus (MLG) par site",
+      subtitle = "Maximum théorique de 24 individus échantillonnés par site",
+      x = "Site",
+      y = "Nombre de MLG"
+    ),
+    en = list(
+      title = "Number of multilocus genotypes (MLGs) per site",
+      subtitle = "Theoretical maximum of 24 sampled individuals per site",
+      x = "Site",
+      y = "Number of MLGs"
+    )
+  )
+  
+  ggplot(summary_tbl, aes(x = Site, y = N_MLG)) +
+    geom_col(fill = "#4C78A8", width = 0.75) +
+    geom_hline(
+      yintercept = max_theoretical,
+      linetype = "dashed",
+      linewidth = 0.8,
+      color = "#595959"
+    ) +
+    scale_y_continuous(
+      limits = c(0, max(max_theoretical, summary_tbl$N_MLG, na.rm = TRUE) * 1.05),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(
+      title = labels$title,
+      subtitle = labels$subtitle,
+      x = labels$x,
+      y = labels$y
+    ) +
+    theme_minimal(base_size = 16) +
+    theme(
+      plot.title = element_text(face = "bold", size = 19),
+      plot.subtitle = element_text(size = 14),
+      axis.title = element_text(size = 15),
+      axis.text.x = element_text(size = 12, angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(size = 12),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+}
+
+save_mlg_plot_dual_language <- function(summary_tbl, fig_dir, max_theoretical = 24) {
+  plot_fr <- make_mlg_barplot(summary_tbl, lang = "fr", max_theoretical = max_theoretical)
+  plot_en <- make_mlg_barplot(summary_tbl, lang = "en", max_theoretical = max_theoretical)
+  
+  png_fr <- file.path(fig_dir, "mlg_per_site_barplot_fr.png")
+  pdf_fr <- file.path(fig_dir, "mlg_per_site_barplot_fr.pdf")
+  png_en <- file.path(fig_dir, "mlg_per_site_barplot_en.png")
+  pdf_en <- file.path(fig_dir, "mlg_per_site_barplot_en.pdf")
+  
+  ggsave(filename = png_fr, plot = plot_fr, width = 12, height = 7, dpi = 320)
+  ggsave(filename = pdf_fr, plot = plot_fr, width = 12, height = 7)
+  ggsave(filename = png_en, plot = plot_en, width = 12, height = 7, dpi = 320)
+  ggsave(filename = pdf_en, plot = plot_en, width = 12, height = 7)
+  
+  list(
+    fr_png = png_fr, fr_pdf = pdf_fr,
+    en_png = png_en, en_pdf = pdf_en
+  )
+}
+
+site_mlg_summary <- build_site_mlg_summary(clonality_df, df_ids_tbl = df_ids)
+
+cat("\n[01_clonality] Tableau résumé utilisé pour le barplot MLG par site:\n")
+print(site_mlg_summary)
+
+site_mlg_summary_file <- file.path(TABLES_DIR, "mlg_per_site_summary.csv")
+write.csv(site_mlg_summary, site_mlg_summary_file, row.names = FALSE)
+
+mlg_plot_files <- save_mlg_plot_dual_language(
+  summary_tbl = site_mlg_summary,
+  fig_dir = FIGURES_DIR,
+  max_theoretical = 24
+)
+
 message("[01_clonality] Saved: ", out_file)
 message("[01_clonality] Saved: ", assign_file)
+message("[01_clonality] Saved: ", site_mlg_summary_file)
+message("[01_clonality] Saved: ", mlg_plot_files$fr_png)
+message("[01_clonality] Saved: ", mlg_plot_files$fr_pdf)
+message("[01_clonality] Saved: ", mlg_plot_files$en_png)
+message("[01_clonality] Saved: ", mlg_plot_files$en_pdf)

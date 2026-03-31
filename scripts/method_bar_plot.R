@@ -81,6 +81,16 @@ method_levels_en <- c(
   "Identification génétique"
 )
 
+method_palette_en <- c(
+  "Excavation - Morphologie du collet et lien racinaire" = "#145A32",
+  "Excavation - Morphologie du collet" = "#196F3D",
+  "Excavation - Lien racinaire entre individus" = "#1E8449",
+  "Excavation - Non explicite" = "#239B56",
+  "Lien racinaire - Horizon de surface" = "#2E8B57",
+  "Proximité des individus" = "#52BE80",
+  "Identification génétique" = "#7DCEA0"
+)
+
 method_labels_fr <- c(
   "Excavation - Morphologie du collet et lien racinaire" = "Excavation - Morphologie du collet et lien racinaire",
   "Excavation - Morphologie du collet" = "Excavation - Morphologie du collet",
@@ -125,6 +135,7 @@ p_method_en <- ggplot(summary_df, aes(x = Method_Category_clean, y = n, fill = M
     fill = "Method category",
     title = NULL
   ) +
+  scale_fill_manual(values = method_palette_en, drop = FALSE) +
   theme_pub +
   theme(legend.position = "none")
 
@@ -142,6 +153,7 @@ ggsave(
 p_method_en_legend_source <- ggplot(summary_df, aes(x = Method_Category_clean, y = n, fill = Method_Category_clean)) +
   geom_col() +
   labs(fill = "Method category") +
+  scale_fill_manual(values = method_palette_en, drop = FALSE) +
   theme_minimal(base_size = 18) +
   theme(
     legend.position = "right",
@@ -177,6 +189,8 @@ summary_df_fr <- summary_df_fr %>%
     Method_Category_clean_fr = factor(Method_Category_clean_fr, levels = method_levels_fr)
   )
 
+method_palette_fr <- setNames(unname(method_palette_en[method_levels_en]), method_levels_fr)
+
 p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n, fill = Method_Category_clean_fr)) +
   geom_col(width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2, color = "black") +
@@ -188,6 +202,7 @@ p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n, fi
     fill = "Catégorie de méthode",
     title = NULL
   ) +
+  scale_fill_manual(values = method_palette_fr, drop = FALSE) +
   theme_pub +
   theme(legend.position = "none")
 
@@ -205,6 +220,7 @@ ggsave(
 p_method_fr_legend_source <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n, fill = Method_Category_clean_fr)) +
   geom_col() +
   labs(fill = "Catégorie de méthode") +
+  scale_fill_manual(values = method_palette_fr, drop = FALSE) +
   theme_minimal(base_size = 18) +
   theme(
     legend.position = "right",
@@ -234,7 +250,7 @@ assumed_tested_df <- df %>%
 
 # English
 p2_en <- ggplot(assumed_tested_df, aes(x = reorder(Assumed_or_Tested, n), y = n)) +
-  geom_col(fill = "#2C7FB8", width = 0.75) +
+  geom_col(fill = "#2E8B57", width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
   expand_limits(y = max(assumed_tested_df$n, na.rm = TRUE) * 1.15 + 0.3) +
@@ -262,7 +278,7 @@ assumed_tested_df_fr <- assumed_tested_df %>%
   )
 
 p2_fr <- ggplot(assumed_tested_df_fr, aes(x = reorder(Assumed_or_Tested_fr, n), y = n)) +
-  geom_col(fill = "#2C7FB8", width = 0.75) +
+  geom_col(fill = "#2E8B57", width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
   expand_limits(y = max(assumed_tested_df_fr$n, na.rm = TRUE) * 1.15 + 0.3) +
@@ -338,7 +354,7 @@ print(stage_summary)
 
 # Development stage plot - English
 p3_en <- ggplot(stage_summary, aes(x = Stade_Development_std, y = n)) +
-  geom_col(fill = "#2C7FB8", width = 0.75) +
+  geom_col(fill = "#2E8B57", width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
   expand_limits(y = max(stage_summary$n, na.rm = TRUE) * 1.15 + 0.3) +
@@ -368,7 +384,7 @@ stage_summary_fr <- stage_summary_fr %>%
   mutate(Stade_Development_std_fr = factor(Stade_Development_std_fr, levels = stage_levels_fr))
 
 p3_fr <- ggplot(stage_summary_fr, aes(x = Stade_Development_std_fr, y = n)) +
-  geom_col(fill = "#2C7FB8", width = 0.75) +
+  geom_col(fill = "#2E8B57", width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
   expand_limits(y = max(stage_summary_fr$n, na.rm = TRUE) * 1.15 + 0.3) +
@@ -396,7 +412,7 @@ source_df <- df %>%
 
 # English
 p4_en <- ggplot(source_df, aes(x = reorder(Sourced_from, n), y = n)) +
-  geom_col(fill = "#2C7FB8", width = 0.75) +
+  geom_col(fill = "#2E8B57", width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
   expand_limits(y = max(source_df$n, na.rm = TRUE) * 1.15 + 0.3) +
@@ -415,7 +431,7 @@ ggsave(
 
 # French
 p4_fr <- ggplot(source_df, aes(x = reorder(Sourced_from, n), y = n)) +
-  geom_col(fill = "#2C7FB8", width = 0.75) +
+  geom_col(fill = "#2E8B57", width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
   expand_limits(y = max(source_df$n, na.rm = TRUE) * 1.15 + 0.3) +

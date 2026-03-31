@@ -427,7 +427,7 @@ make_mlg_barplot <- function(summary_tbl, lang = c("fr", "en"), max_theoretical 
   )
   
   ggplot(summary_tbl, aes(x = Site, y = N_MLG)) +
-    geom_col(fill = "#4C78A8", width = 0.75) +
+    geom_col(fill = "#2E8B57", width = 0.75) +
     geom_hline(
       yintercept = max_theoretical,
       linetype = "dashed",
@@ -447,10 +447,10 @@ make_mlg_barplot <- function(summary_tbl, lang = c("fr", "en"), max_theoretical 
     theme_minimal(base_size = 16) +
     theme(
       plot.title = element_text(face = "bold", size = 19),
-      plot.subtitle = element_text(size = 14),
+      plot.subtitle = element_text(size = 18),
       axis.title = element_text(size = 15),
-      axis.text.x = element_text(size = 12, angle = 45, hjust = 1, vjust = 1),
-      axis.text.y = element_text(size = 12),
+      axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(size = 16),
       panel.grid.major.x = element_blank(),
       panel.grid.minor = element_blank()
     )

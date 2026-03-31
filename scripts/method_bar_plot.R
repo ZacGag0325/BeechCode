@@ -16,6 +16,7 @@ if (dir.exists(path.expand(project_dir))) {
 library(tidyverse)
 library(readxl)
 library(stringr)
+library(cowplot)
 
 # 3) Define file path ----------------------------------------------------------
 input_file <- "data/raw/scopus_review_database.xlsx"
@@ -100,33 +101,67 @@ summary_df <- df_method %>%
 
 print(summary_df)
 
+# Shared text settings for readability in PNG exports
+theme_pub <- theme_minimal(base_size = 18) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 22),
+    axis.title.y = element_text(size = 22),
+    axis.text.x = element_text(size = 18),
+    axis.text.y = element_text(size = 18)
+  )
+
 # 9) Method stacked bar plot (EN + FR) ----------------------------------------
-# English
+# English (main plot without legend)
 p_method_en <- ggplot(summary_df, aes(x = Method_Category_clean, y = n, fill = Method_Category_clean)) +
   geom_col(width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.2, color = "black") +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2, color = "black") +
   coord_flip() +
+  expand_limits(y = max(summary_df$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(
     x = "Method category",
     y = "Number of studies",
     fill = "Method category",
     title = NULL
   ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position = "right"
-  )
+  theme_pub +
+  theme(legend.position = "none")
 
 print(p_method_en)
 
 ggsave(
   file.path(output_dir, "method_barplot_stacked.png"),
   p_method_en,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
+# English legend exported separately
+p_method_en_legend_source <- ggplot(summary_df, aes(x = Method_Category_clean, y = n, fill = Method_Category_clean)) +
+  geom_col() +
+  labs(fill = "Method category") +
+  theme_minimal(base_size = 18) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.key = element_rect(fill = "white", color = NA)
+  )
+
+legend_method_en <- cowplot::get_legend(p_method_en_legend_source)
+legend_plot_method_en <- cowplot::ggdraw(legend_method_en) +
+  theme(plot.background = element_rect(fill = "white", color = NA))
+
+ggsave(
+  file.path(output_dir, "method_barplot_stacked_legend.png"),
+  legend_plot_method_en,
   width = 8,
   height = 6,
-  dpi = 300
+  dpi = 300,
+  bg = "white"
 )
 
 # French (translate visible plotted labels)
@@ -144,29 +179,52 @@ summary_df_fr <- summary_df_fr %>%
 
 p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n, fill = Method_Category_clean_fr)) +
   geom_col(width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.2, color = "black") +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2, color = "black") +
   coord_flip() +
+  expand_limits(y = max(summary_df_fr$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(
     x = "Catégorie de méthode",
     y = "Nombre d’études",
     fill = "Catégorie de méthode",
     title = NULL
   ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position = "right"
-  )
+  theme_pub +
+  theme(legend.position = "none")
 
 print(p_method_fr)
 
 ggsave(
   file.path(output_dir, "method_barplot_stacked_fr.png"),
   p_method_fr,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+
+# French legend exported separately
+p_method_fr_legend_source <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n, fill = Method_Category_clean_fr)) +
+  geom_col() +
+  labs(fill = "Catégorie de méthode") +
+  theme_minimal(base_size = 18) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.key = element_rect(fill = "white", color = NA)
+  )
+
+legend_method_fr <- cowplot::get_legend(p_method_fr_legend_source)
+legend_plot_method_fr <- cowplot::ggdraw(legend_method_fr) +
+  theme(plot.background = element_rect(fill = "white", color = NA))
+
+ggsave(
+  file.path(output_dir, "method_barplot_stacked_fr_legend.png"),
+  legend_plot_method_fr,
   width = 8,
   height = 6,
-  dpi = 300
+  dpi = 300,
+  bg = "white"
 )
 
 # 10) Assumed vs Tested (EN + FR) ---------------------------------------------
@@ -177,22 +235,19 @@ assumed_tested_df <- df %>%
 # English
 p2_en <- ggplot(assumed_tested_df, aes(x = reorder(Assumed_or_Tested, n), y = n)) +
   geom_col(fill = "#2C7FB8", width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.2) +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
+  expand_limits(y = max(assumed_tested_df$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(title = NULL, x = "", y = "Count") +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
+  theme_pub
 
 print(p2_en)
 
 ggsave(
   file.path(output_dir, "assumed_tested_barplot.png"),
   p2_en,
-  width = 8,
-  height = 5,
+  width = 10,
+  height = 6,
   dpi = 300
 )
 
@@ -208,22 +263,19 @@ assumed_tested_df_fr <- assumed_tested_df %>%
 
 p2_fr <- ggplot(assumed_tested_df_fr, aes(x = reorder(Assumed_or_Tested_fr, n), y = n)) +
   geom_col(fill = "#2C7FB8", width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.2) +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
+  expand_limits(y = max(assumed_tested_df_fr$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(title = NULL, x = "", y = "Nombre") +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
+  theme_pub
 
 print(p2_fr)
 
 ggsave(
   file.path(output_dir, "assumed_tested_barplot_fr.png"),
   p2_fr,
-  width = 8,
-  height = 5,
+  width = 10,
+  height = 6,
   dpi = 300
 )
 
@@ -287,27 +339,23 @@ print(stage_summary)
 # Development stage plot - English
 p3_en <- ggplot(stage_summary, aes(x = Stade_Development_std, y = n)) +
   geom_col(fill = "#2C7FB8", width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.3) +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
-  expand_limits(y = max(stage_summary$n, na.rm = TRUE) * 1.12 + 0.2) +
+  expand_limits(y = max(stage_summary$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(
     title = NULL,
     x = "",
     y = "Number of studies"
   ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
+  theme_pub
 
 print(p3_en)
 
 ggsave(
   file.path(output_dir, "stade_development_barplot.png"),
   p3_en,
-  width = 8.5,
-  height = 5.5,
+  width = 10.5,
+  height = 7,
   dpi = 300
 )
 
@@ -321,27 +369,23 @@ stage_summary_fr <- stage_summary_fr %>%
 
 p3_fr <- ggplot(stage_summary_fr, aes(x = Stade_Development_std_fr, y = n)) +
   geom_col(fill = "#2C7FB8", width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.3) +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
-  expand_limits(y = max(stage_summary_fr$n, na.rm = TRUE) * 1.12 + 0.2) +
+  expand_limits(y = max(stage_summary_fr$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(
     title = NULL,
     x = "",
     y = "Nombre d’études"
   ) +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
+  theme_pub
 
 print(p3_fr)
 
 ggsave(
   file.path(output_dir, "stade_development_barplot_fr.png"),
   p3_fr,
-  width = 8.5,
-  height = 5.5,
+  width = 10.5,
+  height = 7,
   dpi = 300
 )
 
@@ -353,44 +397,38 @@ source_df <- df %>%
 # English
 p4_en <- ggplot(source_df, aes(x = reorder(Sourced_from, n), y = n)) +
   geom_col(fill = "#2C7FB8", width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.2) +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
+  expand_limits(y = max(source_df$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(title = NULL, x = "", y = "Count") +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
+  theme_pub
 
 print(p4_en)
 
 ggsave(
   file.path(output_dir, "sourced_from_barplot.png"),
   p4_en,
-  width = 8,
-  height = 5,
+  width = 10.5,
+  height = 6.5,
   dpi = 300
 )
 
 # French
 p4_fr <- ggplot(source_df, aes(x = reorder(Sourced_from, n), y = n)) +
   geom_col(fill = "#2C7FB8", width = 0.75) +
-  geom_text(aes(label = n), hjust = -0.15, size = 3.2) +
+  geom_text(aes(label = n), hjust = -0.15, size = 6.2) +
   coord_flip() +
+  expand_limits(y = max(source_df$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(title = NULL, x = "", y = "Nombre") +
-  theme_minimal(base_size = 12) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
+  theme_pub
 
 print(p4_fr)
 
 ggsave(
   file.path(output_dir, "sourced_from_barplot_fr.png"),
   p4_fr,
-  width = 8,
-  height = 5,
+  width = 10.5,
+  height = 6.5,
   dpi = 300
 )
 

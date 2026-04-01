@@ -17,16 +17,6 @@ suppressPackageStartupMessages({
 # -----------------------------
 # 2) User settings
 # -----------------------------
-# Where your raw data file is stored
-# (based on your note: file is in data/raw)
-data_dir <- "data/raw"
-
-# Excel file name inside data/raw
-input_filename <- "donnees_modifiees_west_summer2024 copie.xlsx"
-
-# Full input path
-file_path <- file.path(data_dir, input_filename)
-
 # Beech species code in your dataset
 # Change this if needed (example: "HEG", "FASY", etc.)
 beech_code <- "HEG"
@@ -44,20 +34,25 @@ regen_plot_area_m2 <- 4
 output_excel <- "beech_density_by_site_results.xlsx"
 
 # -----------------------------
-# 3) Input checks
+# 3) Project-style input path resolution
 # -----------------------------
-if (!file.exists(file_path)) {
-  available_xlsx <- list.files(data_dir, pattern = "\\.xlsx$", full.names = FALSE)
-  
-  msg <- paste0(
-    "Input file not found: ", normalizePath(file_path, winslash = "/", mustWork = FALSE), "\n",
-    "\nFiles currently found in '", data_dir, "':\n",
-    if (length(available_xlsx) == 0) "(none)" else paste0("- ", available_xlsx, collapse = "\n"),
-    "\n\nUpdate 'input_filename' or move your file into ", data_dir, "."
+possible_paths <- c(
+  "data/raw/donnees_modifiees_west_summer2024 copie.xlsx",
+  "BeechCode/data/raw/donnees_modifiees_west_summer2024 copie.xlsx",
+  "~/Desktop/BeechCode/data/raw/donnees_modifiees_west_summer2024 copie.xlsx",
+  "/mnt/data/donnees_modifiees_west_summer2024 copie.xlsx"
+)
+
+file_path <- possible_paths[file.exists(possible_paths)][1]
+
+if (is.na(file_path)) {
+  stop(
+    "Excel file not found. Checked:\n",
+    paste(possible_paths, collapse = "\n")
   )
-  
-  stop(msg)
 }
+
+cat("Using Excel file:\n", normalizePath(file_path), "\n")
 
 if (!is.numeric(regen_plot_area_m2) || regen_plot_area_m2 <= 0) {
   stop("'regen_plot_area_m2' must be a positive numeric value.")
@@ -66,6 +61,8 @@ if (!is.numeric(regen_plot_area_m2) || regen_plot_area_m2 <= 0) {
 # -----------------------------
 # 4) Read sheets
 # -----------------------------
+cat("Current working directory:\n", getwd(), "\n")
+
 arbre <- read_excel(file_path, sheet = "arbre")
 gaule <- read_excel(file_path, sheet = "gaule")
 regeneration <- read_excel(file_path, sheet = "regeneration")

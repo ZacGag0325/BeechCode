@@ -795,13 +795,13 @@ write_microchecker_genepop_export <- function(tbl,
   out_tbl <- cbind(out_tbl, as.data.frame(genotype_matrix, stringsAsFactors = FALSE))
   out_tbl <- out_tbl[order(out_tbl$pop, out_tbl$ind_id), , drop = FALSE]
   
-  genepop_lines <- c(title_line, locus_names)
+  genepop_lines <- c(title_line, paste(locus_names, collapse = ", "))
   for (p in unique(out_tbl$pop)) {
     genepop_lines <- c(genepop_lines, "Pop")
     sub <- out_tbl[out_tbl$pop == p, , drop = FALSE]
     for (r in seq_len(nrow(sub))) {
       geno_str <- paste(sub[r, locus_names, drop = TRUE], collapse = " ")
-      genepop_lines <- c(genepop_lines, paste0(sub$ind_id[r], " , ", geno_str))
+      genepop_lines <- c(genepop_lines, paste0(sub$ind_id[r], ", ", geno_str))
     }
   }
   

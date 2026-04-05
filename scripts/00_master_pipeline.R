@@ -51,8 +51,10 @@ setwd(PROJECT_ROOT)
 
 OBJ_DIR <- file.path(PROJECT_ROOT, "outputs", "v1", "objects")
 TABLES_SUPP_DIR <- file.path(PROJECT_ROOT, "outputs", "tables", "supplementary")
+MICROCHECKER_DIR <- file.path(PROJECT_ROOT, "outputs", "microchecker")
 dir.create(OBJ_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(TABLES_SUPP_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(MICROCHECKER_DIR, recursive = TRUE, showWarnings = FALSE)
 
 resolve_col <- function(df, choices) {
   nms <- names(df)
@@ -667,7 +669,7 @@ write_microchecker_genepop_export <- function(tbl,
                                               pop_col = NULL,
                                               allowed_ids_norm = NULL,
                                               id_to_pop = NULL,
-                                              output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_genepop.txt"),
+                                              output_path = file.path(MICROCHECKER_DIR, "microchecker_genepop.txt"),
                                               title_line = "BeechCode MicroChecker export") {
   if (!is.data.frame(tbl) || nrow(tbl) == 0 || ncol(tbl) == 0) {
     stop("[00_master_pipeline] Micro-Checker Genepop export expects a non-empty data.frame.")
@@ -901,7 +903,7 @@ build_objects <- function() {
     pop_col = geno_source$summary$site_col,
     allowed_ids_norm = normalize_id(adegenet::indNames(gi)),
     id_to_pop = id_to_site,
-    output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_genepop.txt"),
+    output_path = file.path(MICROCHECKER_DIR, "microchecker_genepop.txt"),
     title_line = "BeechCode MicroChecker export"
   )
   

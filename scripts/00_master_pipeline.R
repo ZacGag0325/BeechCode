@@ -51,8 +51,10 @@ setwd(PROJECT_ROOT)
 
 OBJ_DIR <- file.path(PROJECT_ROOT, "outputs", "v1", "objects")
 TABLES_SUPP_DIR <- file.path(PROJECT_ROOT, "outputs", "tables", "supplementary")
+MICROCHECKER_DIR <- file.path(PROJECT_ROOT, "outputs", "microchecker")
 dir.create(OBJ_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(TABLES_SUPP_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(MICROCHECKER_DIR, recursive = TRUE, showWarnings = FALSE)
 
 resolve_col <- function(df, choices) {
   nms <- names(df)
@@ -596,6 +598,111 @@ build_mll_clone_corrected_object <- function(gi) {
   )
 }
 
+split_genotype_pair <- function(x, missing_code = "0") {
+  x_chr <- trimws(as.character(x))
+  x_chr[is.na(x_chr)] <- ""
+  out <- matrix(missing_code, nrow = length(x_chr), ncol = 2)
+  colnames(out) <- c("A1", "A2")
+  
+  missing_vals <- !nzchar(x_chr) | tolower(x_chr) %in% c("na", "n/a", "null", ".", "-", "?", "0")
+  if (all(missing_vals)) return(out)
+  
+  parsed <- strsplit(x_chr[!missing_vals], "/", fixed = TRUE)
+  valid <- lengths(parsed) == 2
+  
+  if (any(!valid)) {
+    bad <- unique(x_chr[!missing_vals][!valid])
+    stop("[00_master_pipeline] Unexpected diploid genotype format. Expected 'allele1/allele2'. Examples: ",
+         paste(head(bad, 10), collapse = ", "))
+  }
+  
+  left <- trimws(vapply(parsed, `[`, character(1), 1))
+  right <- trimws(vapply(parsed, `[`, character(1), 2))
+  left[!nzchar(left) | tolower(left) %in% c("na", "n/a", "null", ".", "-", "?", "0")] <- missing_code
+  right[!nzchar(right) | tolower(right) %in% c("na", "n/a", "null", ".", "-", "?", "0")] <- missing_code
+  
+  idx <- which(!missing_vals)
+  out[idx, 1] <- left
+  out[idx, 2] <- right
+  out
+}
+
+build_microchecker_export_table <- function(gi_obj, missing_code = "0") {
+  if (inherits(gi_obj, "genclone")) {
+    gi_obj <- adegenet::as.genind(gi_obj)
+  }
+  if (!inherits(gi_obj, "genind")) {
+    stop("[00_master_pipeline] Micro-Checker export expects a genind/genclone object.")
+  }
+  
+  gi_df <- adegenet::genind2df(gi_obj, sep = "/", oneColPerAll = FALSE, usepop = FALSE)
+  loci <- adegenet::locNames(gi_obj)
+  inds <- adegenet::indNames(gi_obj)
+  pops <- as.character(adegenet::pop(gi_obj))
+  if (any(is.na(pops) | !nzchar(pops))) {
+    stop("[00_master_pipeline] Micro-Checker export requires population/site labels for all individuals.")
+  }
+  
+  out <- data.frame(
+    Site = pops,
+    ind_id = inds,
+    stringsAsFactors = FALSE
+  )
+  
+  for (loc in loci) {
+    pair <- split_genotype_pair(gi_df[[loc]], missing_code = missing_code)
+    out[[paste0(loc, "_1")]] <- pair[, 1]
+    out[[paste0(loc, "_2")]] <- pair[, 2]
+  }
+  
+  ord <- order(out$Site, out$ind_id)
+  out[ord, , drop = FALSE]
+}
+
+write_microchecker_export <- function(gi_obj,
+                                      output_txt,
+                                      output_preview_csv = NULL,
+                                      missing_code = "0",
+                                      export_label = "gi") {
+  # Micro-Checker export section:
+  # - This creates a text-based codominant diploid microsatellite genotype file
+  #   intended for Micro-Checker input on Windows.
+  # - Purpose: test for potential null alleles in a dedicated external tool.
+  # - This section only exports data; it does NOT run null-allele analyses.
+  # - Format written here keeps one row per individual, grouped by Site, and
+  #   each locus split into two allele columns with missing data coded as "0".
+  export_tbl <- build_microchecker_export_table(gi_obj, missing_code = missing_code)
+  
+  out_dir <- dirname(output_txt)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  write.table(
+    export_tbl,
+    file = output_txt,
+    sep = "\t",
+    row.names = FALSE,
+    col.names = FALSE,
+    quote = FALSE,
+    na = missing_code
+  )
+  
+  if (!is.null(output_preview_csv)) {
+    write.csv(export_tbl, output_preview_csv, row.names = FALSE, na = missing_code)
+  }
+  
+  if (!file.exists(output_txt)) {
+    stop("[00_master_pipeline] Micro-Checker export failed (text file was not created): ", output_txt)
+  }
+  if (nrow(export_tbl) != adegenet::nInd(gi_obj)) {
+    stop("[00_master_pipeline] Micro-Checker export failed row-count check for ", export_label, ".")
+  }
+  
+  message("[00_master_pipeline] Micro-Checker export (", export_label, ") saved: ", output_txt)
+  if (!is.null(output_preview_csv)) {
+    message("[00_master_pipeline] Micro-Checker preview CSV (", export_label, ") saved: ", output_preview_csv)
+  }
+}
+
 build_objects <- function() {
   scanned <- scan_sources()
   
@@ -662,6 +769,27 @@ build_objects <- function() {
     Bruvo_MLL_threshold = mll_build$threshold,
     Bruvo_algorithm = mll_build$algorithm,
     stringsAsFactors = FALSE
+  )
+  
+  # Export filtered full dataset (gi) for Micro-Checker null-allele diagnostics.
+  # Rationale: this preserves all non-excluded, QC-filtered individuals and keeps
+  # repeated genotypes that are informative for heterozygote deficiency checks.
+  write_microchecker_export(
+    gi_obj = gi,
+    output_txt = file.path(MICROCHECKER_DIR, "microchecker_input.txt"),
+    output_preview_csv = file.path(MICROCHECKER_DIR, "microchecker_input_preview.csv"),
+    missing_code = "0",
+    export_label = "filtered_full_dataset_gi"
+  )
+  
+  # Optional companion export: clone-corrected dataset (gi_mll), useful when
+  # comparing null-allele patterns with and without clonal replicates.
+  write_microchecker_export(
+    gi_obj = gi_mll,
+    output_txt = file.path(MICROCHECKER_DIR, "microchecker_input_clone_corrected.txt"),
+    output_preview_csv = file.path(MICROCHECKER_DIR, "microchecker_input_clone_corrected_preview.csv"),
+    missing_code = "0",
+    export_label = "clone_corrected_dataset_gi_mll"
   )
   
   message("[00_master_pipeline] Number of raw genotype IDs: ", built$diagnostics$n_raw_ids,

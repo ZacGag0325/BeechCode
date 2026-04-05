@@ -81,6 +81,14 @@ split_genotype <- function(x) {
 }
 
 # ------------------------------------------------------------
+# Helper: identify missing/invalid genotype strings
+# ------------------------------------------------------------
+is_missing_genotype <- function(x) {
+  x <- trimws(as.character(x))
+  is.na(x) | x == "" | x %in% c("NA", "0", "0/0", "NA/NA", "-")
+}
+
+# ------------------------------------------------------------
 # Helper: multiple-testing correction with NA-safe handling
 # ------------------------------------------------------------
 add_hwe_multipletest_columns <- function(df,
@@ -408,3 +416,270 @@ save_main_and_supp <- function(df, filename) {
 save_main_and_supp(hwe_by_locus, "hwe_by_locus.csv")
 save_main_and_supp(hwe_by_site, "hwe_by_site.csv")
 save_main_and_supp(hwe_by_locus_within_site, "hwe_by_locus_within_site.csv")
+
+# ------------------------------------------------------------
+# NEW SECTION: Multilocus linkage disequilibrium (LD) testing
+# ------------------------------------------------------------
+# Rationale and interpretation guardrails:
+# - This LD section uses the same clone-corrected object (gi_mll) as HWE,
+#   so repeated clonemates do not inflate genotypic associations.
+# - For diploid, codominant microsatellite loci, we test non-random
+#   association among multilocus genotypes between pairs of loci using
+#   contingency-table tests (chi-squared with Monte Carlo p-values).
+# - Elevated LD across ostensibly unlinked loci can be consistent with a
+#   pooled-structure (Wahlund-effect-type) pattern, but LD alone is not
+#   definitive proof of a Wahlund effect.
+# - LD can also arise from physical linkage, drift, small sample size,
+#   admixture history, or other demographic processes.
+# - Therefore LD results should be treated as supportive evidence and
+#   interpreted jointly with HWE/FIS, STRUCTURE/PCA/DAPC, and FST/Jost's D.
+
+LD_MONTE_CARLO_REPS <- 9999L
+LD_MIN_NON_MISSING_N <- 8L
+LD_ALPHA <- 0.05
+
+message("[02_hwe] Running multilocus LD tests on gi_mll (clone-corrected)...")
+message("[02_hwe] Pairwise LD test: stats::chisq.test (Monte Carlo p-values), B = ", LD_MONTE_CARLO_REPS)
+message("[02_hwe] Multiple-testing correction for pairwise LD: Benjamini-Hochberg (FDR)")
+
+# ------------------------------------------------------------
+# Helper: pairwise locus-by-locus LD within a given genind scope
+# ------------------------------------------------------------
+run_pairwise_ld_for_scope <- function(gobj,
+                                      scope_name,
+                                      min_n = LD_MIN_NON_MISSING_N,
+                                      B = LD_MONTE_CARLO_REPS,
+                                      alpha = LD_ALPHA) {
+  gdf_scope <- adegenet::genind2df(gobj, sep = "/")
+  loci_scope <- setdiff(names(gdf_scope), "pop")
+  
+  if (length(loci_scope) < 2) {
+    return(data.frame(
+      Scope = character(0),
+      Locus1 = character(0),
+      Locus2 = character(0),
+      Test_statistic = numeric(0),
+      P_value = numeric(0),
+      P_value_adjusted = numeric(0),
+      Significant = logical(0),
+      N_non_missing_pair = integer(0),
+      Missing_fraction_pair = numeric(0),
+      Status = character(0),
+      Notes = character(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  pairs <- utils::combn(loci_scope, 2, simplify = FALSE)
+  out <- vector("list", length(pairs))
+  
+  for (i in seq_along(pairs)) {
+    l1 <- pairs[[i]][1]
+    l2 <- pairs[[i]][2]
+    g1 <- trimws(as.character(gdf_scope[[l1]]))
+    g2 <- trimws(as.character(gdf_scope[[l2]]))
+    
+    keep <- !(is_missing_genotype(g1) | is_missing_genotype(g2))
+    n_non_missing <- sum(keep)
+    miss_frac <- 1 - (n_non_missing / nrow(gdf_scope))
+    
+    if (n_non_missing < min_n) {
+      out[[i]] <- data.frame(
+        Scope = scope_name,
+        Locus1 = l1,
+        Locus2 = l2,
+        Test_statistic = NA_real_,
+        P_value = NA_real_,
+        P_value_adjusted = NA_real_,
+        Significant = FALSE,
+        N_non_missing_pair = as.integer(n_non_missing),
+        Missing_fraction_pair = as.numeric(miss_frac),
+        Status = "skipped",
+        Notes = sprintf("too_few_individuals_non_missing_for_pair (N=%d < %d)", n_non_missing, min_n),
+        stringsAsFactors = FALSE
+      )
+      next
+    }
+    
+    tbl <- table(g1[keep], g2[keep])
+    
+    if (nrow(tbl) < 2 || ncol(tbl) < 2) {
+      out[[i]] <- data.frame(
+        Scope = scope_name,
+        Locus1 = l1,
+        Locus2 = l2,
+        Test_statistic = NA_real_,
+        P_value = NA_real_,
+        P_value_adjusted = NA_real_,
+        Significant = FALSE,
+        N_non_missing_pair = as.integer(n_non_missing),
+        Missing_fraction_pair = as.numeric(miss_frac),
+        Status = "skipped",
+        Notes = "invariant_or_single_level_locus_pair",
+        stringsAsFactors = FALSE
+      )
+      next
+    }
+    
+    err <- NULL
+    ld_fit <- tryCatch({
+      stats::chisq.test(tbl, simulate.p.value = TRUE, B = B)
+    }, error = function(e) {
+      err <<- conditionMessage(e)
+      NULL
+    })
+    
+    if (is.null(ld_fit) || is.null(ld_fit$p.value) || !is.finite(ld_fit$p.value)) {
+      out[[i]] <- data.frame(
+        Scope = scope_name,
+        Locus1 = l1,
+        Locus2 = l2,
+        Test_statistic = NA_real_,
+        P_value = NA_real_,
+        P_value_adjusted = NA_real_,
+        Significant = FALSE,
+        N_non_missing_pair = as.integer(n_non_missing),
+        Missing_fraction_pair = as.numeric(miss_frac),
+        Status = "failed",
+        Notes = if (!is.null(err) && nzchar(err)) paste0("ld_test_failed: ", err) else "ld_test_failed",
+        stringsAsFactors = FALSE
+      )
+      next
+    }
+    
+    out[[i]] <- data.frame(
+      Scope = scope_name,
+      Locus1 = l1,
+      Locus2 = l2,
+      Test_statistic = as.numeric(ld_fit$statistic),
+      P_value = as.numeric(ld_fit$p.value),
+      P_value_adjusted = NA_real_,
+      Significant = FALSE,
+      N_non_missing_pair = as.integer(n_non_missing),
+      Missing_fraction_pair = as.numeric(miss_frac),
+      Status = "ok",
+      Notes = "tested",
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  res <- dplyr::bind_rows(out)
+  ok <- which(res$Status == "ok" & is.finite(res$P_value) & !is.na(res$P_value))
+  if (length(ok) > 0) {
+    res$P_value_adjusted[ok] <- p.adjust(res$P_value[ok], method = "BH")
+    res$Significant[ok] <- res$P_value_adjusted[ok] < alpha
+  }
+  
+  res %>%
+    arrange(Scope, Locus1, Locus2)
+}
+
+# ------------------------------------------------------------
+# Overall pooled and by-site pairwise LD tests
+# ------------------------------------------------------------
+ld_pairwise_overall <- run_pairwise_ld_for_scope(
+  gobj = gi_mll,
+  scope_name = "overall"
+)
+
+ld_pairwise_by_site <- dplyr::bind_rows(lapply(sites, function(s) {
+  idx <- which(site_vec == s)
+  if (length(idx) == 0) {
+    return(NULL)
+  }
+  gi_site <- gi_mll[idx, ]
+  run_pairwise_ld_for_scope(
+    gobj = gi_site,
+    scope_name = s
+  )
+}))
+
+ld_pairwise_all <- dplyr::bind_rows(ld_pairwise_overall, ld_pairwise_by_site) %>%
+  select(
+    Scope,
+    Locus1,
+    Locus2,
+    Test_statistic,
+    P_value,
+    P_value_adjusted,
+    Significant,
+    N_non_missing_pair,
+    Missing_fraction_pair,
+    Status,
+    Notes
+  )
+
+# Required pairwise output
+ld_pairwise_file <- file.path(TABLES_DIR, "linkage_disequilibrium_pairwise.csv")
+write.csv(ld_pairwise_all, ld_pairwise_file, row.names = FALSE)
+message("[02_hwe] Saved: ", ld_pairwise_file)
+
+# Optional by-site convenience output (requested when feasible)
+ld_by_site_summary <- ld_pairwise_all %>%
+  filter(Scope != "overall") %>%
+  group_by(Scope) %>%
+  summarise(
+    Number_of_loci = dplyr::n_distinct(c(Locus1, Locus2)),
+    Number_of_pairwise_tests = sum(Status == "ok", na.rm = TRUE),
+    Number_significant_before_correction = sum(Status == "ok" & !is.na(P_value) & P_value < LD_ALPHA, na.rm = TRUE),
+    Number_significant_after_correction = sum(Status == "ok" & Significant, na.rm = TRUE),
+    Notes = "Pairwise multilocus genotype-association tests by Site (Monte Carlo chi-squared, BH-FDR within Site).",
+    .groups = "drop"
+  ) %>%
+  rename(Site = Scope) %>%
+  arrange(Site)
+
+ld_by_site_file <- file.path(TABLES_DIR, "linkage_disequilibrium_by_site.csv")
+write.csv(ld_by_site_summary, ld_by_site_file, row.names = FALSE)
+message("[02_hwe] Saved: ", ld_by_site_file)
+
+# ------------------------------------------------------------
+# Global LD summary table (overall + each Site)
+# ------------------------------------------------------------
+build_ld_global_row <- function(df_scope, scope_label) {
+  if (nrow(df_scope) == 0) {
+    return(data.frame(
+      Scope = scope_label,
+      Number_of_loci = 0L,
+      Number_of_pairwise_tests = 0L,
+      Number_significant_before_correction = 0L,
+      Number_significant_after_correction = 0L,
+      Notes = "No locus pairs available for LD testing in this scope.",
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  tested <- df_scope$Status == "ok"
+  data.frame(
+    Scope = scope_label,
+    Number_of_loci = as.integer(dplyr::n_distinct(c(df_scope$Locus1, df_scope$Locus2))),
+    Number_of_pairwise_tests = as.integer(sum(tested, na.rm = TRUE)),
+    Number_significant_before_correction = as.integer(sum(tested & !is.na(df_scope$P_value) & df_scope$P_value < LD_ALPHA, na.rm = TRUE)),
+    Number_significant_after_correction = as.integer(sum(tested & !is.na(df_scope$P_value_adjusted) & df_scope$P_value_adjusted < LD_ALPHA, na.rm = TRUE)),
+    Notes = "Elevated LD among unlinked loci can be consistent with pooled structure (Wahlund effect) but is supportive only; interpret with HWE/FIS, structure analyses, and differentiation metrics.",
+    stringsAsFactors = FALSE
+  )
+}
+
+ld_global <- dplyr::bind_rows(
+  build_ld_global_row(ld_pairwise_all %>% filter(Scope == "overall"), "overall"),
+  dplyr::bind_rows(lapply(sort(unique(ld_pairwise_all$Scope[ld_pairwise_all$Scope != "overall"])), function(s) {
+    build_ld_global_row(ld_pairwise_all %>% filter(Scope == s), s)
+  }))
+)
+
+ld_global_file <- file.path(TABLES_DIR, "linkage_disequilibrium_global.csv")
+write.csv(ld_global, ld_global_file, row.names = FALSE)
+message("[02_hwe] Saved: ", ld_global_file)
+
+# ------------------------------------------------------------
+# Optional Excel exports (only if writexl is installed)
+# ------------------------------------------------------------
+if (requireNamespace("writexl", quietly = TRUE)) {
+  writexl::write_xlsx(ld_pairwise_all, path = file.path(TABLES_DIR, "linkage_disequilibrium_pairwise.xlsx"))
+  writexl::write_xlsx(ld_global, path = file.path(TABLES_DIR, "linkage_disequilibrium_global.xlsx"))
+  writexl::write_xlsx(ld_by_site_summary, path = file.path(TABLES_DIR, "linkage_disequilibrium_by_site.xlsx"))
+  message("[02_hwe] Saved Excel LD outputs to: ", TABLES_DIR)
+} else {
+  message("[02_hwe] Package 'writexl' not installed; skipping Excel LD exports.")
+}

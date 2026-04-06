@@ -691,7 +691,7 @@ detect_loci_spec <- function(tbl, id_col, pop_col) {
 
 sanitize_genepop_id <- function(x) {
   id <- trimws(as.character(x))
-  id <- strip_to_ascii_plain(id)
+  id <- gsub("[[:cntrl:]]", "", id)
   id <- gsub(",", "_", id, fixed = TRUE)
   id <- gsub("[[:space:]]+", "_", id, perl = TRUE)
   id <- gsub("[^A-Za-z0-9_.-]", "_", id, perl = TRUE)
@@ -699,21 +699,6 @@ sanitize_genepop_id <- function(x) {
   id <- gsub("^_+|_+$", "", id, perl = TRUE)
   id[!nzchar(id)] <- "IND"
   id
-}
-
-strip_to_ascii_plain <- function(x) {
-  x <- trimws(as.character(x))
-  x[is.na(x)] <- ""
-  x <- gsub("\uFEFF", "", x, fixed = TRUE)
-  x <- gsub("[\u2018\u2019\u2032]", "'", x, perl = TRUE)
-  x <- gsub("[\u201C\u201D\u2033]", "\"", x, perl = TRUE)
-  x <- gsub("[\u2013\u2014]", "-", x, perl = TRUE)
-  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "")
-  x[is.na(x)] <- ""
-  x <- gsub("[[:cntrl:]]", "", x)
-  x <- gsub("[^\x20-\x7E]", "", x, perl = TRUE)
-  x <- gsub("\\s+", " ", x, perl = TRUE)
-  trimws(x)
 }
 
 parse_single_genotype_to_6digits <- function(x) {
@@ -774,7 +759,7 @@ build_genepop_lines <- function(title_line, locus_names, out_tbl) {
 }
 
 format_microchecker_title_line <- function(raw_title = "My Microsatellite Data - MICROC") {
-  title_clean <- strip_to_ascii_plain(raw_title)
+  title_clean <- trimws(as.character(raw_title))
   title_clean <- gsub('"', "", title_clean, fixed = TRUE)
   title_clean
 }
@@ -787,23 +772,13 @@ validate_microchecker_genepop_lines <- function(lines, locus_names, title_line) 
   if (!identical(lines[1], title_line)) {
     stop("[00_master_pipeline] Genepop validation failed: first line must exactly equal title line.")
   }
-  if (any(!nzchar(locus_names))) {
-    stop("[00_master_pipeline] Genepop validation failed: locus names must not be blank.")
-  }
-  
   if (grepl("\t", lines[1], fixed = TRUE)) {
     stop("[00_master_pipeline] Genepop validation failed: title line must not contain tabs.")
-  }
-  if (grepl("[^\x00-\x7F]", lines[1], perl = TRUE)) {
-    stop("[00_master_pipeline] Genepop validation failed: title line must be ASCII.")
   }
   
   expected_locus_lines <- lines[seq_len(length(locus_names)) + 1]
   if (!identical(expected_locus_lines, locus_names)) {
     stop("[00_master_pipeline] Genepop validation failed: locus lines do not match expected locus order.")
-  }
-  if (any(grepl("[^\x00-\x7F]", expected_locus_lines, perl = TRUE))) {
-    stop("[00_master_pipeline] Genepop validation failed: locus lines must be ASCII.")
   }
   if (any(grepl(",", expected_locus_lines, fixed = TRUE))) {
     stop("[00_master_pipeline] Genepop validation failed: locus lines must not contain commas.")
@@ -816,18 +791,12 @@ validate_microchecker_genepop_lines <- function(lines, locus_names, title_line) 
   
   expected_locus_count <- NA_integer_
   for (ln in data_lines) {
-    if (!nzchar(ln)) {
-      stop("[00_master_pipeline] Genepop validation failed: blank lines are not allowed.")
-    }
     if (identical(ln, "Pop")) next
     if (grepl("^Pop\\S", ln)) {
       stop("[00_master_pipeline] Genepop validation failed: population separators must be exactly 'Pop'. Bad line: ", ln)
     }
     if (grepl("\t", ln, fixed = TRUE)) {
       stop("[00_master_pipeline] Genepop validation failed: tabs are not allowed in data lines.")
-    }
-    if (grepl("[^\x00-\x7F]", ln, perl = TRUE)) {
-      stop("[00_master_pipeline] Genepop validation failed: data lines must be ASCII only. Bad line: ", ln)
     }
     if (grepl("^\\s|\\s$", ln, perl = TRUE)) {
       stop("[00_master_pipeline] Genepop validation failed: no leading/trailing spaces are allowed in data lines. Bad line: ", ln)
@@ -859,30 +828,12 @@ validate_microchecker_genepop_lines <- function(lines, locus_names, title_line) 
   TRUE
 }
 
-write_plain_text_crlf_no_bom <- function(lines, output_path) {
-  if (!is.character(lines) || length(lines) == 0) {
-    stop("[00_master_pipeline] Cannot write empty Genepop output.")
-  }
-  if (any(grepl("\t", lines, fixed = TRUE))) {
-    stop("[00_master_pipeline] Refusing to write Genepop output: tabs detected.")
-  }
-  if (any(grepl("[^\x00-\x7F]", lines, perl = TRUE))) {
-    stop("[00_master_pipeline] Refusing to write Genepop output: non-ASCII characters detected.")
-  }
-  lines <- gsub("\\s+$", "", lines, perl = TRUE)
-  payload <- paste0(paste(lines, collapse = "\r\n"), "\r\n")
-  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
-  con <- file(output_path, open = "wb")
-  on.exit(close(con), add = TRUE)
-  writeBin(charToRaw(payload), con)
-}
-
 write_microchecker_genepop_export <- function(tbl,
                                               id_col = NULL,
                                               pop_col = NULL,
                                               allowed_ids_norm = NULL,
                                               id_to_pop = NULL,
-                                              output_path = file.path(MICROCHECKER_DIR, "microchecker_input.txt"),
+                                              output_path = file.path(MICROCHECKER_DIR, "microchecker_input.dat"),
                                               title_line = "My Microsatellite Data - MICROC") {
   if (!is.data.frame(tbl) || nrow(tbl) == 0 || ncol(tbl) == 0) {
     stop("[00_master_pipeline] Micro-Checker Genepop export expects a non-empty data.frame.")
@@ -943,18 +894,15 @@ write_microchecker_genepop_export <- function(tbl,
     stop("[00_master_pipeline] Missing population/site assignment for one or more individuals in Genepop export. Examples: ",
          paste(head(bad_ids, 20), collapse = ", "))
   }
-  work$.__pop <- strip_to_ascii_plain(pop_vals)
+  work$.__pop <- trimws(pop_vals)
   work <- work[!duplicated(work$.__id_norm), , drop = FALSE]
   
   safe_ids <- sanitize_genepop_id(work$.__id_raw)
   safe_ids <- make_unique_ids(safe_ids)
   
-  locus_names <- strip_to_ascii_plain(loci_spec$spec$locus)
+  locus_names <- loci_spec$spec$locus
   if (length(locus_names) == 0) {
     stop("[00_master_pipeline] No loci detected for Micro-Checker Genepop export.")
-  }
-  if (any(!nzchar(locus_names))) {
-    stop("[00_master_pipeline] Locus names cannot be empty after ASCII sanitization.")
   }
   
   genotype_by_locus <- vector("list", length(locus_names))
@@ -996,12 +944,11 @@ write_microchecker_genepop_export <- function(tbl,
     locus_names = locus_names,
     out_tbl = out_tbl
   )
-  genepop_lines <- strip_to_ascii_plain(genepop_lines)
   genepop_lines <- gsub("\r", "", genepop_lines, fixed = TRUE)
-  genepop_lines <- gsub("\\s+$", "", genepop_lines, perl = TRUE)
   validate_microchecker_genepop_lines(genepop_lines, locus_names, title_line = title_line)
   
-  write_plain_text_crlf_no_bom(genepop_lines, output_path = output_path)
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  writeLines(genepop_lines, con = output_path, sep = "\n", useBytes = TRUE)
   
   if (!file.exists(output_path)) {
     stop("[00_master_pipeline] Failed to create Genepop output file: ", output_path)
@@ -1101,7 +1048,7 @@ build_objects <- function() {
     pop_col = geno_source$summary$site_col,
     allowed_ids_norm = normalize_id(adegenet::indNames(gi)),
     id_to_pop = id_to_site,
-    output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_input.txt"),
+    output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_input.dat"),
     title_line = "My Microsatellite Data - MICROC"
   )
   # ===== Micro-Checker / TRUE Genepop export: END =====

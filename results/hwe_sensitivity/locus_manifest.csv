@@ -1,0 +1,3 @@
+"dataset","n_loci","loci","removed_loci"
+"FULL",15,"csolfagus_05;csolfagus_06;csolfagus_19;csolfagus_29;csolfagus_31;DUKCT_A_0;EEU75_A_0;EJV8T_A_0;EMILY_A_0;ERHBI_A_0;FCM5;FG5;FS1-15F;sfc_0036;sfc_1143",""
+"REDUCED",15,"csolfagus_05;csolfagus_06;csolfagus_19;csolfagus_29;csolfagus_31;DUKCT_A_0;EEU75_A_0;EJV8T_A_0;EMILY_A_0;ERHBI_A_0;FCM5;FG5;FS1-15F;sfc_0036;sfc_1143","EJV8T_A_0;ERHBI_A_0;FCM5;FG5"

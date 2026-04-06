@@ -98,8 +98,26 @@ validate_locus_filter <- function(gobj, loci_to_remove) {
 }
 
 subset_genind_loci <- function(gobj, loci_keep) {
-  keep_idx <- adegenet::locNames(gobj) %in% loci_keep
-  out <- gobj[, keep_idx, drop = FALSE]
+  loci_keep <- as.character(loci_keep)
+  loci_available <- adegenet::locNames(gobj)
+  if (!all(loci_keep %in% loci_available)) {
+    missing <- setdiff(loci_keep, loci_available)
+    stop("[hwe_sensitivity] Cannot subset loci. Missing requested locus/loci: ", paste(missing, collapse = ", "))
+  }
+  
+  # Subset loci by explicit locus names (not logical recycling over allele columns).
+  out <- gobj[, loci_keep, drop = FALSE]
+  
+  if (is.null(adegenet::pop(out)) || length(adegenet::pop(out)) != adegenet::nInd(out)) {
+    adegenet::pop(out) <- adegenet::pop(gobj)
+  }
+  
+  if (adegenet::nLoc(out) != length(loci_keep)) {
+    stop(
+      "[hwe_sensitivity] Locus subsetting mismatch: expected ", length(loci_keep),
+      " loci but got ", adegenet::nLoc(out), "."
+    )
+  }
   if (!inherits(out, "genind")) stop("[hwe_sensitivity] Locus subsetting failed (not a genind object).")
   out
 }
@@ -464,20 +482,18 @@ run_pca_bundle <- function(gobj, dataset_label) {
 }
 
 count_alleles_by_locus <- function(gobj, dataset_label) {
-  geno_df <- adegenet::genind2df(gobj, sep = "/")
-  loci <- adegenet::locNames(gobj)
-  
-  parse_alleles <- function(x) {
-    parts <- strsplit(as.character(x), split = "/", fixed = TRUE)
-    unique(unlist(parts, use.names = FALSE))
-  }
+  locus_alleles <- adegenet::alleles(gobj)
+  loci <- names(locus_alleles)
   
   out <- lapply(loci, function(loc) {
-    vals <- geno_df[[loc]]
-    vals <- vals[!is.na(vals) & nzchar(vals)]
-    alleles <- parse_alleles(vals)
-    alleles <- alleles[!is.na(alleles) & nzchar(alleles)]
-    data.frame(Dataset = dataset_label, Locus = loc, N_alleles = dplyr::n_distinct(alleles), stringsAsFactors = FALSE)
+    a <- as.character(locus_alleles[[loc]])
+    a <- a[!is.na(a) & nzchar(a)]
+    data.frame(
+      Dataset = dataset_label,
+      Locus = loc,
+      N_alleles = dplyr::n_distinct(a),
+      stringsAsFactors = FALSE
+    )
   })
   
   bind_rows(out)

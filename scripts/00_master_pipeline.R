@@ -51,7 +51,7 @@ setwd(PROJECT_ROOT)
 
 OBJ_DIR <- file.path(PROJECT_ROOT, "outputs", "v1", "objects")
 TABLES_SUPP_DIR <- file.path(PROJECT_ROOT, "outputs", "tables", "supplementary")
-MICROCHECKER_DIR <- file.path(PROJECT_ROOT, "outputs", "microchecker")
+MICROCHECKER_DIR <- file.path(PROJECT_ROOT, "data", "derived")
 dir.create(OBJ_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(TABLES_SUPP_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(MICROCHECKER_DIR, recursive = TRUE, showWarnings = FALSE)
@@ -619,49 +619,143 @@ format_allele_to_3digits <- function(x) {
   sprintf("%03d", as.integer(round(x_num)))
 }
 
-detect_allele_pairs <- function(tbl, id_col, pop_col) {
+detect_loci_spec <- function(tbl, id_col, pop_col) {
   protected_cols <- c(id_col, pop_col)
   protected_cols <- protected_cols[!is.na(protected_cols)]
   
   candidate_cols <- setdiff(names(tbl), protected_cols)
   allele_cols <- candidate_cols[grepl("(_|\\.)[12]$", candidate_cols, perl = TRUE)]
-  
-  if (length(allele_cols) == 0) {
-    stop("[00_master_pipeline] Could not detect paired allele columns ending in '_1/_2' or '.1/.2'.")
-  }
   if ((length(allele_cols) %% 2) != 0) {
     stop("[00_master_pipeline] Detected an odd number of allele columns (", length(allele_cols), "). Each locus must have exactly two allele columns.")
   }
-  
-  loci <- sub("(_|\\.)[12]$", "", allele_cols, perl = TRUE)
-  loci_tbl <- split(allele_cols, loci)
-  
-  missing_pairs <- names(loci_tbl)[vapply(loci_tbl, function(cols) {
-    has1 <- any(grepl("(_|\\.)1$", cols, perl = TRUE))
-    has2 <- any(grepl("(_|\\.)2$", cols, perl = TRUE))
-    !(has1 && has2)
-  }, logical(1))]
-  
-  if (length(missing_pairs) > 0) {
-    stop("[00_master_pipeline] Some loci are missing one of the required allele columns (_1/_2 or .1/.2): ",
-         paste(head(missing_pairs, 20), collapse = ", "))
+  if (length(allele_cols) > 0) {
+    loci <- sub("(_|\\.)[12]$", "", allele_cols, perl = TRUE)
+    loci_tbl <- split(allele_cols, loci)
+    missing_pairs <- names(loci_tbl)[vapply(loci_tbl, function(cols) {
+      has1 <- any(grepl("(_|\\.)1$", cols, perl = TRUE))
+      has2 <- any(grepl("(_|\\.)2$", cols, perl = TRUE))
+      !(has1 && has2)
+    }, logical(1))]
+    
+    if (length(missing_pairs) > 0) {
+      stop("[00_master_pipeline] Some loci are missing one of the required allele columns (_1/_2 or .1/.2): ",
+           paste(head(missing_pairs, 20), collapse = ", "))
+    }
+    
+    ordered_loci <- unique(loci)
+    paired_tbl <- data.frame(
+      locus = ordered_loci,
+      a1_col = vapply(ordered_loci, function(loc) {
+        cols <- loci_tbl[[loc]]
+        cols[grepl("(_|\\.)1$", cols, perl = TRUE)][1]
+      }, character(1)),
+      a2_col = vapply(ordered_loci, function(loc) {
+        cols <- loci_tbl[[loc]]
+        cols[grepl("(_|\\.)2$", cols, perl = TRUE)][1]
+      }, character(1)),
+      stringsAsFactors = FALSE
+    )
+    return(list(kind = "paired", spec = paired_tbl))
   }
   
-  ordered_loci <- sort(unique(loci))
-  pair_tbl <- data.frame(
-    locus = ordered_loci,
-    a1_col = vapply(ordered_loci, function(loc) {
-      cols <- loci_tbl[[loc]]
-      cols[grepl("(_|\\.)1$", cols, perl = TRUE)][1]
-    }, character(1)),
-    a2_col = vapply(ordered_loci, function(loc) {
-      cols <- loci_tbl[[loc]]
-      cols[grepl("(_|\\.)2$", cols, perl = TRUE)][1]
-    }, character(1)),
-    stringsAsFactors = FALSE
-  )
+  single_cols <- candidate_cols[!grepl("(_|\\.)[12]$", candidate_cols, perl = TRUE)]
+  if (length(single_cols) == 0) {
+    stop("[00_master_pipeline] Could not detect genotype locus columns for Micro-Checker Genepop export.")
+  }
   
-  pair_tbl
+  looks_like_single_genotype <- function(x) {
+    x_chr <- trimws(as.character(x))
+    x_chr <- x_chr[nzchar(x_chr) & !(tolower(x_chr) %in% c("na", "n/a", "null", ".", "-", "?", "000000", "0", "-9"))]
+    if (length(x_chr) == 0) return(FALSE)
+    x_chr <- gsub("\\s+", "", x_chr, perl = TRUE)
+    patt <- "^[0-9]{1,3}[/|:;,._ -][0-9]{1,3}$|^[0-9]{6}$"
+    mean(grepl(patt, x_chr, perl = TRUE)) >= 0.8
+  }
+  
+  locus_like <- vapply(single_cols, function(col) looks_like_single_genotype(tbl[[col]]), logical(1))
+  single_loci <- single_cols[locus_like]
+  
+  if (length(single_loci) == 0) {
+    stop("[00_master_pipeline] Could not detect paired allele columns or single-column genotype loci.")
+  }
+  
+  list(
+    kind = "single",
+    spec = data.frame(
+      locus = single_loci,
+      geno_col = single_loci,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+sanitize_genepop_id <- function(x) {
+  id <- trimws(as.character(x))
+  id <- gsub("[[:cntrl:]]", "", id)
+  id <- gsub(",", "_", id, fixed = TRUE)
+  id <- gsub("[[:space:]]+", "_", id, perl = TRUE)
+  id <- gsub("[^A-Za-z0-9_.-]", "_", id, perl = TRUE)
+  id <- gsub("_+", "_", id, perl = TRUE)
+  id <- gsub("^_+|_+$", "", id, perl = TRUE)
+  id[!nzchar(id)] <- "IND"
+  id
+}
+
+parse_single_genotype_to_6digits <- function(x) {
+  if (is_missing_allele_value(x)) {
+    return("000000")
+  }
+  x_chr <- trimws(as.character(x))
+  x_chr <- gsub("\\s+", "", x_chr, perl = TRUE)
+  if (grepl("^[0-9]{6}$", x_chr)) {
+    return(x_chr)
+  }
+  split_vals <- strsplit(x_chr, "[/|:;,._ -]", perl = TRUE)[[1]]
+  split_vals <- split_vals[nzchar(split_vals)]
+  if (length(split_vals) != 2) {
+    return("000000")
+  }
+  if (is_missing_allele_value(split_vals[1]) || is_missing_allele_value(split_vals[2])) {
+    return("000000")
+  }
+  paste0(
+    format_allele_to_3digits(split_vals[1]),
+    format_allele_to_3digits(split_vals[2])
+  )
+}
+
+build_genepop_code_from_pair <- function(a1, a2) {
+  if (is_missing_allele_value(a1) || is_missing_allele_value(a2)) {
+    return("000000")
+  }
+  paste0(
+    format_allele_to_3digits(a1),
+    format_allele_to_3digits(a2)
+  )
+}
+
+make_unique_ids <- function(ids) {
+  out <- ids
+  dup_groups <- split(seq_along(out), out)
+  for (g in dup_groups) {
+    if (length(g) <= 1) next
+    out[g] <- paste0(out[g], "_", seq_along(g))
+  }
+  out
+}
+
+build_genepop_lines <- function(title_line, locus_names, out_tbl) {
+  lines <- c(title_line, locus_names)
+  pop_order <- unique(out_tbl$pop)
+  for (p in pop_order) {
+    lines <- c(lines, "Pop")
+    sub <- out_tbl[out_tbl$pop == p, , drop = FALSE]
+    for (r in seq_len(nrow(sub))) {
+      geno_str <- paste(sub[r, locus_names, drop = TRUE], collapse = " ")
+      lines <- c(lines, paste0(sub$ind_id[r], ", ", geno_str))
+    }
+  }
+  lines
 }
 
 write_microchecker_genepop_export <- function(tbl,
@@ -670,7 +764,7 @@ write_microchecker_genepop_export <- function(tbl,
                                               allowed_ids_norm = NULL,
                                               id_to_pop = NULL,
                                               output_path = file.path(MICROCHECKER_DIR, "microchecker_genepop.txt"),
-                                              title_line = "BeechCode MicroChecker export") {
+                                              title_line = "My Microsatellite Data - MICROC") {
   if (!is.data.frame(tbl) || nrow(tbl) == 0 || ncol(tbl) == 0) {
     stop("[00_master_pipeline] Micro-Checker Genepop export expects a non-empty data.frame.")
   }
@@ -692,7 +786,7 @@ write_microchecker_genepop_export <- function(tbl,
     ))
   }
   
-  allele_pairs <- detect_allele_pairs(tbl, id_col = id_col, pop_col = pop_col)
+  loci_spec <- detect_loci_spec(tbl, id_col = id_col, pop_col = pop_col)
   
   work <- tbl
   work$.__id_raw <- trimws(as.character(work[[id_col]]))
@@ -730,80 +824,55 @@ write_microchecker_genepop_export <- function(tbl,
     stop("[00_master_pipeline] Missing population/site assignment for one or more individuals in Genepop export. Examples: ",
          paste(head(bad_ids, 20), collapse = ", "))
   }
-  work$.__pop <- pop_vals
+  work$.__pop <- trimws(pop_vals)
+  work <- work[!duplicated(work$.__id_norm), , drop = FALSE]
   
-  dup_rows <- duplicated(work$.__id_norm)
-  if (any(dup_rows)) {
-    message("[00_master_pipeline] Duplicate IDs detected in genotype source for Genepop export; keeping first occurrence per normalized ID.")
-    work <- work[!dup_rows, , drop = FALSE]
-  }
+  safe_ids <- sanitize_genepop_id(work$.__id_raw)
+  safe_ids <- make_unique_ids(safe_ids)
   
-  locus_names <- allele_pairs$locus
+  locus_names <- loci_spec$spec$locus
   if (length(locus_names) == 0) {
     stop("[00_master_pipeline] No loci detected for Micro-Checker Genepop export.")
   }
   
-  partial_missing_counter <- integer(length(locus_names))
   genotype_by_locus <- vector("list", length(locus_names))
-  
-  for (i in seq_along(locus_names)) {
-    a1_raw <- work[[allele_pairs$a1_col[i]]]
-    a2_raw <- work[[allele_pairs$a2_col[i]]]
-    
-    m1 <- is_missing_allele_value(a1_raw)
-    m2 <- is_missing_allele_value(a2_raw)
-    partial_missing <- xor(m1, m2)
-    partial_missing_counter[i] <- sum(partial_missing)
-    
-    a1_fmt <- rep("000", nrow(work))
-    a2_fmt <- rep("000", nrow(work))
-    
-    idx1 <- which(!m1)
-    idx2 <- which(!m2)
-    
-    if (length(idx1) > 0) {
-      a1_fmt[idx1] <- vapply(a1_raw[idx1], format_allele_to_3digits, character(1))
+  if (identical(loci_spec$kind, "paired")) {
+    for (i in seq_along(locus_names)) {
+      a1_raw <- work[[loci_spec$spec$a1_col[i]]]
+      a2_raw <- work[[loci_spec$spec$a2_col[i]]]
+      code <- vapply(seq_len(nrow(work)), function(idx) {
+        build_genepop_code_from_pair(a1_raw[idx], a2_raw[idx])
+      }, character(1))
+      genotype_by_locus[[i]] <- code
     }
-    if (length(idx2) > 0) {
-      a2_fmt[idx2] <- vapply(a2_raw[idx2], format_allele_to_3digits, character(1))
+  } else if (identical(loci_spec$kind, "single")) {
+    for (i in seq_along(locus_names)) {
+      g_raw <- work[[loci_spec$spec$geno_col[i]]]
+      code <- vapply(g_raw, parse_single_genotype_to_6digits, character(1))
+      genotype_by_locus[[i]] <- code
     }
-    
-    code <- ifelse(m1 & m2, "000000", paste0(a1_fmt, a2_fmt))
-    genotype_by_locus[[i]] <- code
-  }
-  
-  total_partial_missing <- sum(partial_missing_counter)
-  if (total_partial_missing > 0) {
-    bad_loci <- locus_names[partial_missing_counter > 0]
-    warning(
-      "[00_master_pipeline] Found ", total_partial_missing,
-      " locus calls with one allele missing and the other present. ",
-      "These were exported with the missing allele coded as 000. Loci affected: ",
-      paste(head(bad_loci, 20), collapse = ", "),
-      call. = FALSE
-    )
+  } else {
+    stop("[00_master_pipeline] Unsupported locus specification type for Genepop export: ", loci_spec$kind)
   }
   
   genotype_matrix <- do.call(cbind, genotype_by_locus)
   colnames(genotype_matrix) <- locus_names
   
   out_tbl <- data.frame(
-    ind_id = work$.__id_raw,
+    ind_id = safe_ids,
     pop = work$.__pop,
+    .row_order = seq_len(nrow(work)),
     stringsAsFactors = FALSE
   )
   out_tbl <- cbind(out_tbl, as.data.frame(genotype_matrix, stringsAsFactors = FALSE))
-  out_tbl <- out_tbl[order(out_tbl$pop, out_tbl$ind_id), , drop = FALSE]
+  out_tbl <- out_tbl[order(out_tbl$pop, out_tbl$.row_order, out_tbl$ind_id), , drop = FALSE]
+  out_tbl$.row_order <- NULL
   
-  genepop_lines <- c(title_line, paste(locus_names, collapse = ", "))
-  for (p in unique(out_tbl$pop)) {
-    genepop_lines <- c(genepop_lines, "Pop")
-    sub <- out_tbl[out_tbl$pop == p, , drop = FALSE]
-    for (r in seq_len(nrow(sub))) {
-      geno_str <- paste(sub[r, locus_names, drop = TRUE], collapse = " ")
-      genepop_lines <- c(genepop_lines, paste0(sub$ind_id[r], ", ", geno_str))
-    }
-  }
+  genepop_lines <- build_genepop_lines(
+    title_line = title_line,
+    locus_names = locus_names,
+    out_tbl = out_tbl
+  )
   
   dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
   writeLines(genepop_lines, con = output_path, useBytes = TRUE)
@@ -812,11 +881,11 @@ write_microchecker_genepop_export <- function(tbl,
     stop("[00_master_pipeline] Failed to create Genepop output file: ", output_path)
   }
   
-  message("[00_master_pipeline] Micro-Checker Genepop export complete.")
+  message("[00_master_pipeline] === Micro-Checker / Genepop export success ===")
+  message("[00_master_pipeline] Output file: ", output_path)
   message("[00_master_pipeline] Samples: ", nrow(out_tbl))
   message("[00_master_pipeline] Populations: ", length(unique(out_tbl$pop)))
   message("[00_master_pipeline] Loci: ", length(locus_names))
-  message("[00_master_pipeline] Output: ", output_path)
   
   invisible(list(
     n_samples = nrow(out_tbl),
@@ -826,6 +895,7 @@ write_microchecker_genepop_export <- function(tbl,
     locus_names = locus_names
   ))
 }
+
 
 build_objects <- function() {
   scanned <- scan_sources()
@@ -895,7 +965,8 @@ build_objects <- function() {
     stringsAsFactors = FALSE
   )
   
-  # Export filtered full dataset as a true Genepop plain-text file for
+  # ===== Micro-Checker / TRUE Genepop export: START =====
+  # Export filtered full dataset as a strict Genepop plain-text file for
   # Micro-Checker null-allele diagnostics.
   write_microchecker_genepop_export(
     tbl = geno_source$df,
@@ -903,9 +974,10 @@ build_objects <- function() {
     pop_col = geno_source$summary$site_col,
     allowed_ids_norm = normalize_id(adegenet::indNames(gi)),
     id_to_pop = id_to_site,
-    output_path = file.path(MICROCHECKER_DIR, "microchecker_genepop.txt"),
-    title_line = "BeechCode MicroChecker export"
+    output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_genepop.txt"),
+    title_line = "My Microsatellite Data - MICROC"
   )
+  # ===== Micro-Checker / TRUE Genepop export: END =====
   
   message("[00_master_pipeline] Number of raw genotype IDs: ", built$diagnostics$n_raw_ids,
           " (unique normalized: ", built$diagnostics$n_unique_raw_ids, ")")

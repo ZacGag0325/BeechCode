@@ -748,7 +748,7 @@ build_genepop_lines <- function(title_line, locus_names, out_tbl) {
   lines <- c(title_line, locus_names)
   pop_order <- unique(out_tbl$pop)
   for (p in pop_order) {
-    lines <- c(lines, "Pop")
+    lines <- c(lines, "POP")
     sub <- out_tbl[out_tbl$pop == p, , drop = FALSE]
     for (r in seq_len(nrow(sub))) {
       geno_str <- paste(sub[r, locus_names, drop = TRUE], collapse = " ")
@@ -758,10 +758,10 @@ build_genepop_lines <- function(title_line, locus_names, out_tbl) {
   lines
 }
 
-format_microchecker_title_line <- function(raw_title = "Microsatellite Dataset for MicroChecker") {
+format_microchecker_title_line <- function(raw_title = "My Microsatellite Data - MICROC") {
   title_clean <- trimws(as.character(raw_title))
   title_clean <- gsub('"', "", title_clean, fixed = TRUE)
-  paste0("Title: ", title_clean)
+  title_clean
 }
 
 validate_microchecker_genepop_lines <- function(lines, locus_names) {
@@ -769,27 +769,37 @@ validate_microchecker_genepop_lines <- function(lines, locus_names) {
     stop("[00_master_pipeline] Genepop validation failed: file content is too short.")
   }
   
-  if (!startsWith(lines[1], "Title:")) {
-    stop("[00_master_pipeline] Genepop validation failed: first line must start with 'Title:'.")
+  if (grepl("\t", lines[1], fixed = TRUE)) {
+    stop("[00_master_pipeline] Genepop validation failed: title line must not contain tabs.")
   }
   
   expected_locus_lines <- lines[seq_len(length(locus_names)) + 1]
   if (!identical(expected_locus_lines, locus_names)) {
     stop("[00_master_pipeline] Genepop validation failed: locus lines do not match expected locus order.")
   }
-  
-  data_lines <- lines[-seq_len(length(locus_names) + 1)]
-  if (length(data_lines) == 0 || !any(data_lines == "Pop")) {
-    stop("[00_master_pipeline] Genepop validation failed: at least one 'Pop' line is required.")
+  if (any(grepl(",", expected_locus_lines, fixed = TRUE))) {
+    stop("[00_master_pipeline] Genepop validation failed: locus lines must not contain commas.")
   }
   
+  data_lines <- lines[-seq_len(length(locus_names) + 1)]
+  if (length(data_lines) == 0 || !any(data_lines == "POP")) {
+    stop("[00_master_pipeline] Genepop validation failed: at least one 'POP' line is required.")
+  }
+  
+  expected_locus_count <- NA_integer_
   for (ln in data_lines) {
-    if (identical(ln, "Pop")) next
+    if (identical(ln, "POP")) next
     if (grepl("\t", ln, fixed = TRUE)) {
       stop("[00_master_pipeline] Genepop validation failed: tabs are not allowed in data lines.")
     }
+    if (grepl("^\\s|\\s$", ln, perl = TRUE)) {
+      stop("[00_master_pipeline] Genepop validation failed: no leading/trailing spaces are allowed in data lines. Bad line: ", ln)
+    }
     if (length(gregexpr(",", ln, fixed = TRUE)[[1]]) != 1) {
       stop("[00_master_pipeline] Genepop validation failed: each individual line must contain exactly one comma. Bad line: ", ln)
+    }
+    if (!grepl("^[^,]+, [0-9]{6}( [0-9]{6})*$", ln, perl = TRUE)) {
+      stop("[00_master_pipeline] Genepop validation failed: each individual line must follow 'ID, 000000 ...' with one space separators. Bad line: ", ln)
     }
     split_line <- strsplit(ln, ", ", fixed = TRUE)[[1]]
     if (length(split_line) != 2) {
@@ -802,6 +812,11 @@ validate_microchecker_genepop_lines <- function(lines, locus_names) {
     if (!all(grepl("^[0-9]{6}$", geno_codes))) {
       stop("[00_master_pipeline] Genepop validation failed: each locus code must be exactly 6 digits. Bad line: ", ln)
     }
+    if (is.na(expected_locus_count)) {
+      expected_locus_count <- length(geno_codes)
+    } else if (!identical(length(geno_codes), expected_locus_count)) {
+      stop("[00_master_pipeline] Genepop validation failed: inconsistent number of loci across individuals. Bad line: ", ln)
+    }
   }
   
   TRUE
@@ -813,7 +828,7 @@ write_microchecker_genepop_export <- function(tbl,
                                               allowed_ids_norm = NULL,
                                               id_to_pop = NULL,
                                               output_path = file.path(MICROCHECKER_DIR, "microchecker_genepop.txt"),
-                                              title_line = "Microsatellite Dataset for MicroChecker") {
+                                              title_line = "My Microsatellite Data - MICROC") {
   if (!is.data.frame(tbl) || nrow(tbl) == 0 || ncol(tbl) == 0) {
     stop("[00_master_pipeline] Micro-Checker Genepop export expects a non-empty data.frame.")
   }
@@ -1025,8 +1040,8 @@ build_objects <- function() {
     pop_col = geno_source$summary$site_col,
     allowed_ids_norm = normalize_id(adegenet::indNames(gi)),
     id_to_pop = id_to_site,
-    output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_genepop.txt"),
-    title_line = "Microsatellite Dataset for MicroChecker"
+    output_path = file.path(PROJECT_ROOT, "data", "processed", "microchecker_input.gen"),
+    title_line = "My Microsatellite Data - MICROC"
   )
   # ===== Micro-Checker / TRUE Genepop export: END =====
   

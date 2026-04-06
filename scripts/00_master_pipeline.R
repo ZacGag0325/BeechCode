@@ -758,10 +758,10 @@ build_genepop_lines <- function(title_line, locus_names, out_tbl) {
   lines
 }
 
-format_microchecker_title_line <- function(raw_title = "My Microsatellite Data - MICROC") {
+format_microchecker_title_line <- function(raw_title = "Microsatellite Dataset for MicroChecker") {
   title_clean <- trimws(as.character(raw_title))
   title_clean <- gsub('"', "", title_clean, fixed = TRUE)
-  paste0('Title line: "', title_clean, '"')
+  paste0("Title: ", title_clean)
 }
 
 validate_microchecker_genepop_lines <- function(lines, locus_names) {
@@ -769,8 +769,8 @@ validate_microchecker_genepop_lines <- function(lines, locus_names) {
     stop("[00_master_pipeline] Genepop validation failed: file content is too short.")
   }
   
-  if (!startsWith(lines[1], "Title line:")) {
-    stop("[00_master_pipeline] Genepop validation failed: first line must start with 'Title line:'.")
+  if (!startsWith(lines[1], "Title:")) {
+    stop("[00_master_pipeline] Genepop validation failed: first line must start with 'Title:'.")
   }
   
   expected_locus_lines <- lines[seq_len(length(locus_names)) + 1]
@@ -813,7 +813,7 @@ write_microchecker_genepop_export <- function(tbl,
                                               allowed_ids_norm = NULL,
                                               id_to_pop = NULL,
                                               output_path = file.path(MICROCHECKER_DIR, "microchecker_genepop.txt"),
-                                              title_line = "My Microsatellite Data - MICROC") {
+                                              title_line = "Microsatellite Dataset for MicroChecker") {
   if (!is.data.frame(tbl) || nrow(tbl) == 0 || ncol(tbl) == 0) {
     stop("[00_master_pipeline] Micro-Checker Genepop export expects a non-empty data.frame.")
   }
@@ -1026,7 +1026,7 @@ build_objects <- function() {
     allowed_ids_norm = normalize_id(adegenet::indNames(gi)),
     id_to_pop = id_to_site,
     output_path = file.path(PROJECT_ROOT, "data", "derived", "microchecker_genepop.txt"),
-    title_line = "My Microsatellite Data - MICROC"
+    title_line = "Microsatellite Dataset for MicroChecker"
   )
   # ===== Micro-Checker / TRUE Genepop export: END =====
   

@@ -758,6 +758,55 @@ build_genepop_lines <- function(title_line, locus_names, out_tbl) {
   lines
 }
 
+format_microchecker_title_line <- function(raw_title = "My Microsatellite Data - MICROC") {
+  title_clean <- trimws(as.character(raw_title))
+  title_clean <- gsub('"', "", title_clean, fixed = TRUE)
+  paste0('Title line: "', title_clean, '"')
+}
+
+validate_microchecker_genepop_lines <- function(lines, locus_names) {
+  if (length(lines) < (length(locus_names) + 2)) {
+    stop("[00_master_pipeline] Genepop validation failed: file content is too short.")
+  }
+  
+  if (!startsWith(lines[1], "Title line:")) {
+    stop("[00_master_pipeline] Genepop validation failed: first line must start with 'Title line:'.")
+  }
+  
+  expected_locus_lines <- lines[seq_len(length(locus_names)) + 1]
+  if (!identical(expected_locus_lines, locus_names)) {
+    stop("[00_master_pipeline] Genepop validation failed: locus lines do not match expected locus order.")
+  }
+  
+  data_lines <- lines[-seq_len(length(locus_names) + 1)]
+  if (length(data_lines) == 0 || !any(data_lines == "Pop")) {
+    stop("[00_master_pipeline] Genepop validation failed: at least one 'Pop' line is required.")
+  }
+  
+  for (ln in data_lines) {
+    if (identical(ln, "Pop")) next
+    if (grepl("\t", ln, fixed = TRUE)) {
+      stop("[00_master_pipeline] Genepop validation failed: tabs are not allowed in data lines.")
+    }
+    if (length(gregexpr(",", ln, fixed = TRUE)[[1]]) != 1) {
+      stop("[00_master_pipeline] Genepop validation failed: each individual line must contain exactly one comma. Bad line: ", ln)
+    }
+    split_line <- strsplit(ln, ", ", fixed = TRUE)[[1]]
+    if (length(split_line) != 2) {
+      stop("[00_master_pipeline] Genepop validation failed: each individual line must follow 'ID, code code ...'. Bad line: ", ln)
+    }
+    geno_codes <- strsplit(split_line[2], " ", fixed = TRUE)[[1]]
+    if (length(geno_codes) != length(locus_names)) {
+      stop("[00_master_pipeline] Genepop validation failed: genotype count does not match locus count. Bad line: ", ln)
+    }
+    if (!all(grepl("^[0-9]{6}$", geno_codes))) {
+      stop("[00_master_pipeline] Genepop validation failed: each locus code must be exactly 6 digits. Bad line: ", ln)
+    }
+  }
+  
+  TRUE
+}
+
 write_microchecker_genepop_export <- function(tbl,
                                               id_col = NULL,
                                               pop_col = NULL,
@@ -869,13 +918,15 @@ write_microchecker_genepop_export <- function(tbl,
   out_tbl$.row_order <- NULL
   
   genepop_lines <- build_genepop_lines(
-    title_line = title_line,
+    title_line = format_microchecker_title_line(title_line),
     locus_names = locus_names,
     out_tbl = out_tbl
   )
+  genepop_lines <- gsub("\r", "", genepop_lines, fixed = TRUE)
+  validate_microchecker_genepop_lines(genepop_lines, locus_names)
   
   dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
-  writeLines(genepop_lines, con = output_path, useBytes = TRUE)
+  writeLines(genepop_lines, con = output_path, sep = "\n", useBytes = TRUE)
   
   if (!file.exists(output_path)) {
     stop("[00_master_pipeline] Failed to create Genepop output file: ", output_path)

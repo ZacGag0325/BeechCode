@@ -62,7 +62,7 @@ df_method <- df %>%
       str_detect(Method_Category_clean_lower, "excavation") &
         str_detect(Method_Category_clean_lower, "non explicite") ~ "Excavation - Non explicite",
       str_detect(Method_Category_clean_lower, "lien racinaire") &
-        str_detect(Method_Category_clean_lower, "horizon de surface") ~ "Lien racinaire - Horizon de surface",
+        str_detect(Method_Category_clean_lower, "racine de surface") ~ "Lien racinaire - Racine de surface",
       str_detect(Method_Category_clean_lower, "proximité|proximite") ~ "Proximité des individus",
       str_detect(Method_Category_clean_lower, "identification génétique|identification genetique|génétique|genetique") ~ "Identification génétique",
       TRUE ~ NA_character_
@@ -76,7 +76,7 @@ method_levels_en <- c(
   "Excavation - Morphologie du collet",
   "Excavation - Lien racinaire entre individus",
   "Excavation - Non explicite",
-  "Lien racinaire - Horizon de surface",
+  "Lien racinaire - Racine de surface",
   "Proximité des individus",
   "Identification génétique"
 )
@@ -86,7 +86,7 @@ method_palette_en <- c(
   "Excavation - Morphologie du collet" = "#196F3D",
   "Excavation - Lien racinaire entre individus" = "#1E8449",
   "Excavation - Non explicite" = "#239B56",
-  "Lien racinaire - Horizon de surface" = "#2E8B57",
+  "Lien racinaire - Racine de surface" = "#2E8B57",
   "Proximité des individus" = "#52BE80",
   "Identification génétique" = "#7DCEA0"
 )
@@ -96,7 +96,7 @@ method_labels_fr <- c(
   "Excavation - Morphologie du collet" = "Excavation - Morphologie du collet",
   "Excavation - Lien racinaire entre individus" = "Excavation - Lien racinaire entre individus",
   "Excavation - Non explicite" = "Excavation - Non explicite",
-  "Lien racinaire - Horizon de surface" = "Lien racinaire - Horizon de surface",
+  "Lien racinaire - Horizon de surface" = "Lien racinaire - Racine de surface",
   "Proximité des individus" = "Proximité des individus",
   "Identification génétique" = "Identification génétique"
 )
@@ -305,15 +305,15 @@ df <- df %>%
     Stade_Development_std = case_when(
       is.na(Stade_Development_clean) | Stade_Development_clean == "" ~ "Unspecified",
       str_detect(Stade_Development_clean, "mixed stages|stades? mixtes|juvenile tree|arbre juvenile|\\bother\\b|\\bautre\\b") ~ NA_character_,
-      str_detect(Stade_Development_clean, "^sapling\\s*(and|&)\\s*seedling|^saplings\\s*(and|&)\\s*seedlings|^gaulis\\s*(et|&)\\s*semis|^gaule\\s*(et|&)\\s*semis") ~ "Sapling and Seedling",
+      str_detect(Stade_Development_clean, "^sapling\\s*(and|&)\\s*seedling|^saplings\\s*(and|&)\\s*seedlings|^gaule\\s*(et|&)\\s*semis|^gaule\\s*(et|&)\\s*semis") ~ "Sapling and Seedling",
       str_detect(Stade_Development_clean, "all trees|all stages|all developmental stages|all individuals|all size classes") ~ "All trees",
       str_detect(Stade_Development_clean, "^(na|n/a|nd|none)$|non renseign|non préc|non prec|not specified|not stated|unspecified|unknown") ~ "Unspecified",
-      str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") &
+      str_detect(Stade_Development_clean, "sapling|saplings|gaule|gaule") &
         str_detect(Stade_Development_clean, "mature|adult|arbre mature") ~ "Sapling and Mature",
       str_detect(Stade_Development_clean, "seedling|seedlings|semis") &
-        str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") ~ "Seedling and Sapling",
+        str_detect(Stade_Development_clean, "sapling|saplings|gaule|gaule") ~ "Seedling and Sapling",
       str_detect(Stade_Development_clean, "seedling|seedlings|semis") ~ "Seedling",
-      str_detect(Stade_Development_clean, "sapling|saplings|gaulis|gaule") ~ "Sapling",
+      str_detect(Stade_Development_clean, "sapling|saplings|gaule|gaule") ~ "Sapling",
       str_detect(Stade_Development_clean, "mature|adult|arbre mature") |
         (str_detect(Stade_Development_clean, "tree|trees|arbre|arbres") &
            !str_detect(Stade_Development_clean, "young|juvenile")) ~ "Mature tree",
@@ -334,11 +334,11 @@ stage_order_en <- c(
 
 stage_labels_fr <- c(
   "Seedling" = "Semis",
-  "Sapling" = "Gaulis",
+  "Sapling" = "Gaule",
   "Mature tree" = "Arbre mature",
-  "Seedling and Sapling" = "Semis et gaulis",
-  "Sapling and Seedling" = "Gaulis et semis",
-  "Sapling and Mature" = "Gaulis et arbre mature",
+  "Seedling and Sapling" = "Semis et gaule",
+  "Sapling and Seedling" = "Gaule et semis",
+  "Sapling and Mature" = "Gaule et arbre mature",
   "All trees" = "Tous les arbres",
   "Unspecified" = "Non précisé"
 )

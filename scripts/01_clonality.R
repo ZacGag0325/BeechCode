@@ -344,13 +344,12 @@ write.csv(clonality_df, assign_file, row.names = FALSE)
 print_quick_clone_summary(clonality_df, site_available = site_available)
 
 # -----------------------------------------------------------------------------
-# MLG barplots by site (FR + EN) for presentation
+# Clonality percentage barplots by site (FR + EN) for presentation
 # -----------------------------------------------------------------------------
 # Objective:
 # - x axis: Site
-# - y axis: Number of distinct MLGs observed in each site
-# - reference line at theoretical maximum = 24 sampled individuals per site
-# - robust behavior even when some sites have <24 valid individuals
+# - y axis: Clonality (%) based on MLL clonality proportion
+# - robust behavior even when some sites have variable sample sizes
 
 find_latitude_col <- function(df) {
   find_synonym_col(
@@ -359,14 +358,20 @@ find_latitude_col <- function(df) {
   )
 }
 
-build_site_mlg_summary <- function(assignments_df, df_ids_tbl = NULL) {
+build_site_clonality_summary <- function(assignments_df, df_ids_tbl = NULL) {
   summary_tbl <- assignments_df %>%
     mutate(Site = ifelse(is.na(Site) | !nzchar(Site), "SITE_UNAVAILABLE", Site)) %>%
     group_by(Site) %>%
     summarise(
-      N_MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
       N_individuals = dplyr::n(),
+      N_MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
+      N_MLL = dplyr::n_distinct(MLL, na.rm = TRUE),
       .groups = "drop"
+    ) %>%
+    add_clonality_metrics() %>%
+    mutate(
+      Clonality_MLL = 1 - (N_MLL / N_individuals),
+      Clonality_MLL_percent = Clonality_MLL * 100
     )
   
   if (!is.null(df_ids_tbl)) {
@@ -407,35 +412,29 @@ build_site_mlg_summary <- function(assignments_df, df_ids_tbl = NULL) {
   summary_tbl
 }
 
-make_mlg_barplot <- function(summary_tbl, lang = c("fr", "en"), max_theoretical = 24) {
+make_clonality_percent_barplot <- function(summary_tbl, lang = c("fr", "en")) {
   lang <- match.arg(lang)
   
   labels <- switch(
     lang,
     fr = list(
-      title = "Nombre de génotypes multilocus (MLG) par site",
-      subtitle = "Maximum théorique de 24 individus échantillonnés par site",
+      title = "Clonalité par site",
+      subtitle = "Pourcentage d'individus appartenant à des lignées multilocus répétées",
       x = "Site",
-      y = "Nombre de MLG"
+      y = "Clonalité (%)"
     ),
     en = list(
-      title = "Number of multilocus genotypes (MLGs) per site",
-      subtitle = "Theoretical maximum of 24 sampled individuals per site",
+      title = "Clonality by site",
+      subtitle = "Percentage of individuals belonging to repeated multilocus lineages",
       x = "Site",
-      y = "Number of MLGs"
+      y = "Clonality (%)"
     )
   )
   
-  ggplot(summary_tbl, aes(x = Site, y = N_MLG)) +
+  ggplot(summary_tbl, aes(x = Site, y = Clonality_MLL_percent)) +
     geom_col(fill = "#2E8B57", width = 0.75) +
-    geom_hline(
-      yintercept = max_theoretical,
-      linetype = "dashed",
-      linewidth = 0.8,
-      color = "#595959"
-    ) +
     scale_y_continuous(
-      limits = c(0, max(max_theoretical, summary_tbl$N_MLG, na.rm = TRUE) * 1.05),
+      limits = c(0, 100),
       expand = expansion(mult = c(0, 0.02))
     ) +
     labs(
@@ -456,14 +455,14 @@ make_mlg_barplot <- function(summary_tbl, lang = c("fr", "en"), max_theoretical 
     )
 }
 
-save_mlg_plot_dual_language <- function(summary_tbl, fig_dir, max_theoretical = 24) {
-  plot_fr <- make_mlg_barplot(summary_tbl, lang = "fr", max_theoretical = max_theoretical)
-  plot_en <- make_mlg_barplot(summary_tbl, lang = "en", max_theoretical = max_theoretical)
+save_clonality_percent_plot_dual_language <- function(summary_tbl, fig_dir) {
+  plot_fr <- make_clonality_percent_barplot(summary_tbl, lang = "fr")
+  plot_en <- make_clonality_percent_barplot(summary_tbl, lang = "en")
   
-  png_fr <- file.path(fig_dir, "mlg_per_site_barplot_fr.png")
-  pdf_fr <- file.path(fig_dir, "mlg_per_site_barplot_fr.pdf")
-  png_en <- file.path(fig_dir, "mlg_per_site_barplot_en.png")
-  pdf_en <- file.path(fig_dir, "mlg_per_site_barplot_en.pdf")
+  png_fr <- file.path(fig_dir, "clonality_percent_per_site_fr.png")
+  pdf_fr <- file.path(fig_dir, "clonality_percent_per_site_fr.pdf")
+  png_en <- file.path(fig_dir, "clonality_percent_per_site_en.png")
+  pdf_en <- file.path(fig_dir, "clonality_percent_per_site_en.pdf")
   
   ggsave(filename = png_fr, plot = plot_fr, width = 12, height = 7, dpi = 320)
   ggsave(filename = pdf_fr, plot = plot_fr, width = 12, height = 7)
@@ -476,24 +475,23 @@ save_mlg_plot_dual_language <- function(summary_tbl, fig_dir, max_theoretical = 
   )
 }
 
-site_mlg_summary <- build_site_mlg_summary(clonality_df, df_ids_tbl = df_ids)
+site_clonality_summary <- build_site_clonality_summary(clonality_df, df_ids_tbl = df_ids)
 
-cat("\n[01_clonality] Tableau résumé utilisé pour le barplot MLG par site:\n")
-print(site_mlg_summary)
+cat("\n[01_clonality] Tableau résumé utilisé pour le barplot de clonalité (%) par site:\n")
+print(site_clonality_summary)
 
-site_mlg_summary_file <- file.path(TABLES_DIR, "mlg_per_site_summary.csv")
-write.csv(site_mlg_summary, site_mlg_summary_file, row.names = FALSE)
+site_clonality_summary_file <- file.path(TABLES_DIR, "clonality_percent_per_site_summary.csv")
+write.csv(site_clonality_summary, site_clonality_summary_file, row.names = FALSE)
 
-mlg_plot_files <- save_mlg_plot_dual_language(
-  summary_tbl = site_mlg_summary,
-  fig_dir = FIGURES_DIR,
-  max_theoretical = 24
+clonality_plot_files <- save_clonality_percent_plot_dual_language(
+  summary_tbl = site_clonality_summary,
+  fig_dir = FIGURES_DIR
 )
 
 message("[01_clonality] Saved: ", out_file)
 message("[01_clonality] Saved: ", assign_file)
-message("[01_clonality] Saved: ", site_mlg_summary_file)
-message("[01_clonality] Saved: ", mlg_plot_files$fr_png)
-message("[01_clonality] Saved: ", mlg_plot_files$fr_pdf)
-message("[01_clonality] Saved: ", mlg_plot_files$en_png)
-message("[01_clonality] Saved: ", mlg_plot_files$en_pdf)
+message("[01_clonality] Saved: ", site_clonality_summary_file)
+message("[01_clonality] Saved: ", clonality_plot_files$fr_png)
+message("[01_clonality] Saved: ", clonality_plot_files$fr_pdf)
+message("[01_clonality] Saved: ", clonality_plot_files$en_png)
+message("[01_clonality] Saved: ", clonality_plot_files$en_pdf)

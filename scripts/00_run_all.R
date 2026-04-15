@@ -185,6 +185,7 @@ for (script_name in c(
   "04_amova.R",
   "06_distance_matrices.R",
   "11_isolation_by_distance.R",
+  "hwe_sensitivity_analysis.R",
   "03_structure_all_plots_S2N_bySite.R"
 )) {
   run_out <- run_script(script_name, warning_log_dir)

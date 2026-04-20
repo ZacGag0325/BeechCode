@@ -169,7 +169,22 @@ make_reduced_genind <- function(gobj, loci_to_remove) {
     warning("[hwe_sensitivity] None of the requested loci were found; reduced dataset equals full dataset.")
   }
   
-  reduced <- gobj[, retained, drop = FALSE]
+  reduced <- local({
+    split_by_locus <- adegenet::seploc(gobj, truenames = TRUE, res.type = "list")
+    split_names <- names(split_by_locus)
+    keep_split <- intersect(retained, split_names)
+    
+    if (length(keep_split) != length(retained)) {
+      missing_keep <- setdiff(retained, split_names)
+      stop(
+        "[hwe_sensitivity] Failed to retain all expected loci when splitting genind. Missing: ",
+        paste(missing_keep, collapse = ", ")
+      )
+    }
+    
+    adegenet::repool(split_by_locus[keep_split])
+  })
+  
   adegenet::pop(reduced) <- adegenet::pop(gobj)
   
   if (adegenet::nLoc(reduced) != length(retained)) {

@@ -70,9 +70,11 @@ resolve_input_file <- function(path_in) {
   # Fallback: search by basename in common folders
   base <- basename(path_in)
   fallback_dirs <- unique(c(getwd(), script_dir, file.path(script_dir, ".."), file.path(script_dir, "..", "data")))
+  escape_regex <- function(x) gsub("([][{}()+*^$|\\\\?.])", "\\\\\\1", x, perl = TRUE)
+  
   search_hits <- unlist(lapply(fallback_dirs, function(d) {
     if (!dir.exists(d)) return(character())
-    list.files(d, pattern = paste0("^", gsub("([.()\\[\\]{}+*?^$|\\\\])", "\\\\\\1", base), "$"),
+    list.files(d, pattern = paste0("^", escape_regex(base), "$"),
                full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
   }))
   search_hits <- unique(search_hits[file.exists(search_hits)])
@@ -343,7 +345,7 @@ choose_sheet <- function() {
                                    "site", sh
     )
     sample_try <- pick_unique_column(df_try, NULL,
-                                     c("sample", "sample_number", "sample_no", "individual", "ind", "id", "tree", "stem"),
+                                     c("sample", "sample_number", "sample_no", "individual", "ind", "id_tige", "tree", "stem", "numero", "numero_individu"),
                                      "sample", sh
     )
     
@@ -384,7 +386,7 @@ site_col <- pick_unique_column(raw_df, site_col_override,
                                "site", sheet_use
 )
 sample_col <- pick_unique_column(raw_df, sample_col_override,
-                                 c("sample", "sample_number", "sample_no", "individual", "ind", "id", "tree", "stem"),
+                                 c("sample", "sample_number", "sample_no", "individual", "ind", "id_tige", "tree", "stem", "numero", "numero_individu"),
                                  "sample", sheet_use
 )
 

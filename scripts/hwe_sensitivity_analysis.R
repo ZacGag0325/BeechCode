@@ -170,22 +170,30 @@ make_reduced_genind <- function(gobj, loci_to_remove) {
   }
   
   reduced <- local({
-    split_by_locus <- adegenet::seploc(gobj, truenames = TRUE, res.type = "list")
-    split_names <- names(split_by_locus)
-    keep_split <- intersect(retained, split_names)
+    loci_df <- adegenet::genind2df(gobj, sep = "/", usepop = FALSE)
+    df_loci <- names(loci_df)
+    keep_df <- intersect(retained, df_loci)
     
-    if (length(keep_split) != length(retained)) {
-      missing_keep <- setdiff(retained, split_names)
+    if (length(keep_df) != length(retained)) {
+      missing_keep <- setdiff(retained, df_loci)
       stop(
-        "[hwe_sensitivity] Failed to retain all expected loci when splitting genind. Missing: ",
+        "[hwe_sensitivity] Failed to retain all expected loci when rebuilding genind. Missing: ",
         paste(missing_keep, collapse = ", ")
       )
     }
     
-    adegenet::repool(split_by_locus[keep_split])
+    rebuilt <- adegenet::df2genind(
+      X = loci_df[, keep_df, drop = FALSE],
+      sep = "/",
+      ploidy = adegenet::ploidy(gobj),
+      ind.names = adegenet::indNames(gobj),
+      type = adegenet::type(gobj),
+      NA.char = c("NA", "", "-", "NA/NA", "0/0")
+    )
+    
+    adegenet::pop(rebuilt) <- adegenet::pop(gobj)
+    rebuilt
   })
-  
-  adegenet::pop(reduced) <- adegenet::pop(gobj)
   
   if (adegenet::nLoc(reduced) != length(retained)) {
     stop("[hwe_sensitivity] Locus subsetting mismatch: expected ", length(retained), " got ", adegenet::nLoc(reduced), ".")

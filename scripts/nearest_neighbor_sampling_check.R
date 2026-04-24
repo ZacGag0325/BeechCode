@@ -1,53 +1,52 @@
 #!/usr/bin/env Rscript
 
 # ============================================================================
-# nearest_neighbour_adjacent_numbers_analysis.R
+# nearest_neighbor_sampling_check.R
 # ----------------------------------------------------------------------------
-# Standalone script for adjacent-sample and nearest-neighbour distance analysis
-# from an Excel workbook.
+# Standalone script to evaluate nearest-neighbor distances among sampled beech
+# stems within each site.
 #
-# This script:
-#   1) Reads an Excel file.
-#   2) Finds the relevant sheet/columns (site, sample number, coordinates).
-#   3) Cleans data and converts sample IDs / coordinates to numeric.
-#   4) Computes adjacent-sample distances within each site.
-#   5) Computes true nearest-neighbour distances within each site.
-#   6) Summarizes site-level patterns and threshold proportions.
-#   7) Exports CSV outputs and figures to a new output folder.
+# What this script does:
+#   1) Reads stem-level data from a user-specified file.
+#   2) Resolves required columns (site ID, sample ID, x, y).
+#   3) Calculates nearest sampled neighbor distances within each site.
+#   4) Writes per-sample and per-site summary tables to disk.
+#   5) Creates and saves two publication-style figures.
 #
-# IMPORTANT:
-#   - Standalone script (not connected to any project pipeline).
-#   - If auto-detection is ambiguous, the script prints column names and stops
-#     with clear instructions for manual edits.
+# NOTE:
+#   - This script is standalone and does not modify any project pipeline.
+#   - Edit the USER SETTINGS section before running.
 # ============================================================================
 
 # ----------------------------- USER SETTINGS ---------------------------------
-input_file <- "donnees_modifiees_west_summer2024 copie.xlsx"
-output_dir <- "outputs/nearest_neighbour_adjacent_numbers"
+# Set your input file path here (CSV/TSV supported by extension).
+input_file <- "data/stem_level_data.csv"
 
-# Optional manual overrides (set to exact column names if needed)
-sheet_name_override <- NULL
-site_col_override <- NULL
-sample_col_override <- NULL
-x_col_override <- NULL
-y_col_override <- NULL
-lat_col_override <- NULL
-lon_col_override <- NULL
+# Optional output directory (will be created if needed).
+output_dir <- "outputs/nearest_neighbor_sampling_check"
 
-# Distance thresholds (meters)
-thresholds_m <- c(1, 2, 5, 8, 10, 20)
+# REQUIRED COLUMN MAPPINGS:
+# - If you know the exact column names, set them as strings.
+# - If left as NULL, the script will attempt to auto-detect from common names.
+site_col   <- NULL  # e.g., "site", "site_id"
+sample_col <- NULL  # e.g., "sample_id", "individual_id", "stem_id"
+x_col      <- NULL  # e.g., "x", "x_m", "utm_x"
+y_col      <- NULL  # e.g., "y", "y_m", "utm_y"
 
-# Optional per-site map/plot output (can be many files)
-make_site_maps <- TRUE
+# Distance thresholds (meters) used in site-level summary proportions.
+thresholds_m <- c(8, 10, 12)
 # ----------------------------------------------------------------------------
 
-required_pkgs <- c("readxl", "dplyr", "stringr", "ggplot2", "tidyr", "purrr", "readr")
+# ----------------------------- PACKAGE CHECK ---------------------------------
+required_pkgs <- c("dplyr", "readr", "stringr", "ggplot2", "tidyr", "purrr")
 missing_pkgs <- required_pkgs[!vapply(required_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+
 if (length(missing_pkgs) > 0) {
   stop(
     paste0(
-      "Missing packages: ", paste(missing_pkgs, collapse = ", "), "\n",
-      "Install with: install.packages(c(",
+      "Missing required packages: ", paste(missing_pkgs, collapse = ", "),
+      "\nPlease install them before running, e.g.:\n",
+      "install.packages(c(",
       paste(sprintf('"%s"', missing_pkgs), collapse = ", "),
       "))"
     ),
@@ -56,493 +55,313 @@ if (length(missing_pkgs) > 0) {
 }
 
 suppressPackageStartupMessages({
-  library(readxl)
   library(dplyr)
+  library(readr)
   library(stringr)
   library(ggplot2)
   library(tidyr)
   library(purrr)
-  library(readr)
 })
+# ----------------------------------------------------------------------------
 
-normalize_names <- function(x) {
-  x %>%
-    stringr::str_to_lower() %>%
-    stringr::str_replace_all("[^a-z0-9]+", "_") %>%
-    stringr::str_replace_all("^_+|_+$", "")
-}
-
-as_numeric_safely <- function(x) {
-  if (is.numeric(x)) return(as.numeric(x))
-  x_chr <- as.character(x)
-  x_chr <- stringr::str_replace_all(x_chr, ",", ".")
-  suppressWarnings(as.numeric(x_chr))
-}
-
-print_cols_and_stop <- function(sheet_name, cols, reason) {
-  msg <- paste0(
-    "\n", reason, "\n",
-    "Sheet checked: '", sheet_name, "'\n",
-    "Available columns:\n  - ", paste(cols, collapse = "\n  - "), "\n\n",
-    "Please edit one or more of:\n",
-    "  sheet_name_override, site_col_override, sample_col_override,\n",
-    "  lat_col_override/lon_col_override OR x_col_override/y_col_override."
-  )
-  stop(msg, call. = FALSE)
-}
-
-pick_unique_column <- function(df, override, candidates, label, sheet_name) {
-  nms <- names(df)
-  if (!is.null(override)) {
-    if (!(override %in% nms)) {
-      stop(
-        paste0("Configured ", label, " override '", override, "' not found."),
-        call. = FALSE
-      )
-    }
-    return(override)
-  }
-  
-  nms_norm <- normalize_names(nms)
-  candidates_norm <- normalize_names(candidates)
-  
-  exact_hits <- nms[nms_norm %in% candidates_norm]
-  if (length(exact_hits) == 1) return(exact_hits)
-  if (length(exact_hits) > 1) {
-    print_cols_and_stop(
-      sheet_name,
-      nms,
-      paste0("Ambiguous auto-detection for ", label, ": ", paste(exact_hits, collapse = ", "))
-    )
-  }
-  
-  partial_idx <- unique(unlist(lapply(candidates_norm, function(cd) {
-    which(stringr::str_detect(nms_norm, stringr::fixed(cd)))
-  })))
-  
-  partial_hits <- nms[partial_idx]
-  if (length(partial_hits) == 1) return(partial_hits)
-  if (length(partial_hits) > 1) {
-    print_cols_and_stop(
-      sheet_name,
-      nms,
-      paste0("Ambiguous partial match for ", label, ": ", paste(partial_hits, collapse = ", "))
-    )
-  }
-  
-  NA_character_
-}
-
-infer_coord_type <- function(df, lat_col, lon_col, x_col, y_col) {
-  if (!is.na(lat_col) && !is.na(lon_col)) return("latlon")
-  if (!is.na(x_col) && !is.na(y_col)) return("xy")
-  stop("Could not determine coordinate type.", call. = FALSE)
-}
-
-haversine_m <- function(lat1, lon1, lat2, lon2) {
-  # Geodesic distance in meters (Haversine, spherical Earth)
-  r <- 6371000
-  to_rad <- pi / 180
-  dlat <- (lat2 - lat1) * to_rad
-  dlon <- (lon2 - lon1) * to_rad
-  a <- sin(dlat / 2)^2 + cos(lat1 * to_rad) * cos(lat2 * to_rad) * sin(dlon / 2)^2
-  2 * r * atan2(sqrt(a), sqrt(1 - a))
-}
-
-pair_distance <- function(d, i, j) {
-  if (nrow(d) == 0) return(NA_real_)
-  if (d$coord_type[1] == "latlon") {
-    haversine_m(d$lat[i], d$lon[i], d$lat[j], d$lon[j])
-  } else {
-    dx <- d$x[i] - d$x[j]
-    dy <- d$y[i] - d$y[j]
-    sqrt(dx^2 + dy^2)
-  }
-}
-
-compute_site_outputs <- function(site_df) {
-  site_df <- site_df %>% arrange(sample_num, sample_id)
-  n <- nrow(site_df)
-  
-  # Adjacent-by-number pairs (1->2, 2->3, ... after sorting)
-  adjacent_tbl <- if (n >= 2) {
-    idx1 <- seq_len(n - 1)
-    idx2 <- idx1 + 1
-    tibble(
-      site = site_df$site[1],
-      sample_id_1 = site_df$sample_id[idx1],
-      sample_id_2 = site_df$sample_id[idx2],
-      sample_num_1 = site_df$sample_num[idx1],
-      sample_num_2 = site_df$sample_num[idx2],
-      adjacent_distance_m = map2_dbl(idx1, idx2, ~ pair_distance(site_df, .x, .y))
-    )
-  } else {
-    tibble(
-      site = character(), sample_id_1 = character(), sample_id_2 = character(),
-      sample_num_1 = numeric(), sample_num_2 = numeric(), adjacent_distance_m = numeric()
-    )
-  }
-  
-  # True nearest neighbour for each individual
-  nn_tbl <- if (n >= 2) {
-    idx <- seq_len(n)
-    nearest_idx <- map_int(idx, function(i) {
-      dist_i <- map_dbl(idx, function(j) {
-        if (i == j) return(Inf)
-        pair_distance(site_df, i, j)
-      })
-      which.min(dist_i)
-    })
-    
-    nearest_dist <- map2_dbl(idx, nearest_idx, ~ pair_distance(site_df, .x, .y))
-    
-    tibble(
-      site = site_df$site,
-      sample_id = site_df$sample_id,
-      sample_num = site_df$sample_num,
-      nearest_sample_id = site_df$sample_id[nearest_idx],
-      nearest_sample_num = site_df$sample_num[nearest_idx],
-      nearest_distance_m = nearest_dist
-    )
-  } else {
-    tibble(
-      site = site_df$site,
-      sample_id = site_df$sample_id,
-      sample_num = site_df$sample_num,
-      nearest_sample_id = NA_character_,
-      nearest_sample_num = NA_real_,
-      nearest_distance_m = NA_real_
-    )
-  }
-  
-  # Is adjacent-number neighbour also true nearest neighbour?
-  adjacent_match_tbl <- if (n >= 2) {
-    tibble(i = seq_len(n)) %>%
-      mutate(
-        prev_i = i - 1,
-        next_i = i + 1,
-        prev_dist = ifelse(prev_i >= 1, map2_dbl(i, prev_i, ~ pair_distance(site_df, .x, .y)), Inf),
-        next_dist = ifelse(next_i <= n, map2_dbl(i, next_i, ~ pair_distance(site_df, .x, .y)), Inf),
-        adjacent_partner_i = ifelse(prev_dist <= next_dist, prev_i, next_i),
-        adjacent_partner_i = ifelse(adjacent_partner_i < 1 | adjacent_partner_i > n, NA, adjacent_partner_i),
-        adjacent_partner_id = ifelse(is.na(adjacent_partner_i), NA_character_, site_df$sample_id[adjacent_partner_i]),
-        adjacent_partner_distance_m = ifelse(
-          is.na(adjacent_partner_i),
-          NA_real_,
-          map2_dbl(i, adjacent_partner_i, ~ pair_distance(site_df, .x, .y))
-        )
-      ) %>%
-      left_join(nn_tbl %>% select(sample_id, nearest_sample_id, nearest_distance_m), by = c("adjacent_partner_id" = "sample_id")) %>%
-      transmute(
-        site = site_df$site[1],
-        sample_id = site_df$sample_id[i],
-        sample_num = site_df$sample_num[i],
-        adjacent_partner_id,
-        adjacent_partner_distance_m,
-        is_adjacent_partner_true_nearest = ifelse(is.na(adjacent_partner_id), NA, adjacent_partner_id == nearest_sample_id)
-      )
-  } else {
-    tibble(
-      site = site_df$site,
-      sample_id = site_df$sample_id,
-      sample_num = site_df$sample_num,
-      adjacent_partner_id = NA_character_,
-      adjacent_partner_distance_m = NA_real_,
-      is_adjacent_partner_true_nearest = NA
-    )
-  }
-  
-  list(adjacent = adjacent_tbl, nearest = nn_tbl, adjacent_match = adjacent_match_tbl)
-}
-
-# ------------------------------ MAIN -----------------------------------------
-if (!file.exists(input_file)) {
-  stop(
-    paste0(
-      "Input Excel file not found: ", input_file, "\n",
-      "Place the file at project root or edit 'input_file' in USER SETTINGS."
-    ),
-    call. = FALSE
-  )
-}
-
-sheets <- readxl::excel_sheets(input_file)
-if (length(sheets) == 0) {
-  stop("No sheets found in the Excel file.", call. = FALSE)
-}
-
-choose_sheet <- function() {
-  if (!is.null(sheet_name_override)) {
-    if (!(sheet_name_override %in% sheets)) {
-      stop(
-        paste0("sheet_name_override '", sheet_name_override, "' not found in workbook."),
-        call. = FALSE
-      )
-    }
-    return(sheet_name_override)
-  }
-  
-  # Heuristic: pick first sheet where site+sample+coords can be detected.
-  for (sh in sheets) {
-    df_try <- suppressMessages(readxl::read_excel(input_file, sheet = sh))
-    if (ncol(df_try) < 4) next
-    
-    site_try <- pick_unique_column(df_try, NULL,
-                                   c("site", "population", "pop", "plot", "stand", "location"),
-                                   "site", sh
-    )
-    sample_try <- pick_unique_column(df_try, NULL,
-                                     c("sample", "sample_number", "sample_no", "individual", "ind", "id", "tree", "stem"),
-                                     "sample", sh
+# ----------------------------- HELPER FUNCTIONS ------------------------------
+read_input_data <- function(path) {
+  if (!file.exists(path)) {
+    xlsx_candidates <- list.files(
+      path = ".",
+      pattern = "\\.(xlsx|xls)$",
+      recursive = TRUE,
+      full.names = TRUE,
+      ignore.case = TRUE
     )
     
-    lat_try <- pick_unique_column(df_try, NULL,
-                                  c("lat", "latitude", "y_wgs84"), "latitude", sh
-    )
-    lon_try <- pick_unique_column(df_try, NULL,
-                                  c("lon", "long", "longitude", "x_wgs84"), "longitude", sh
-    )
-    x_try <- pick_unique_column(df_try, NULL,
-                                c("x", "easting", "utm_x", "coord_x"), "x", sh
-    )
-    y_try <- pick_unique_column(df_try, NULL,
-                                c("y", "northing", "utm_y", "coord_y"), "y", sh
-    )
-    
-    has_site_sample <- !is.na(site_try) && !is.na(sample_try)
-    has_coord <- (!is.na(lat_try) && !is.na(lon_try)) || (!is.na(x_try) && !is.na(y_try))
-    
-    if (has_site_sample && has_coord) return(sh)
-  }
-  
-  stop(
-    paste0(
-      "Could not auto-detect a sheet with site/sample/coordinate columns.\n",
-      "Available sheets: ", paste(sheets, collapse = ", "), "\n",
-      "Set sheet_name_override in USER SETTINGS."
-    ),
-    call. = FALSE
-  )
-}
-
-sheet_use <- choose_sheet()
-raw_df <- suppressMessages(readxl::read_excel(input_file, sheet = sheet_use))
-
-site_col <- pick_unique_column(raw_df, site_col_override,
-                               c("site", "population", "pop", "plot", "stand", "location"),
-                               "site", sheet_use
-)
-sample_col <- pick_unique_column(raw_df, sample_col_override,
-                                 c("sample", "sample_number", "sample_no", "individual", "ind", "id", "tree", "stem"),
-                                 "sample", sheet_use
-)
-
-lat_col <- pick_unique_column(raw_df, lat_col_override,
-                              c("lat", "latitude", "y_wgs84"), "latitude", sheet_use
-)
-lon_col <- pick_unique_column(raw_df, lon_col_override,
-                              c("lon", "long", "longitude", "x_wgs84"), "longitude", sheet_use
-)
-x_col <- pick_unique_column(raw_df, x_col_override,
-                            c("x", "easting", "utm_x", "coord_x"), "x", sheet_use
-)
-y_col <- pick_unique_column(raw_df, y_col_override,
-                            c("y", "northing", "utm_y", "coord_y"), "y", sheet_use
-)
-
-coord_type <- infer_coord_type(raw_df, lat_col, lon_col, x_col, y_col)
-
-if (is.na(site_col) || is.na(sample_col)) {
-  print_cols_and_stop(sheet_use, names(raw_df), "Failed to detect required site/sample columns.")
-}
-
-if (coord_type == "latlon") {
-  cleaned <- raw_df %>%
-    transmute(
-      site = as.character(.data[[site_col]]),
-      sample_id = as.character(.data[[sample_col]]),
-      sample_num = as_numeric_safely(.data[[sample_col]]),
-      lat = as_numeric_safely(.data[[lat_col]]),
-      lon = as_numeric_safely(.data[[lon_col]]),
-      coord_type = "latlon"
-    )
-} else {
-  cleaned <- raw_df %>%
-    transmute(
-      site = as.character(.data[[site_col]]),
-      sample_id = as.character(.data[[sample_col]]),
-      sample_num = as_numeric_safely(.data[[sample_col]]),
-      x = as_numeric_safely(.data[[x_col]]),
-      y = as_numeric_safely(.data[[y_col]]),
-      coord_type = "xy"
-    )
-}
-
-if (coord_type == "latlon") {
-  cleaned <- cleaned %>%
-    filter(!is.na(site), site != "", !is.na(sample_id), sample_id != "", !is.na(sample_num), !is.na(lat), !is.na(lon))
-} else {
-  cleaned <- cleaned %>%
-    filter(!is.na(site), site != "", !is.na(sample_id), sample_id != "", !is.na(sample_num), !is.na(x), !is.na(y))
-}
-
-if (nrow(cleaned) == 0) {
-  stop("No rows left after cleaning. Check column mappings and value formats.", call. = FALSE)
-}
-
-dup_check <- cleaned %>% count(site, sample_id) %>% filter(n > 1)
-if (nrow(dup_check) > 0) {
-  stop(
-    paste0(
-      "Duplicate sample_id values found within site after cleaning (first examples): ",
-      paste(head(paste0(dup_check$site, ":", dup_check$sample_id), 10), collapse = ", "),
-      "\nPlease ensure unique sample identifiers per site."
-    ),
-    call. = FALSE
-  )
-}
-
-site_results <- cleaned %>%
-  group_by(site) %>%
-  group_split() %>%
-  set_names(cleaned %>% distinct(site) %>% pull(site)) %>%
-  map(compute_site_outputs)
-
-adjacent_pairs <- bind_rows(map(site_results, "adjacent"))
-nearest_results <- bind_rows(map(site_results, "nearest"))
-adjacent_vs_nn <- bind_rows(map(site_results, "adjacent_match"))
-
-summary_stats <- adjacent_pairs %>%
-  group_by(site) %>%
-  summarise(
-    n_adjacent_pairs = n(),
-    mean_adjacent_distance_m = mean(adjacent_distance_m, na.rm = TRUE),
-    median_adjacent_distance_m = median(adjacent_distance_m, na.rm = TRUE),
-    min_adjacent_distance_m = min(adjacent_distance_m, na.rm = TRUE),
-    q25_adjacent_distance_m = quantile(adjacent_distance_m, probs = 0.25, na.rm = TRUE, names = FALSE),
-    q75_adjacent_distance_m = quantile(adjacent_distance_m, probs = 0.75, na.rm = TRUE, names = FALSE),
-    max_adjacent_distance_m = max(adjacent_distance_m, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-threshold_summary <- adjacent_pairs %>%
-  tidyr::crossing(threshold_m = thresholds_m) %>%
-  group_by(site, threshold_m) %>%
-  summarise(prop_within_threshold = mean(adjacent_distance_m <= threshold_m, na.rm = TRUE), .groups = "drop")
-
-adj_vs_nn_summary <- adjacent_vs_nn %>%
-  group_by(site) %>%
-  summarise(
-    n_individuals = n(),
-    prop_adjacent_partner_is_true_nearest = mean(is_adjacent_partner_true_nearest, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-site_summary <- summary_stats %>%
-  left_join(adj_vs_nn_summary, by = "site")
-
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-
-readr::write_csv(adjacent_pairs, file.path(output_dir, "adjacent_number_pair_distances.csv"))
-readr::write_csv(nearest_results, file.path(output_dir, "true_nearest_neighbour_by_individual.csv"))
-readr::write_csv(adjacent_vs_nn, file.path(output_dir, "adjacent_vs_true_nearest_by_individual.csv"))
-readr::write_csv(site_summary, file.path(output_dir, "summary_by_site.csv"))
-readr::write_csv(threshold_summary, file.path(output_dir, "threshold_summary_by_site.csv"))
-
-p1 <- ggplot(adjacent_pairs, aes(x = site, y = adjacent_distance_m)) +
-  geom_boxplot(fill = "#9ecae1", color = "#2171b5", outlier.alpha = 0.6) +
-  theme_bw(base_size = 12) +
-  labs(
-    title = "Adjacent sample-number distances by site",
-    x = "Site",
-    y = "Distance between adjacent sample numbers (m)"
-  ) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-ggsave(
-  filename = file.path(output_dir, "adjacent_distance_distribution_by_site.png"),
-  plot = p1,
-  width = 10,
-  height = 6,
-  dpi = 320
-)
-
-p2 <- ggplot(threshold_summary, aes(x = factor(threshold_m), y = prop_within_threshold * 100, fill = site)) +
-  geom_col(position = position_dodge()) +
-  theme_bw(base_size = 12) +
-  labs(
-    title = "Percent of adjacent-number pairs within thresholds",
-    x = "Distance threshold (m)",
-    y = "Pairs within threshold (%)",
-    fill = "Site"
-  )
-
-ggsave(
-  filename = file.path(output_dir, "adjacent_pairs_threshold_percentages.png"),
-  plot = p2,
-  width = 11,
-  height = 6,
-  dpi = 320
-)
-
-if (make_site_maps) {
-  dir.create(file.path(output_dir, "site_maps"), recursive = TRUE, showWarnings = FALSE)
-  
-  map_data <- if (coord_type == "latlon") {
-    cleaned %>% mutate(px = lon, py = lat)
-  } else {
-    cleaned %>% mutate(px = x, py = y)
-  }
-  
-  invisible(
-    map_data %>%
-      group_by(site) %>%
-      group_split() %>%
-      walk(function(d_site) {
-        d_site <- d_site %>% arrange(sample_num)
-        line_df <- if (nrow(d_site) >= 2) {
-          tibble(
-            x = head(d_site$px, -1),
-            y = head(d_site$py, -1),
-            xend = tail(d_site$px, -1),
-            yend = tail(d_site$py, -1)
+    stop(
+      paste0(
+        "Input file not found: ", path,
+        "\nPlease update 'input_file' in the USER SETTINGS section.",
+        "\n\nIf you intended to run the adjacent-number Excel analysis, use:",
+        "\n  source('scripts/nearest_neighbour_adjacent_numbers_analysis.R')",
+        "\n(or the US spelling alias if present).",
+        if (length(xlsx_candidates) > 0) {
+          paste0(
+            "\n\nExcel files detected in this project (examples):\n  - ",
+            paste(utils::head(xlsx_candidates, 10), collapse = "\n  - ")
           )
         } else {
-          tibble(x = numeric(), y = numeric(), xend = numeric(), yend = numeric())
+          "\n\nNo Excel files were detected in the current project tree."
         }
-        
-        p_site <- ggplot() +
-          geom_segment(data = line_df, aes(x = x, y = y, xend = xend, yend = yend),
-                       color = "grey55", linewidth = 0.5) +
-          geom_point(data = d_site, aes(x = px, y = py), color = "#08519c", size = 2) +
-          geom_text(data = d_site, aes(x = px, y = py, label = sample_num), vjust = -0.7, size = 2.8) +
-          theme_bw(base_size = 11) +
-          labs(
-            title = paste0("Site ", d_site$site[1], ": adjacent-number connections"),
-            x = ifelse(coord_type == "latlon", "Longitude", "X"),
-            y = ifelse(coord_type == "latlon", "Latitude", "Y")
-          )
-        
-        out <- file.path(output_dir, "site_maps", paste0("site_", make.names(d_site$site[1]), "_adjacent_map.png"))
-        ggsave(out, p_site, width = 7, height = 6, dpi = 320)
-      })
+      ),
+      call. = FALSE
+    )
+  }
+  
+  ext <- tolower(tools::file_ext(path))
+  
+  if (ext %in% c("csv")) {
+    readr::read_csv(path, show_col_types = FALSE)
+  } else if (ext %in% c("tsv", "txt")) {
+    readr::read_tsv(path, show_col_types = FALSE)
+  } else {
+    stop(
+      paste0(
+        "Unsupported file extension '.", ext, "'.\n",
+        "Please provide a .csv, .tsv, or .txt file."
+      ),
+      call. = FALSE
+    )
+  }
+}
+
+choose_col <- function(data, user_col, candidate_names, col_label) {
+  nms <- names(data)
+  
+  # If user explicitly provides a column name, validate it.
+  if (!is.null(user_col)) {
+    if (!user_col %in% nms) {
+      stop(
+        paste0(
+          "Configured ", col_label, " column '", user_col, "' not found in data.\n",
+          "Available columns: ", paste(nms, collapse = ", ")
+        ),
+        call. = FALSE
+      )
+    }
+    return(user_col)
+  }
+  
+  # Otherwise, attempt auto-detection (case-insensitive exact match first).
+  lower_nms <- tolower(nms)
+  lower_candidates <- tolower(candidate_names)
+  
+  exact_hits_idx <- which(lower_nms %in% lower_candidates)
+  if (length(exact_hits_idx) >= 1) {
+    return(nms[exact_hits_idx[1]])
+  }
+  
+  # Then attempt partial match as fallback.
+  partial_hits_idx <- unique(unlist(lapply(lower_candidates, function(cn) which(str_detect(lower_nms, fixed(cn))))))
+  if (length(partial_hits_idx) >= 1) {
+    return(nms[partial_hits_idx[1]])
+  }
+  
+  stop(
+    paste0(
+      "Could not auto-detect ", col_label, " column.\n",
+      "Please set '", gsub(" ", "_", col_label), "' in USER SETTINGS.\n",
+      "Available columns: ", paste(nms, collapse = ", ")
+    ),
+    call. = FALSE
   )
 }
 
-message("Analysis complete.")
-message("Input file: ", normalizePath(input_file, mustWork = FALSE))
-message("Sheet used: ", sheet_use)
-message("Resolved columns:")
-message("  site: ", site_col)
-message("  sample: ", sample_col)
-if (coord_type == "latlon") {
-  message("  latitude: ", lat_col)
-  message("  longitude: ", lon_col)
-  message("Distance method: geodesic (Haversine) in meters for latitude/longitude coordinates.")
-} else {
-  message("  x: ", x_col)
-  message("  y: ", y_col)
-  message("Distance method: Euclidean in meters for projected X/Y coordinates.")
+compute_nn_within_site <- function(df_site) {
+  # Expected columns: site, sample_id, x, y
+  n <- nrow(df_site)
+  
+  if (n < 2) {
+    # Graceful handling for sites with insufficient points.
+    return(
+      df_site %>%
+        mutate(
+          nearest_neighbor_id = NA_character_,
+          nearest_neighbor_distance_m = NA_real_
+        )
+    )
+  }
+  
+  coords <- as.matrix(df_site[, c("x", "y")])
+  
+  # Euclidean distance matrix.
+  dmat <- as.matrix(stats::dist(coords, method = "euclidean"))
+  
+  # Exclude self-distance from nearest-neighbor search.
+  diag(dmat) <- Inf
+  
+  nn_index <- max.col(-dmat, ties.method = "first")
+  nn_distance <- dmat[cbind(seq_len(n), nn_index)]
+  
+  df_site %>%
+    mutate(
+      nearest_neighbor_id = sample_id[nn_index],
+      nearest_neighbor_distance_m = nn_distance
+    )
 }
-message("Rows kept after cleaning: ", nrow(cleaned))
-message("Output directory: ", normalizePath(output_dir, mustWork = FALSE))
+# ----------------------------------------------------------------------------
+
+# ----------------------------- MAIN WORKFLOW ---------------------------------
+# 1) Read data.
+stems_raw <- read_input_data(input_file)
+
+# 2) Resolve required columns.
+resolved_site_col <- choose_col(
+  data = stems_raw,
+  user_col = site_col,
+  candidate_names = c("site", "site_id", "siteid", "population", "plot", "stand"),
+  col_label = "site"
+)
+
+resolved_sample_col <- choose_col(
+  data = stems_raw,
+  user_col = sample_col,
+  candidate_names = c("sample_id", "individual_id", "id", "stem_id", "tree_id", "sample", "individual"),
+  col_label = "sample id"
+)
+
+resolved_x_col <- choose_col(
+  data = stems_raw,
+  user_col = x_col,
+  candidate_names = c("x", "x_m", "xcoord", "x_coord", "easting", "utm_x", "xpos"),
+  col_label = "x coordinate"
+)
+
+resolved_y_col <- choose_col(
+  data = stems_raw,
+  user_col = y_col,
+  candidate_names = c("y", "y_m", "ycoord", "y_coord", "northing", "utm_y", "ypos"),
+  col_label = "y coordinate"
+)
+
+# 3) Standardize and validate.
+stems <- stems_raw %>%
+  transmute(
+    site = as.character(.data[[resolved_site_col]]),
+    sample_id = as.character(.data[[resolved_sample_col]]),
+    x = suppressWarnings(as.numeric(.data[[resolved_x_col]])),
+    y = suppressWarnings(as.numeric(.data[[resolved_y_col]]))
+  )
+
+if (any(is.na(stems$site) | stems$site == "")) {
+  stop("Site column contains missing/blank values. Please fix input data.", call. = FALSE)
+}
+
+if (any(is.na(stems$sample_id) | stems$sample_id == "")) {
+  stop("Sample ID column contains missing/blank values. Please fix input data.", call. = FALSE)
+}
+
+if (any(is.na(stems$x) | is.na(stems$y))) {
+  bad_n <- sum(is.na(stems$x) | is.na(stems$y))
+  stop(
+    paste0(
+      "Coordinate columns contain non-numeric or missing values in ", bad_n, " row(s).\n",
+      "Please clean coordinates or update x/y column mappings in USER SETTINGS."
+    ),
+    call. = FALSE
+  )
+}
+
+# Handle duplicated sample IDs within a site.
+dupes <- stems %>%
+  count(site, sample_id, name = "n") %>%
+  filter(n > 1)
+
+if (nrow(dupes) > 0) {
+  stop(
+    paste0(
+      "Found duplicated sample IDs within site. Please ensure unique sample IDs per site.\n",
+      "Examples: ",
+      paste0(head(paste(dupes$site, dupes$sample_id, sep = ":"), 5), collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+# 4) Compute nearest-neighbor distances within each site.
+insufficient_sites <- stems %>%
+  count(site, name = "n") %>%
+  filter(n < 2)
+
+if (nrow(insufficient_sites) > 0) {
+  warning(
+    paste0(
+      "Some sites have fewer than 2 sampled individuals; nearest-neighbor metrics will be NA for those sites: ",
+      paste(insufficient_sites$site, collapse = ", ")
+    ),
+    call. = FALSE
+  )
+}
+
+nn_table <- stems %>%
+  arrange(site, sample_id) %>%
+  group_by(site) %>%
+  group_modify(~ compute_nn_within_site(.x)) %>%
+  ungroup() %>%
+  select(site, sample_id, nearest_neighbor_id, nearest_neighbor_distance_m)
+
+# 5) Build site-level summary.
+site_summary <- nn_table %>%
+  group_by(site) %>%
+  summarise(
+    n_sampled_individuals = n(),
+    mean_nearest_neighbor_distance_m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, mean(nearest_neighbor_distance_m, na.rm = TRUE)),
+    median_nearest_neighbor_distance_m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, median(nearest_neighbor_distance_m, na.rm = TRUE)),
+    min_nearest_neighbor_distance_m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, min(nearest_neighbor_distance_m, na.rm = TRUE)),
+    max_nearest_neighbor_distance_m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, max(nearest_neighbor_distance_m, na.rm = TRUE)),
+    sd_nearest_neighbor_distance_m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, sd(nearest_neighbor_distance_m, na.rm = TRUE)),
+    prop_nn_le_8m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, mean(nearest_neighbor_distance_m <= 8, na.rm = TRUE)),
+    prop_nn_le_10m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, mean(nearest_neighbor_distance_m <= 10, na.rm = TRUE)),
+    prop_nn_le_12m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, mean(nearest_neighbor_distance_m <= 12, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# 6) Save outputs.
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+table_out_path <- file.path(output_dir, "nearest_neighbor_per_sample.csv")
+summary_out_path <- file.path(output_dir, "nearest_neighbor_site_summary.csv")
+
+readr::write_csv(nn_table, table_out_path)
+readr::write_csv(site_summary, summary_out_path)
+
+# 7) Create and save figures.
+plot_theme <- theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey95", color = "grey70"),
+    strip.text = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+hist_plot <- nn_table %>%
+  filter(!is.na(nearest_neighbor_distance_m)) %>%
+  ggplot(aes(x = nearest_neighbor_distance_m)) +
+  geom_histogram(bins = 20, color = "white", fill = "#2C7FB8") +
+  geom_vline(xintercept = 8, linetype = "dashed", linewidth = 0.8, color = "#D95F02") +
+  facet_wrap(~ site, scales = "free_y") +
+  labs(
+    title = "Nearest-neighbor distances among sampled stems",
+    x = "Nearest-neighbor distance (m)",
+    y = "Count"
+  ) +
+  plot_theme
+
+box_plot <- nn_table %>%
+  filter(!is.na(nearest_neighbor_distance_m)) %>%
+  ggplot(aes(x = site, y = nearest_neighbor_distance_m)) +
+  geom_boxplot(fill = "#74A9CF", color = "#1F78B4", outlier.alpha = 0.6) +
+  geom_hline(yintercept = 8, linetype = "dashed", linewidth = 0.8, color = "#D95F02") +
+  labs(
+    title = "Nearest-neighbor distance by site",
+    x = "Site",
+    y = "Nearest-neighbor distance (m)"
+  ) +
+  plot_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+hist_out_path <- file.path(output_dir, "nearest_neighbor_histogram_by_site.png")
+box_out_path <- file.path(output_dir, "nearest_neighbor_boxplot_by_site.png")
+
+ggsave(filename = hist_out_path, plot = hist_plot, width = 10, height = 7, dpi = 400)
+ggsave(filename = box_out_path, plot = box_plot, width = 9, height = 6, dpi = 400)
+
+# 8) Final console message.
+message("Nearest-neighbor sampling check complete.")
+message("Resolved columns:")
+message("  site:      ", resolved_site_col)
+message("  sample_id: ", resolved_sample_col)
+message("  x:         ", resolved_x_col)
+message("  y:         ", resolved_y_col)
+message("Outputs saved to: ", normalizePath(output_dir, winslash = "/", mustWork = FALSE))
+message("  - ", normalizePath(table_out_path, winslash = "/", mustWork = FALSE))
+message("  - ", normalizePath(summary_out_path, winslash = "/", mustWork = FALSE))
+message("  - ", normalizePath(hist_out_path, winslash = "/", mustWork = FALSE))
+message("  - ", normalizePath(box_out_path, winslash = "/", mustWork = FALSE))

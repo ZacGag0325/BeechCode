@@ -278,30 +278,53 @@ compute_site_outputs <- function(site_df) {
   
   # Is adjacent-number neighbour also true nearest neighbour?
   adjacent_match_tbl <- if (n >= 2) {
-    tibble(i = seq_len(n)) %>%
-      mutate(
-        prev_i = i - 1,
-        next_i = i + 1,
-        prev_dist = ifelse(prev_i >= 1, map2_dbl(i, prev_i, ~ pair_distance(site_df, .x, .y)), Inf),
-        next_dist = ifelse(next_i <= n, map2_dbl(i, next_i, ~ pair_distance(site_df, .x, .y)), Inf),
-        adjacent_partner_i = ifelse(prev_dist <= next_dist, prev_i, next_i),
-        adjacent_partner_i = ifelse(adjacent_partner_i < 1 | adjacent_partner_i > n, NA, adjacent_partner_i),
-        adjacent_partner_id = ifelse(is.na(adjacent_partner_i), NA_character_, site_df$sample_id[adjacent_partner_i]),
-        adjacent_partner_distance_m = ifelse(
-          is.na(adjacent_partner_i),
-          NA_real_,
-          map2_dbl(i, adjacent_partner_i, ~ pair_distance(site_df, .x, .y))
-        )
-      ) %>%
-      left_join(nn_tbl %>% select(sample_id, nearest_sample_id, nearest_distance_m), by = c("adjacent_partner_id" = "sample_id")) %>%
-      transmute(
-        site = site_df$site[1],
-        sample_id = site_df$sample_id[i],
-        sample_num = site_df$sample_num[i],
-        adjacent_partner_id,
-        adjacent_partner_distance_m,
-        is_adjacent_partner_true_nearest = ifelse(is.na(adjacent_partner_id), NA, adjacent_partner_id == nearest_sample_id)
+    idx <- seq_len(n)
+    prev_i <- idx - 1
+    next_i <- idx + 1
+    
+    prev_dist <- rep(Inf, n)
+    has_prev <- prev_i >= 1
+    if (any(has_prev)) {
+      prev_dist[has_prev] <- map2_dbl(idx[has_prev], prev_i[has_prev], ~ pair_distance(site_df, .x, .y))
+    }
+    
+    next_dist <- rep(Inf, n)
+    has_next <- next_i <= n
+    if (any(has_next)) {
+      next_dist[has_next] <- map2_dbl(idx[has_next], next_i[has_next], ~ pair_distance(site_df, .x, .y))
+    }
+    
+    adjacent_partner_i <- ifelse(prev_dist <= next_dist, prev_i, next_i)
+    adjacent_partner_i[adjacent_partner_i < 1 | adjacent_partner_i > n] <- NA_integer_
+    
+    adjacent_partner_id <- rep(NA_character_, n)
+    has_partner <- !is.na(adjacent_partner_i)
+    adjacent_partner_id[has_partner] <- site_df$sample_id[adjacent_partner_i[has_partner]]
+    
+    adjacent_partner_distance_m <- rep(NA_real_, n)
+    if (any(has_partner)) {
+      adjacent_partner_distance_m[has_partner] <- map2_dbl(
+        idx[has_partner],
+        adjacent_partner_i[has_partner],
+        ~ pair_distance(site_df, .x, .y)
       )
+    }
+    
+    tibble(
+      site = site_df$site[1],
+      sample_id = site_df$sample_id,
+      sample_num = site_df$sample_num,
+      adjacent_partner_id = adjacent_partner_id,
+      adjacent_partner_distance_m = adjacent_partner_distance_m
+    ) %>%
+      left_join(
+        nn_tbl %>% select(sample_id, nearest_sample_id, nearest_distance_m),
+        by = c("sample_id" = "sample_id")
+      ) %>%
+      mutate(
+        is_adjacent_partner_true_nearest = ifelse(is.na(adjacent_partner_id), NA, adjacent_partner_id == nearest_sample_id)
+      ) %>%
+      select(site, sample_id, sample_num, adjacent_partner_id, adjacent_partner_distance_m, is_adjacent_partner_true_nearest)
   } else {
     tibble(
       site = site_df$site,

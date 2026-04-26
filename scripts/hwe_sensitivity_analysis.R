@@ -205,7 +205,7 @@ make_reduced_genind <- function(gobj, loci_to_remove) {
       sep = "/",
       ploidy = adegenet::ploidy(gobj),
       ind.names = adegenet::indNames(gobj),
-      type = adegenet::type(gobj),
+      type = if (!is.null(gobj@type) && length(gobj@type) > 0) gobj@type else "codom",
       NA.char = "NA"
     )
     

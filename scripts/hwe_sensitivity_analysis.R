@@ -83,6 +83,24 @@ write_csv_msg <- function(df, path) {
   message("[hwe_sensitivity] Saved: ", path)
 }
 
+write_failure_log <- function(step_name, dataset_label, model_label = NA_character_, err_msg = NA_character_) {
+  log_df <- data.frame(
+    timestamp_utc = format(Sys.time(), tz = "UTC", usetz = TRUE),
+    step = as.character(step_name),
+    dataset = as.character(dataset_label),
+    model = as.character(model_label),
+    error_message = as.character(err_msg),
+    stringsAsFactors = FALSE
+  )
+  log_path <- file.path(SENS_TABLES_DIR, paste0("failure_log_", analysis_suffix, ".csv"))
+  if (file.exists(log_path)) {
+    existing <- tryCatch(read.csv(log_path, stringsAsFactors = FALSE), error = function(e) NULL)
+    if (!is.null(existing)) log_df <- bind_rows(existing, log_df)
+  }
+  write.csv(log_df, log_path, row.names = FALSE)
+  message("[hwe_sensitivity] Wrote failure log: ", log_path)
+}
+
 matrix_to_long_unique <- function(m, value_name) {
   long_all <- as.data.frame(as.table(m), stringsAsFactors = FALSE)
   names(long_all) <- c("Site1", "Site2", value_name)
@@ -188,7 +206,7 @@ make_reduced_genind <- function(gobj, loci_to_remove) {
       ploidy = adegenet::ploidy(gobj),
       ind.names = adegenet::indNames(gobj),
       type = adegenet::type(gobj),
-      NA.char = c("NA", "", "-", "NA/NA", "0/0")
+      NA.char = "NA"
     )
     
     adegenet::pop(rebuilt) <- adegenet::pop(gobj)
@@ -334,41 +352,116 @@ run_amova_bundle <- function(gi_use, dataset_label) {
   adegenet::pop(gi_f) <- site_f
   
   run_amova_model <- function(gi_obj, strata_df, formula_obj, model_label) {
-    adegenet::strata(gi_obj) <- strata_df
-    fit <- poppr::poppr.amova(gi_obj, formula_obj)
-    rand <- ade4::randtest(fit, nrepet = AMOVA_PERMUTATIONS)
-    
-    components <- as.data.frame(fit$componentsofcovariance)
-    components$Source <- rownames(components)
-    rownames(components) <- NULL
-    names(components)[1] <- "Sigma"
-    
-    phi_stats <- as.data.frame(fit$statphi)
-    phi_stats$Source <- rownames(phi_stats)
-    rownames(phi_stats) <- NULL
-    names(phi_stats)[1] <- "Phi"
-    
-    results <- full_join(components, phi_stats, by = "Source") %>%
-      mutate(
+    tryCatch({
+      adegenet::strata(gi_obj) <- strata_df
+      fit <- poppr::poppr.amova(gi_obj, formula_obj)
+      
+      components <- as.data.frame(fit$componentsofcovariance, stringsAsFactors = FALSE)
+      components$Source <- rownames(components)
+      rownames(components) <- NULL
+      if (ncol(components) > 0) names(components)[1] <- "Sigma"
+      
+      phi_stats <- as.data.frame(fit$statphi, stringsAsFactors = FALSE)
+      phi_stats$Source <- rownames(phi_stats)
+      rownames(phi_stats) <- NULL
+      if (ncol(phi_stats) > 0) names(phi_stats)[1] <- "Phi"
+      
+      results <- full_join(components, phi_stats, by = "Source") %>%
+        mutate(
+          Dataset = dataset_label,
+          Model = model_label,
+          N_individuals_used = adegenet::nInd(gi_obj),
+          N_groups_used = dplyr::n_distinct(strata_df$Site),
+          Permutations = AMOVA_PERMUTATIONS
+        ) %>%
+        select(Dataset, Model, Source, everything())
+      
+      rand <- tryCatch(
+        ade4::randtest(fit, nrepet = AMOVA_PERMUTATIONS),
+        error = function(e) {
+          cat(
+            "[hwe_sensitivity][WARN] randtest failed for dataset=", dataset_label,
+            " model=", model_label, " : ", conditionMessage(e), "\n", sep = ""
+          )
+          write_failure_log("amova_randtest", dataset_label, model_label, conditionMessage(e))
+          NULL
+        }
+      )
+      
+      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " class(rand)=", paste(class(rand), collapse = ","), "\n", sep = "")
+      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " names(rand)=", if (is.null(rand)) "NULL" else paste(names(rand), collapse = ","), "\n", sep = "")
+      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " length(rand$obs)=", if (is.null(rand) || is.null(rand$obs)) 0L else length(rand$obs), "\n", sep = "")
+      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " length(rand$pvalue)=", if (is.null(rand) || is.null(rand$pvalue)) 0L else length(rand$pvalue), "\n", sep = "")
+      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " names(rand$obs)=", if (is.null(rand) || is.null(rand$obs) || is.null(names(rand$obs))) "NULL" else paste(names(rand$obs), collapse = ","), "\n", sep = "")
+      
+      variance_sources <- if ("Source" %in% names(results)) as.character(results$Source) else character(0)
+      obs_vals <- if (!is.null(rand) && !is.null(rand$obs)) as.numeric(rand$obs) else numeric(0)
+      p_vals <- if (!is.null(rand) && !is.null(rand$pvalue)) as.numeric(rand$pvalue) else numeric(0)
+      obs_names <- if (!is.null(rand) && !is.null(rand$obs)) names(rand$obs) else NULL
+      obs_names <- if (is.null(obs_names)) character(0) else as.character(obs_names)
+      
+      base_components <- unique(c(obs_names, variance_sources))
+      if (length(base_components) == 0) base_components <- "AMOVA_component_unavailable"
+      
+      rand_df <- data.frame(
         Dataset = dataset_label,
         Model = model_label,
+        component = base_components,
+        statistic = NA_real_,
+        p_value = NA_real_,
+        permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      )
+      
+      if (length(obs_names) == 0 || length(obs_vals) == 0) {
+        cat(
+          "[hwe_sensitivity][WARN] rand$obs missing/empty; writing NA statistics for dataset=",
+          dataset_label, " model=", model_label, ".\n", sep = ""
+        )
+      } else {
+        n_assign <- min(length(obs_names), length(obs_vals))
+        rand_df$statistic[match(obs_names[seq_len(n_assign)], rand_df$component)] <- obs_vals[seq_len(n_assign)]
+      }
+      
+      if (length(obs_names) == 0 || length(p_vals) == 0) {
+        cat(
+          "[hwe_sensitivity][WARN] rand$pvalue missing/empty; writing NA p-values for dataset=",
+          dataset_label, " model=", model_label, ".\n", sep = ""
+        )
+      } else {
+        n_assign_p <- min(length(obs_names), length(p_vals))
+        rand_df$p_value[match(obs_names[seq_len(n_assign_p)], rand_df$component)] <- p_vals[seq_len(n_assign_p)]
+      }
+      
+      list(results = results, rand = rand_df)
+    }, error = function(e) {
+      cat(
+        "[hwe_sensitivity][WARN] AMOVA model failed for dataset=", dataset_label,
+        " model=", model_label, " : ", conditionMessage(e), "\n", sep = ""
+      )
+      write_failure_log("amova_model", dataset_label, model_label, conditionMessage(e))
+      fail_results <- data.frame(
+        Dataset = dataset_label,
+        Model = model_label,
+        Source = "AMOVA_failed",
+        Sigma = NA_real_,
+        Phi = NA_real_,
         N_individuals_used = adegenet::nInd(gi_obj),
         N_groups_used = dplyr::n_distinct(strata_df$Site),
-        Permutations = AMOVA_PERMUTATIONS
-      ) %>%
-      select(Dataset, Model, Source, everything())
-    
-    rand_df <- data.frame(
-      Dataset = dataset_label,
-      Model = model_label,
-      component = names(rand$obs),
-      statistic = as.numeric(rand$obs),
-      p_value = as.numeric(rand$pvalue),
-      permutations = AMOVA_PERMUTATIONS,
-      stringsAsFactors = FALSE
-    )
-    
-    list(results = results, rand = rand_df)
+        Permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      )
+      fail_rand <- data.frame(
+        Dataset = dataset_label,
+        Model = model_label,
+        component = "AMOVA_failed",
+        statistic = NA_real_,
+        p_value = NA_real_,
+        permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      )
+      list(results = fail_results, rand = fail_rand)
+    })
   }
   
   strata_site <- data.frame(
@@ -551,8 +644,62 @@ red_div <- run_diversity_bundle(reduced_gi, "REDUCED")
 full_diff <- run_differentiation_bundle(full_gi, "FULL")
 red_diff <- run_differentiation_bundle(reduced_gi, "REDUCED")
 
-full_amova <- run_amova_bundle(full_gi, "FULL")
-red_amova <- run_amova_bundle(reduced_gi, "REDUCED")
+full_amova <- tryCatch(
+  run_amova_bundle(full_gi, "FULL"),
+  error = function(e) {
+    write_failure_log("run_amova_bundle", "FULL", "bundle", conditionMessage(e))
+    list(
+      results = data.frame(
+        Dataset = "FULL",
+        Model = "bundle_failed",
+        Source = "bundle_failed",
+        Sigma = NA_real_,
+        Phi = NA_real_,
+        N_individuals_used = nInd(full_gi),
+        N_groups_used = NA_integer_,
+        Permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      ),
+      rand = data.frame(
+        Dataset = "FULL",
+        Model = "bundle_failed",
+        component = "bundle_failed",
+        statistic = NA_real_,
+        p_value = NA_real_,
+        permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+)
+red_amova <- tryCatch(
+  run_amova_bundle(reduced_gi, "REDUCED"),
+  error = function(e) {
+    write_failure_log("run_amova_bundle", "REDUCED", "bundle", conditionMessage(e))
+    list(
+      results = data.frame(
+        Dataset = "REDUCED",
+        Model = "bundle_failed",
+        Source = "bundle_failed",
+        Sigma = NA_real_,
+        Phi = NA_real_,
+        N_individuals_used = nInd(reduced_gi),
+        N_groups_used = NA_integer_,
+        Permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      ),
+      rand = data.frame(
+        Dataset = "REDUCED",
+        Model = "bundle_failed",
+        component = "bundle_failed",
+        statistic = NA_real_,
+        p_value = NA_real_,
+        permutations = AMOVA_PERMUTATIONS,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+)
 
 full_hwe <- run_hwe_by_site_locus(full_gi, "FULL")
 red_hwe <- run_hwe_by_site_locus(reduced_gi, "REDUCED")

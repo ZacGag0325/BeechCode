@@ -109,7 +109,7 @@ if (length(missing_pkgs) > 0) {
     paste0(
       "Missing packages: ", paste(missing_pkgs, collapse = ", "), "\n",
       "Install with: install.packages(c(",
-      paste(sprintf('"%s"', missing_pkgs), collapse = ", "),
+      paste(sprintf('\"%s\"', missing_pkgs), collapse = ", "),
       "))"
     ),
     call. = FALSE
@@ -558,6 +558,81 @@ ggsave(
   plot = p2,
   width = 11,
   height = 6,
+  dpi = 320
+)
+
+# Distance-frequency classes for adjacent-individual pairs
+distance_breaks <- c(0, 1, 2, 3, 4, 5, 6, 7, 8, Inf)
+distance_labels <- c(
+  "0–1 m", "1–2 m", "2–3 m", "3–4 m", "4–5 m",
+  "5–6 m", "6–7 m", "7–8 m", ">8 m"
+)
+
+adjacent_distance_binned <- adjacent_pairs %>%
+  filter(!is.na(adjacent_distance_m), adjacent_distance_m >= 0) %>%
+  mutate(
+    distance_class = cut(
+      adjacent_distance_m,
+      breaks = distance_breaks,
+      labels = distance_labels,
+      include.lowest = TRUE,
+      right = FALSE
+    )
+  )
+
+distance_frequency_table <- adjacent_distance_binned %>%
+  count(distance_class, name = "n_adjacent_pairs", .drop = FALSE) %>%
+  mutate(
+    distance_class = factor(distance_class, levels = distance_labels),
+    distance_class = as.character(distance_class)
+  )
+
+distance_frequency_table_by_site <- adjacent_distance_binned %>%
+  count(site, distance_class, name = "n_adjacent_pairs", .drop = FALSE) %>%
+  mutate(distance_class = factor(distance_class, levels = distance_labels))
+
+readr::write_csv(
+  distance_frequency_table,
+  file.path(output_dir, "adjacent_pair_distance_frequency_table.csv")
+)
+
+p3 <- ggplot(
+  distance_frequency_table %>% mutate(distance_class = factor(distance_class, levels = distance_labels)),
+  aes(x = distance_class, y = n_adjacent_pairs)
+) +
+  geom_col(fill = "#74c476", color = "#238b45") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Frequency of adjacent-individual pair distances (all sites pooled)",
+    x = "Distance class (m)",
+    y = "Number of adjacent-individual pairs"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave(
+  filename = file.path(output_dir, "adjacent_pair_distance_frequency_overall.png"),
+  plot = p3,
+  width = 9,
+  height = 5.5,
+  dpi = 320
+)
+
+p4 <- ggplot(distance_frequency_table_by_site, aes(x = distance_class, y = n_adjacent_pairs)) +
+  geom_col(fill = "#6baed6", color = "#2171b5") +
+  facet_wrap(~ site, scales = "free_y") +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Frequency of adjacent-individual pair distances by site",
+    x = "Distance class (m)",
+    y = "Number of adjacent-individual pairs"
+  ) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+ggsave(
+  filename = file.path(output_dir, "adjacent_pair_distance_frequency_by_site.png"),
+  plot = p4,
+  width = 12,
+  height = 8,
   dpi = 320
 )
 

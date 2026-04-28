@@ -261,7 +261,7 @@ choose_excel_sheet <- function(path_in, sheet_override = NULL) {
     if (ncol(df_try) < 4) next
     
     site_try <- pick_unique_column(df_try, NULL, c("site", "site_id", "siteid", "population", "pop", "plot", "stand", "location"), "site")
-    sample_try <- pick_unique_column(df_try, NULL, c("sample", "sample_id", "sample_number", "sample_no", "individual", "individual_id", "ind", "id", "tree", "stem", "stem_id", "numero"), "sample")
+    sample_try <- pick_unique_column(df_try, NULL, c("sample", "sample_id", "sample_number", "sample_no", "individual", "individual_id", "ind", "tree", "stem", "stem_id", "numero", "id_tige", "numero_individu"), "sample")
     lat_try <- pick_unique_column(df_try, NULL, c("lat", "latitude", "y_wgs84"), "latitude")
     lon_try <- pick_unique_column(df_try, NULL, c("lon", "long", "longitude", "x_wgs84"), "longitude")
     x_try <- pick_unique_column(df_try, NULL, c("x", "x_m", "xcoord", "x_coord", "easting", "utm_x", "coord_x"), "x")
@@ -324,7 +324,7 @@ site_col <- pick_unique_column(
 sample_col <- pick_unique_column(
   raw_df,
   sample_col_override,
-  c("sample", "sample_id", "sample_number", "sample_no", "individual", "individual_id", "ind", "id", "tree", "stem", "stem_id", "numero"),
+  c("sample", "sample_id", "sample_number", "sample_no", "individual", "individual_id", "ind", "tree", "stem", "stem_id", "numero", "id_tige", "numero_individu"),
   "sample"
 )
 

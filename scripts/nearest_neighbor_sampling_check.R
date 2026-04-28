@@ -20,7 +20,7 @@
 # ============================================================================
 
 # ----------------------------- USER SETTINGS ---------------------------------
-input_file <- "data/stem_level_data.csv"
+input_file <- "donnees_modifiees_west_summer2024 copie.xlsx"
 output_dir <- "outputs/nearest_neighbor_sampling_check"
 
 # Optional Excel sheet override (only used for .xlsx/.xls)
@@ -176,45 +176,131 @@ compute_true_nn_within_site <- function(site_df) {
     )
 }
 
-resolve_input_data <- function(path_in, sheet_override = NULL) {
-  if (!file.exists(path_in)) {
-    stop(
-      paste0("Input file not found: ", path_in,
-             "\nPlease update 'input_file' in USER SETTINGS."),
-      call. = FALSE
-    )
+resolve_input_file <- function(path_in) {
+  if (file.exists(path_in)) return(normalizePath(path_in, winslash = "/", mustWork = TRUE))
+  
+  args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- sub("^--file=", "", args[grepl("^--file=", args)])
+  script_dir <- if (length(file_arg) > 0) {
+    dirname(normalizePath(file_arg[1], winslash = "/", mustWork = FALSE))
+  } else {
+    getwd()
   }
   
-  ext <- tolower(tools::file_ext(path_in))
+  candidates <- unique(c(
+    path_in,
+    file.path(getwd(), path_in),
+    file.path(script_dir, path_in),
+    file.path(script_dir, "..", path_in),
+    file.path(script_dir, "..", "data", path_in),
+    file.path(script_dir, "..", "inputs", path_in)
+  ))
+  
+  hit <- candidates[file.exists(candidates)]
+  if (length(hit) >= 1) return(normalizePath(hit[1], winslash = "/", mustWork = TRUE))
+  
+  base <- basename(path_in)
+  fallback_dirs <- unique(c(getwd(), script_dir, file.path(script_dir, ".."), file.path(script_dir, "..", "data")))
+  escape_regex <- function(x) gsub("([][{}()+*^$|\\\\?.])", "\\\\\\1", x, perl = TRUE)
+  
+  search_hits <- unlist(lapply(fallback_dirs, function(d) {
+    if (!dir.exists(d)) return(character())
+    list.files(
+      d,
+      pattern = paste0("^", escape_regex(base), "$"),
+      full.names = TRUE,
+      recursive = TRUE,
+      ignore.case = TRUE
+    )
+  }))
+  search_hits <- unique(search_hits[file.exists(search_hits)])
+  if (length(search_hits) >= 1) return(normalizePath(search_hits[1], winslash = "/", mustWork = TRUE))
+  
+  visible_data_files <- unique(unlist(lapply(fallback_dirs, function(d) {
+    if (!dir.exists(d)) return(character())
+    list.files(
+      d,
+      pattern = "\\.(xlsx|xls|csv|tsv|txt)$",
+      full.names = TRUE,
+      recursive = FALSE,
+      ignore.case = TRUE
+    )
+  })))
+  
+  stop(
+    paste0(
+      "Input file not found: ", path_in, "\n",
+      "Checked:\n  - ", paste(candidates, collapse = "\n  - "), "\n",
+      if (length(visible_data_files) > 0) {
+        paste0("Detected data files in common locations:\n  - ", paste(visible_data_files, collapse = "\n  - "), "\n")
+      } else {
+        "No candidate data files detected in common locations.\n"
+      },
+      "Please update 'input_file' in USER SETTINGS."
+    ),
+    call. = FALSE
+  )
+}
+
+choose_excel_sheet <- function(path_in, sheet_override = NULL) {
+  sheets <- readxl::excel_sheets(path_in)
+  if (length(sheets) == 0) stop("No sheets found in Excel file.", call. = FALSE)
+  
+  if (!is.null(sheet_override)) {
+    if (!(sheet_override %in% sheets)) {
+      stop(
+        paste0("sheet_name_override '", sheet_override, "' not found in workbook."),
+        call. = FALSE
+      )
+    }
+    return(sheet_override)
+  }
+  
+  for (sh in sheets) {
+    df_try <- suppressMessages(readxl::read_excel(path_in, sheet = sh))
+    if (ncol(df_try) < 4) next
+    
+    site_try <- pick_unique_column(df_try, NULL, c("site", "site_id", "siteid", "population", "pop", "plot", "stand", "location"), "site")
+    sample_try <- pick_unique_column(df_try, NULL, c("sample", "sample_id", "sample_number", "sample_no", "individual", "individual_id", "ind", "id", "tree", "stem", "stem_id", "numero"), "sample")
+    lat_try <- pick_unique_column(df_try, NULL, c("lat", "latitude", "y_wgs84"), "latitude")
+    lon_try <- pick_unique_column(df_try, NULL, c("lon", "long", "longitude", "x_wgs84"), "longitude")
+    x_try <- pick_unique_column(df_try, NULL, c("x", "x_m", "xcoord", "x_coord", "easting", "utm_x", "coord_x"), "x")
+    y_try <- pick_unique_column(df_try, NULL, c("y", "y_m", "ycoord", "y_coord", "northing", "utm_y", "coord_y"), "y")
+    
+    has_site_sample <- !is.na(site_try) && !is.na(sample_try)
+    has_coord <- (!is.na(lat_try) && !is.na(lon_try)) || (!is.na(x_try) && !is.na(y_try))
+    if (has_site_sample && has_coord) return(sh)
+  }
+  
+  stop(
+    paste0(
+      "Could not auto-detect an Excel sheet with site/sample/coordinate columns.\n",
+      "Available sheets: ", paste(sheets, collapse = ", "), "\n",
+      "Set sheet_name_override in USER SETTINGS."
+    ),
+    call. = FALSE
+  )
+}
+
+resolve_input_data <- function(path_in, sheet_override = NULL) {
+  path_resolved <- resolve_input_file(path_in)
+  
+  ext <- tolower(tools::file_ext(path_resolved))
   
   if (ext == "csv") {
-    data <- readr::read_csv(path_in, show_col_types = FALSE)
-    return(list(data = data, source = basename(path_in), sheet = NA_character_))
+    data <- readr::read_csv(path_resolved, show_col_types = FALSE)
+    return(list(data = data, source = basename(path_resolved), sheet = NA_character_, path = path_resolved))
   }
   
   if (ext %in% c("tsv", "txt")) {
-    data <- readr::read_tsv(path_in, show_col_types = FALSE)
-    return(list(data = data, source = basename(path_in), sheet = NA_character_))
+    data <- readr::read_tsv(path_resolved, show_col_types = FALSE)
+    return(list(data = data, source = basename(path_resolved), sheet = NA_character_, path = path_resolved))
   }
   
   if (ext %in% c("xlsx", "xls")) {
-    sheets <- readxl::excel_sheets(path_in)
-    if (length(sheets) == 0) stop("No sheets found in Excel file.", call. = FALSE)
-    
-    sheet_use <- if (!is.null(sheet_override)) {
-      if (!(sheet_override %in% sheets)) {
-        stop(
-          paste0("sheet_name_override '", sheet_override, "' not found in workbook."),
-          call. = FALSE
-        )
-      }
-      sheet_override
-    } else {
-      sheets[1]
-    }
-    
-    data <- readxl::read_excel(path_in, sheet = sheet_use)
-    return(list(data = data, source = basename(path_in), sheet = sheet_use))
+    sheet_use <- choose_excel_sheet(path_resolved, sheet_override)
+    data <- suppressMessages(readxl::read_excel(path_resolved, sheet = sheet_use))
+    return(list(data = data, source = basename(path_resolved), sheet = sheet_use, path = path_resolved))
   }
   
   stop(
@@ -426,6 +512,7 @@ fmt_count_pct <- function(count, total) {
 }
 
 message("Nearest-neighbour sampling check complete.")
+message("Resolved input path: ", input_obj$path)
 message("Resolved source: ", input_obj$source)
 if (!is.na(input_obj$sheet)) message("Resolved sheet: ", input_obj$sheet)
 message("Resolved columns:")

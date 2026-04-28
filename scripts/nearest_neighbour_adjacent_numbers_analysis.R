@@ -547,28 +547,34 @@ p2 <- ggplot(threshold_summary, aes(x = factor(threshold_m), y = prop_within_thr
   geom_col(position = position_dodge()) +
   theme_bw(base_size = 12) +
   labs(
-    title = "Percent of adjacent-number pairs within thresholds",
+    title = "Cumulative percent of adjacent-number pairs within distance thresholds",
     x = "Distance threshold (m)",
     y = "Pairs within threshold (%)",
     fill = "Site"
   )
 
 ggsave(
-  filename = file.path(output_dir, "adjacent_pairs_threshold_percentages.png"),
+  filename = file.path(output_dir, "adjacent_pairs_cumulative_threshold_percentages.png"),
   plot = p2,
   width = 11,
   height = 6,
   dpi = 320
 )
 
-# Distance-frequency classes for adjacent-individual pairs
+# Distance-class frequency plots for adjacent-individual pairs (non-cumulative)
+# Read from the exported adjacent-pair table so this step can be reused independently.
+adjacent_pairs_for_distance_classes <- readr::read_csv(
+  file.path(output_dir, "adjacent_number_pair_distances.csv"),
+  show_col_types = FALSE
+)
+
 distance_breaks <- c(0, 1, 2, 3, 4, 5, 6, 7, 8, Inf)
 distance_labels <- c(
   "0–1 m", "1–2 m", "2–3 m", "3–4 m", "4–5 m",
   "5–6 m", "6–7 m", "7–8 m", ">8 m"
 )
 
-adjacent_distance_binned <- adjacent_pairs %>%
+adjacent_distance_binned <- adjacent_pairs_for_distance_classes %>%
   filter(!is.na(adjacent_distance_m), adjacent_distance_m >= 0) %>%
   mutate(
     distance_class = cut(
@@ -593,7 +599,7 @@ distance_frequency_table_by_site <- adjacent_distance_binned %>%
 
 readr::write_csv(
   distance_frequency_table,
-  file.path(output_dir, "adjacent_pair_distance_frequency_table.csv")
+  file.path(output_dir, "adjacent_pair_distance_classes_table.csv")
 )
 
 p3 <- ggplot(
@@ -603,14 +609,15 @@ p3 <- ggplot(
   geom_col(fill = "#74c476", color = "#238b45") +
   theme_bw(base_size = 12) +
   labs(
-    title = "Frequency of adjacent-individual pair distances (all sites pooled)",
-    x = "Distance class (m)",
-    y = "Number of adjacent-individual pairs"
+    title = "Frequency distribution of distances between adjacent sampled individuals",
+    x = "Distance class between adjacent sampled individuals",
+    y = "Number of adjacent-number pairs",
+    caption = "Final class groups all distances >8 m."
   ) +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
 
 ggsave(
-  filename = file.path(output_dir, "adjacent_pair_distance_frequency_overall.png"),
+  filename = file.path(output_dir, "adjacent_pair_distance_classes_overall.png"),
   plot = p3,
   width = 9,
   height = 5.5,
@@ -622,17 +629,50 @@ p4 <- ggplot(distance_frequency_table_by_site, aes(x = distance_class, y = n_adj
   facet_wrap(~ site, scales = "free_y") +
   theme_bw(base_size = 12) +
   labs(
-    title = "Frequency of adjacent-individual pair distances by site",
-    x = "Distance class (m)",
-    y = "Number of adjacent-individual pairs"
+    title = "Frequency distribution of distances between adjacent sampled individuals",
+    x = "Distance class between adjacent sampled individuals",
+    y = "Number of adjacent-number pairs",
+    caption = "Final class groups all distances >8 m."
   ) +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
 
 ggsave(
-  filename = file.path(output_dir, "adjacent_pair_distance_frequency_by_site.png"),
+  filename = file.path(output_dir, "adjacent_pair_distance_classes_by_site.png"),
   plot = p4,
   width = 12,
   height = 8,
+  dpi = 320
+)
+
+# Median adjacent-pair distance by site with IQR
+median_distance_by_site <- adjacent_pairs_for_distance_classes %>%
+  filter(!is.na(adjacent_distance_m), adjacent_distance_m >= 0) %>%
+  group_by(site) %>%
+  summarise(
+    n_adjacent_pairs = n(),
+    median_distance_m = median(adjacent_distance_m, na.rm = TRUE),
+    q25_distance_m = quantile(adjacent_distance_m, probs = 0.25, na.rm = TRUE, names = FALSE),
+    q75_distance_m = quantile(adjacent_distance_m, probs = 0.75, na.rm = TRUE, names = FALSE),
+    .groups = "drop"
+  ) %>%
+  arrange(median_distance_m)
+
+p5 <- ggplot(median_distance_by_site, aes(x = reorder(site, median_distance_m), y = median_distance_m)) +
+  geom_linerange(aes(ymin = q25_distance_m, ymax = q75_distance_m), color = "#6a51a3", linewidth = 1) +
+  geom_point(color = "#3f007d", size = 2.5) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Median distance between adjacent-number pairs by site (IQR shown)",
+    x = "Site",
+    y = "Median adjacent-number pair distance (m)"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(
+  filename = file.path(output_dir, "adjacent_pair_median_distance_by_site.png"),
+  plot = p5,
+  width = 10,
+  height = 6,
   dpi = 320
 )
 
@@ -697,3 +737,35 @@ if (coord_type == "latlon") {
 }
 message("Rows kept after cleaning: ", nrow(cleaned))
 message("Output directory: ", normalizePath(output_dir, mustWork = FALSE))
+
+overall_pairs <- adjacent_pairs_for_distance_classes %>%
+  filter(!is.na(adjacent_distance_m), adjacent_distance_m >= 0)
+
+total_pairs <- nrow(overall_pairs)
+count_within <- function(threshold) {
+  sum(overall_pairs$adjacent_distance_m <= threshold, na.rm = TRUE)
+}
+fmt_count_pct <- function(count, total) {
+  if (total == 0) return("0 (0.0%)")
+  paste0(count, " (", sprintf("%.1f", (count / total) * 100), "%)")
+}
+
+within_1 <- count_within(1)
+within_2 <- count_within(2)
+within_5 <- count_within(5)
+within_8 <- count_within(8)
+
+message("Total number of adjacent-number pairs: ", total_pairs)
+message("Number and percent of pairs within 1 m: ", fmt_count_pct(within_1, total_pairs))
+message("Number and percent of pairs within 2 m: ", fmt_count_pct(within_2, total_pairs))
+message("Number and percent of pairs within 5 m: ", fmt_count_pct(within_5, total_pairs))
+message("Number and percent of pairs within 8 m: ", fmt_count_pct(within_8, total_pairs))
+message("Median distance overall (m): ", sprintf("%.3f", median(overall_pairs$adjacent_distance_m, na.rm = TRUE)))
+message("Mean distance overall (m): ", sprintf("%.3f", mean(overall_pairs$adjacent_distance_m, na.rm = TRUE)))
+message("Median distance by site (m):")
+for (i in seq_len(nrow(median_distance_by_site))) {
+  message(
+    "  ", median_distance_by_site$site[i], ": ",
+    sprintf("%.3f", median_distance_by_site$median_distance_m[i])
+  )
+}

@@ -471,12 +471,11 @@ plot_theme <- theme_bw(base_size = 12) +
   )
 
 hist_plot <- ggplot(histogram_data, aes(x = distance_class, y = n_stems)) +
-  geom_col(fill = "#2C7FB8", color = "white") +
+  geom_col(fill = "#2E8B57", color = "NA") +
   labs(
-    title = "Distribution of true nearest-neighbour distances among sampled stems",
-    x = "True nearest-neighbour distance (m)",
+    title = "Distribution of nearest-neighbour distances among sampled stems",
+    x = "Nearest-neighbour distance (m)",
     y = "Number of stems",
-    caption = "Bin width = 1 m; final class aggregates stems with nearest-neighbour distance >8 m."
   ) +
   plot_theme +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
@@ -484,7 +483,7 @@ hist_plot <- ggplot(histogram_data, aes(x = distance_class, y = n_stems)) +
 box_plot <- nn_table %>%
   filter(!is.na(nearest_neighbor_distance_m), nearest_neighbor_distance_m >= 0) %>%
   ggplot(aes(x = site, y = nearest_neighbor_distance_m)) +
-  geom_boxplot(fill = "#74A9CF", color = "#1F78B4", outlier.alpha = 0.6) +
+  geom_boxplot(fill = "#2E8B57", color = "NA", outlier.alpha = 0.6) +
   labs(
     title = "True nearest-neighbour distance by site",
     x = "Site",

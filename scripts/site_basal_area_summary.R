@@ -5,8 +5,18 @@
 
 options(stringsAsFactors = FALSE)
 
-project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
-scripts_dir <- file.path(project_root, "scripts")
+args <- commandArgs(trailingOnly = FALSE)
+file_arg <- grep("^--file=", args, value = TRUE)
+script_path <- if (length(file_arg) > 0) sub("^--file=", "", file_arg[1]) else ""
+
+if (nzchar(script_path)) {
+  script_dir <- dirname(normalizePath(script_path, winslash = "/", mustWork = TRUE))
+} else {
+  script_dir <- normalizePath(file.path(getwd(), "scripts"), winslash = "/", mustWork = FALSE)
+}
+
+project_root <- dirname(script_dir)
+scripts_dir <- script_dir
 output_dir <- file.path(project_root, "outputs", "tables")
 
 if (!dir.exists(scripts_dir)) {
@@ -23,7 +33,7 @@ if (length(r_files) == 0) {
   stop("No .R files found in ", scripts_dir)
 }
 
-extract_matches <- function(pattern, text, group = 1L) {
+extract_matches <- function(pattern, text, group = 2L) {
   m <- gregexpr(pattern, text, perl = TRUE)
   reg <- regmatches(text, m)
   out <- character(0)

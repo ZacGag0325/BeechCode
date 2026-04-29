@@ -23,7 +23,7 @@ if (length(r_files) == 0) {
   stop("No .R files found in ", scripts_dir)
 }
 
-extract_matches <- function(pattern, text, group = 2L) {
+extract_matches <- function(pattern, text, group = 1L) {
   m <- gregexpr(pattern, text, perl = TRUE)
   reg <- regmatches(text, m)
   out <- character(0)
@@ -113,10 +113,13 @@ for (f in r_files) {
   lines <- readLines(f, warn = FALSE, encoding = "UTF-8")
   txt <- paste(lines, collapse = "\n")
   
-  lib_pkgs <- extract_matches("(?:library|require)\\s*\\(\\s*([A-Za-z][A-Za-z0-9._]*)\\s*\\)", txt, group = 2L)
+  lib_pkgs <- c(
+    extract_matches("(?:library|require)\\s*\\(\\s*([A-Za-z][A-Za-z0-9._]*)\\s*\\)", txt, group = 1L),
+    extract_matches("(?:library|require)\\s*\\(\\s*['\"]([A-Za-z][A-Za-z0-9._]*)['\"]\\s*\\)", txt, group = 1L)
+  )
   reqns_pkgs <- c(
-    extract_matches("requireNamespace\\s*\\(\\s*\"([A-Za-z][A-Za-z0-9._]*)\"", txt, group = 2L),
-    extract_matches("requireNamespace\\s*\\(\\s*'([A-Za-z][A-Za-z0-9._]*)'", txt, group = 2L)
+    extract_matches("requireNamespace\\s*\\(\\s*\"([A-Za-z][A-Za-z0-9._]*)\"", txt, group = 1L),
+    extract_matches("requireNamespace\\s*\\(\\s*'([A-Za-z][A-Za-z0-9._]*)'", txt, group = 1L)
   )
   
   ns_calls <- unique(unlist(regmatches(
@@ -218,3 +221,4 @@ cat(" - ", path_by_script, "\n", sep = "")
 cat(" - ", path_summary, "\n", sep = "")
 if (file.exists(path_xlsx)) {
   cat(" - ", path_xlsx, "\n", sep = "")
+}

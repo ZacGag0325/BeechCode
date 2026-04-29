@@ -20,46 +20,67 @@ suppressPackageStartupMessages({
 detect_project_root <- function() {
   fallback_root <- path.expand("~/Desktop/BeechCode")
   
-  # 1) Prefer here::here() if available and returns an existing path.
+  normalize_root_candidate <- function(path_value) {
+    if (is.null(path_value) || length(path_value) == 0 || is.na(path_value)) return(NA_character_)
+    p <- normalizePath(as.character(path_value), winslash = "/", mustWork = FALSE)
+    
+    # If a .Rproj file path is returned, use its parent folder as project root.
+    if (grepl("\\.rproj$", tolower(p))) {
+      p <- dirname(p)
+    }
+    
+    if (!dir.exists(p)) return(NA_character_)
+    p
+  }
+  
+  # 1) Prefer here::here() if available.
   if (requireNamespace("here", quietly = TRUE)) {
     candidate <- tryCatch(here::here(), error = function(e) NA_character_)
-    if (!is.na(candidate) && dir.exists(candidate)) {
-      return(normalizePath(candidate, winslash = "/", mustWork = FALSE))
-    }
+    candidate <- normalize_root_candidate(candidate)
+    if (!is.na(candidate)) return(candidate)
   }
   
   # 2) Try rprojroot::find_rstudio_root_file() if available.
   if (requireNamespace("rprojroot", quietly = TRUE)) {
     candidate <- tryCatch(rprojroot::find_rstudio_root_file(), error = function(e) NA_character_)
-    if (!is.na(candidate) && dir.exists(candidate)) {
-      return(normalizePath(candidate, winslash = "/", mustWork = FALSE))
+    candidate <- normalize_root_candidate(candidate)
+    if (!is.na(candidate)) return(candidate)
+  }
+  
+  # 3) Use the script path if available (works when sourced from file).
+  script_path <- tryCatch(normalizePath(sys.frames()[[1]]$ofile, winslash = "/", mustWork = FALSE),
+                          error = function(e) NA_character_)
+  if (!is.na(script_path) && script_path != "") {
+    script_dir <- dirname(script_path)
+    cur <- script_dir
+    for (i in seq_len(12)) {
+      if (length(list.files(cur, pattern = "\\.Rproj$", ignore.case = TRUE)) > 0) {
+        return(cur)
+      }
+      parent <- dirname(cur)
+      if (identical(parent, cur)) break
+      cur <- parent
     }
   }
   
-  # 3) Manual fallback: if cwd points to a .Rproj file, strip filename.
+  # 4) Manual cwd handling and upward search.
   wd <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
-  if (grepl("\\.rproj$", tolower(wd))) {
-    wd_parent <- dirname(wd)
-    if (dir.exists(wd_parent)) {
-      return(normalizePath(wd_parent, winslash = "/", mustWork = FALSE))
+  wd <- normalize_root_candidate(wd)
+  if (!is.na(wd)) {
+    cur <- wd
+    for (i in seq_len(12)) {
+      if (length(list.files(cur, pattern = "\\.Rproj$", ignore.case = TRUE)) > 0) {
+        return(cur)
+      }
+      parent <- dirname(cur)
+      if (identical(parent, cur)) break
+      cur <- parent
     }
-  }
-  
-  # 4) Search upward from cwd for a directory containing a .Rproj file.
-  cur <- wd
-  for (i in seq_len(12)) {
-    if (length(list.files(cur, pattern = "\\.Rproj$", ignore.case = TRUE)) > 0) {
-      return(normalizePath(cur, winslash = "/", mustWork = FALSE))
-    }
-    parent <- dirname(cur)
-    if (identical(parent, cur)) break
-    cur <- parent
   }
   
   # 5) Explicit fallback requested by user.
-  if (dir.exists(fallback_root)) {
-    return(normalizePath(fallback_root, winslash = "/", mustWork = FALSE))
-  }
+  fallback_candidate <- normalize_root_candidate(fallback_root)
+  if (!is.na(fallback_candidate)) return(fallback_candidate)
   
   # Final fallback to current working directory.
   normalizePath(getwd(), winslash = "/", mustWork = FALSE)

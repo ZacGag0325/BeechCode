@@ -17,12 +17,60 @@ suppressPackageStartupMessages({
 # standardizes likely column names, computes basal area per stem, summarizes by site,
 # and exports CSV + XLSX outputs.
 
-project_root <- normalizePath(getwd())
+detect_project_root <- function() {
+  fallback_root <- path.expand("~/Desktop/BeechCode")
+  
+  # 1) Prefer here::here() if available and returns an existing path.
+  if (requireNamespace("here", quietly = TRUE)) {
+    candidate <- tryCatch(here::here(), error = function(e) NA_character_)
+    if (!is.na(candidate) && dir.exists(candidate)) {
+      return(normalizePath(candidate, winslash = "/", mustWork = FALSE))
+    }
+  }
+  
+  # 2) Try rprojroot::find_rstudio_root_file() if available.
+  if (requireNamespace("rprojroot", quietly = TRUE)) {
+    candidate <- tryCatch(rprojroot::find_rstudio_root_file(), error = function(e) NA_character_)
+    if (!is.na(candidate) && dir.exists(candidate)) {
+      return(normalizePath(candidate, winslash = "/", mustWork = FALSE))
+    }
+  }
+  
+  # 3) Manual fallback: if cwd points to a .Rproj file, strip filename.
+  wd <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+  if (grepl("\\.rproj$", tolower(wd))) {
+    wd_parent <- dirname(wd)
+    if (dir.exists(wd_parent)) {
+      return(normalizePath(wd_parent, winslash = "/", mustWork = FALSE))
+    }
+  }
+  
+  # 4) Search upward from cwd for a directory containing a .Rproj file.
+  cur <- wd
+  for (i in seq_len(12)) {
+    if (length(list.files(cur, pattern = "\\.Rproj$", ignore.case = TRUE)) > 0) {
+      return(normalizePath(cur, winslash = "/", mustWork = FALSE))
+    }
+    parent <- dirname(cur)
+    if (identical(parent, cur)) break
+    cur <- parent
+  }
+  
+  # 5) Explicit fallback requested by user.
+  if (dir.exists(fallback_root)) {
+    return(normalizePath(fallback_root, winslash = "/", mustWork = FALSE))
+  }
+  
+  # Final fallback to current working directory.
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+}
+
+project_root <- detect_project_root()
 raw_dir <- file.path(project_root, "data", "raw")
 out_dir <- file.path(project_root, "outputs", "tables")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-message("Project root: ", project_root)
+message("Detected project root: ", project_root)
 message("Raw data directory: ", raw_dir)
 
 if (!dir.exists(raw_dir)) {

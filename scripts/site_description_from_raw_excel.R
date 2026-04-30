@@ -29,6 +29,7 @@ suppressPackageStartupMessages({
 # -----------------------------
 plot_area_m2 <- 24 * 24  # Used if no plot area can be detected automatically.
 beech_code <- "HEG"
+manual_site_column <- NA_character_  # Set to exact arbre column name to override auto-detection.
 
 # -----------------------------
 # Helpers
@@ -142,6 +143,20 @@ arbre_raw <- readxl::read_excel(excel_path, sheet = "arbre") %>% janitor::clean_
 # Detect relevant columns
 # -----------------------------
 site_col <- pick_column(arbre_raw, c("^site$", "site_?id", "id_?site", "placette", "plot", "parcelle"), "site")
+if (!is.na(manual_site_column)) {
+  if (!(manual_site_column %in% names(arbre_raw))) {
+    stop(
+      paste0(
+        "manual_site_column was provided ('", manual_site_column,
+        "') but does not exist in arbre sheet. Available columns: ",
+        paste(names(arbre_raw), collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  site_col <- manual_site_column
+  message("Manual site column override applied: ", site_col)
+}
 species_col <- pick_column(arbre_raw, c("espece", "species", "specie", "taxon", "code_?ess", "essence", "sp$", "^sp_"), "species")
 dbh_col <- pick_column(arbre_raw, c("dbh", "dhp", "diam", "diametre", "diameter", "d130", "d_?bh"), "DBH")
 ba_col <- pick_column(arbre_raw, c("basal", "surface_?terr", "g_?ind", "ba_?m2", "barea"), "basal area")
@@ -155,6 +170,7 @@ message(" - DBH: ", dbh_col)
 message(" - Basal area (existing): ", ba_col)
 message(" - Elevation in arbre: ", elev_col_arbre)
 message(" - Plot area in arbre: ", plot_area_col)
+message("All columns in 'arbre': ", paste(names(arbre_raw), collapse = ", "))
 
 required_for_core <- c(site_col, species_col, dbh_col)
 if (any(is.na(required_for_core))) {
@@ -174,6 +190,31 @@ arbre <- arbre_raw %>%
     species_clean = str_to_upper(str_trim(as.character(.data[[species_col]]))),
     dbh_cm = coerce_numeric(.data[[dbh_col]])
   )
+
+# -----------------------------
+# Diagnostics
+# -----------------------------
+unique_sites <- arbre %>%
+  filter(!is.na(site_clean)) %>%
+  distinct(site_clean) %>%
+  nrow()
+message("Diagnostic - unique sites detected: ", unique_sites)
+
+site_frequency <- arbre %>%
+  filter(!is.na(site_clean)) %>%
+  count(site_clean, name = "n_individuals") %>%
+  arrange(site_clean)
+message("Diagnostic - individuals per site:")
+print(site_frequency, n = Inf)
+
+diag_preview <- arbre %>%
+  transmute(
+    site = .data[[site_col]],
+    espece = .data[[species_col]],
+    dhp_cm = dbh_cm
+  )
+message("Diagnostic - first 20 rows of site/espece/dhp_cm:")
+print(utils::head(diag_preview, 20), n = 20)
 
 if (all(is.na(arbre$site_clean))) {
   stop("All site values are NA after numeric conversion; cannot continue.", call. = FALSE)
@@ -280,13 +321,21 @@ if (is.null(elevation_by_site) || nrow(elevation_by_site) == 0) {
 # -----------------------------
 # Build outputs
 # -----------------------------
+all_sites <- arbre %>%
+  filter(!is.na(site_clean)) %>%
+  distinct(site_clean)
+
 site_summary <- arbre %>%
-  filter(!is.na(site_clean), !is.na(dbh_cm), !is.na(individual_basal_area_m2)) %>%
+  filter(!is.na(site_clean)) %>%
   group_by(site_clean) %>%
   summarise(
-    basal_area_m2_ha = sum(individual_basal_area_m2, na.rm = TRUE) / plot_area_m2_used * 10000,
-    mean_dbh_cm = mean(dbh_cm, na.rm = TRUE),
-    sd_dbh_cm = sd(dbh_cm, na.rm = TRUE),
+    basal_area_m2_ha = ifelse(
+      all(is.na(individual_basal_area_m2)),
+      NA_real_,
+      sum(individual_basal_area_m2, na.rm = TRUE) / plot_area_m2_used * 10000
+    ),
+    mean_dbh_cm = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
+    sd_dbh_cm = ifelse(all(is.na(dbh_cm)), NA_real_, sd(dbh_cm, na.rm = TRUE)),
     .groups = "drop"
   )
 
@@ -300,7 +349,8 @@ beech_summary <- arbre %>%
     .groups = "drop"
   )
 
-site_description <- site_summary %>%
+site_description <- all_sites %>%
+  left_join(site_summary, by = "site_clean") %>%
   left_join(beech_summary, by = "site_clean") %>%
   left_join(elevation_by_site, by = "site_clean") %>%
   arrange(site_clean) %>%

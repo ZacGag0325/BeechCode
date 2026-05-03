@@ -467,7 +467,9 @@ histogram_data <- nn_table %>%
 plot_theme <- theme_bw(base_size = 12) +
   theme(
     panel.grid.minor = element_blank(),
-    axis.title = element_text(face = "bold")
+    axis.title = element_text(face = "bold"),
+    axis.ticks = element_line(linewidth = 1.0),
+    axis.ticks.length = grid::unit(0.28, "cm")
   )
 
 plot_labels <- list(

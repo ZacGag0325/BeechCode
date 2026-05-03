@@ -470,12 +470,13 @@ plot_theme <- theme_bw(base_size = 12) +
     axis.title = element_text(face = "bold")
   )
 
+# ----------------------------- ENGLISH FIGURES -------------------------------
 hist_plot <- ggplot(histogram_data, aes(x = distance_class, y = n_stems)) +
   geom_col(fill = "#2E8B57", color = "NA") +
   labs(
     title = "Distribution of nearest-neighbour distances among sampled stems",
     x = "Nearest-neighbour distance (m)",
-    y = "Number of stems",
+    y = "Number of stems"
   ) +
   plot_theme +
   theme(axis.text.x = element_text(angle = 30, hjust = 1))
@@ -497,6 +498,35 @@ box_out <- file.path(output_dir, "true_nearest_neighbour_distance_by_site.png")
 
 ggsave(filename = hist_out, plot = hist_plot, width = 10, height = 7, dpi = 400)
 ggsave(filename = box_out, plot = box_plot, width = 9, height = 6, dpi = 400)
+
+# ----------------------------- FRENCH FIGURES --------------------------------
+hist_plot_fr <- ggplot(histogram_data, aes(x = distance_class, y = n_stems)) +
+  geom_col(fill = "#2E8B57", color = "NA") +
+  labs(
+    title = "Distribution des distances au plus proche voisin parmi les tiges échantillonnées",
+    x = "Distance au plus proche voisin (m)",
+    y = "Nombre de tiges"
+  ) +
+  plot_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+box_plot_fr <- nn_table %>%
+  filter(!is.na(nearest_neighbor_distance_m), nearest_neighbor_distance_m >= 0) %>%
+  ggplot(aes(x = site, y = nearest_neighbor_distance_m)) +
+  geom_boxplot(fill = "#2E8B57", color = "NA", outlier.alpha = 0.6) +
+  labs(
+    title = "Distance au plus proche voisin par site",
+    x = "Site",
+    y = "Distance au plus proche voisin (m)"
+  ) +
+  plot_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+hist_out_fr <- file.path(output_dir, "true_nearest_neighbour_distance_histogram_fr.png")
+box_out_fr <- file.path(output_dir, "true_nearest_neighbour_distance_by_site_fr.png")
+
+ggsave(filename = hist_out_fr, plot = hist_plot_fr, width = 10, height = 7, dpi = 400)
+ggsave(filename = box_out_fr, plot = box_plot_fr, width = 9, height = 6, dpi = 400)
 
 # Console summaries
 nn_non_missing <- nn_table %>%
@@ -556,5 +586,7 @@ message("Outputs saved to: ", normalizePath(output_dir, winslash = "/", mustWork
 message("  - ", normalizePath(true_nn_stem_out, winslash = "/", mustWork = FALSE))
 message("  - ", normalizePath(hist_out, winslash = "/", mustWork = FALSE))
 message("  - ", normalizePath(box_out, winslash = "/", mustWork = FALSE))
+message("  - ", normalizePath(hist_out_fr, winslash = "/", mustWork = FALSE), " (French)")
+message("  - ", normalizePath(box_out_fr, winslash = "/", mustWork = FALSE), " (French)")
 message("  - ", normalizePath(legacy_table_out, winslash = "/", mustWork = FALSE), " (kept)")
 message("  - ", normalizePath(legacy_summary_out, winslash = "/", mustWork = FALSE), " (kept)")

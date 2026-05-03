@@ -464,10 +464,13 @@ histogram_data <- nn_table %>%
   count(distance_class, name = "n_stems", .drop = FALSE) %>%
   mutate(distance_class = factor(distance_class, levels = bin_labels))
 
-plot_theme <- theme_bw(base_size = 12) +
+plot_theme <- theme_bw(base_size = 22) +
   theme(
+    plot.title = element_text(size = 26, face = "bold"),
+    axis.title = element_text(size = 26, face = "bold"),
+    axis.text = element_text(size = 22),
     panel.grid.minor = element_blank(),
-    axis.title = element_text(face = "bold"),
+    # Enlarged tick marks for presentation readability
     axis.ticks = element_line(linewidth = 1.0),
     axis.ticks.length = grid::unit(0.28, "cm")
   )
@@ -508,7 +511,7 @@ build_hist_plot <- function(hist_data, labels, theme_obj) {
       y = labels$y
     ) +
     theme_obj +
-    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+    theme(axis.text.x = element_text(size = 22, angle = 30, hjust = 1))
 }
 
 build_box_plot <- function(nn_data, labels, theme_obj) {
@@ -522,7 +525,7 @@ build_box_plot <- function(nn_data, labels, theme_obj) {
       y = labels$y
     ) +
     theme_obj +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    theme(axis.text.x = element_text(size = 22, angle = 45, hjust = 1))
 }
 
 # ----------------------------- ENGLISH FIGURES -------------------------------

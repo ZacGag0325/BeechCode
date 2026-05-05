@@ -99,7 +99,27 @@ beech_pattern <- "fagus\\s*grandifolia|^heg$|hetre|h[êe]tre|american\\s*beech"
 # -----------------------------
 # Paths and workbook loading
 # -----------------------------
-project_root <- getwd()
+resolve_project_root <- function() {
+  script_path <- tryCatch(normalizePath(sys.frames()[[1]]$ofile, winslash = "/", mustWork = FALSE), error = function(e) NA_character_)
+  if (is.na(script_path) || script_path == "") {
+    args <- commandArgs(trailingOnly = FALSE)
+    file_arg <- args[grepl("^--file=", args)]
+    if (length(file_arg) > 0) script_path <- normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = FALSE)
+  }
+  candidates <- unique(normalizePath(c(dirname(script_path), getwd()), winslash = "/", mustWork = FALSE))
+  for (cand in candidates) {
+    probe <- cand
+    for (i in seq_len(8)) {
+      if (dir.exists(file.path(probe, "scripts")) && dir.exists(file.path(probe, "data", "raw"))) return(probe)
+      parent <- dirname(probe)
+      if (identical(parent, probe)) break
+      probe <- parent
+    }
+  }
+  getwd()
+}
+
+project_root <- resolve_project_root()
 raw_dir <- file.path(project_root, "data", "raw")
 out_dir <- file.path(project_root, "outputs", "tables")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)

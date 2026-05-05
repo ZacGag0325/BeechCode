@@ -1,88 +1,38 @@
 #!/usr/bin/env Rscript
 
-required_packages <- c("tidyverse", "readxl", "openxlsx", "janitor", "stringr", "here")
+required_packages <- c("dplyr", "readxl", "openxlsx", "stringr", "tidyr", "purrr")
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
-  stop(paste0("Missing required package(s): ", paste(missing_packages, collapse = ", "), ". Please install them before running this script."), call. = FALSE)
+  stop(
+    paste0("Missing required package(s): ", paste(missing_packages, collapse = ", "), ". Please install them before running this script."),
+    call. = FALSE
+  )
 }
 
 suppressPackageStartupMessages({
-  library(tidyverse)
+  library(dplyr)
   library(readxl)
   library(openxlsx)
-  library(janitor)
   library(stringr)
-  library(here)
+  library(tidyr)
+  library(purrr)
 })
 
 # -----------------------------
-# User-editable constants
+# Constants
 # -----------------------------
-plot_area_m2 <- 24 * 24
-beech_code <- "HEG"
-manual_site_column <- NA_character_
-min_expected_sites <- 8
+fallback_plot_area_m2 <- 576 # 24m x 24m
 
 # -----------------------------
 # Helpers
 # -----------------------------
-resolve_project_root <- function() {
-  candidate_roots <- c(here::here(), getwd())
-  candidate_roots <- unique(normalizePath(candidate_roots, winslash = "/", mustWork = FALSE))
-  fallback <- NULL
-  
-  for (cand in candidate_roots) {
-    probe <- cand
-    for (i in seq_len(6)) {
-      has_data <- dir.exists(file.path(probe, "data"))
-      has_scripts <- dir.exists(file.path(probe, "scripts"))
-      has_raw <- dir.exists(file.path(probe, "data", "raw"))
-      if (has_data && has_scripts) {
-        if (has_raw) return(probe)
-        fallback <- probe
-      }
-      parent <- dirname(probe)
-      if (identical(parent, probe)) break
-      probe <- parent
-    }
-  }
-  
-  if (!is.null(fallback)) return(fallback)
-  normalizePath(here::here(), winslash = "/", mustWork = FALSE)
-}
-
 normalize_ascii <- function(x) {
-  x %>%
-    iconv(from = "", to = "ASCII//TRANSLIT") %>%
-    tolower() %>%
-    str_replace_all("[^a-z0-9]+", "_") %>%
-    str_replace_all("_+", "_") %>%
+  x |>
+    iconv(from = "", to = "ASCII//TRANSLIT") |>
+    tolower() |>
+    str_replace_all("[^a-z0-9]+", "_") |>
+    str_replace_all("_+", "_") |>
     str_replace_all("^_|_$", "")
-}
-
-find_excel_file <- function(search_dir) {
-  if (!dir.exists(search_dir)) {
-    stop(paste0("Expected raw-data directory not found: ", search_dir), call. = FALSE)
-  }
-  excel_files <- list.files(search_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
-  if (length(excel_files) == 0) stop(paste0("No Excel files found in: ", search_dir), call. = FALSE)
-  
-  preferred <- excel_files[str_detect(normalize_ascii(basename(excel_files)), "donnee|donn?ee|west")]
-  selected <- if (length(preferred) >= 1) preferred[1] else excel_files[1]
-  
-  message("Candidate Excel file(s):")
-  message(paste0(" - ", basename(excel_files), collapse = "\n"))
-  message("Selected workbook: ", basename(selected))
-  selected
-}
-
-pick_column <- function(df, patterns, label) {
-  cn <- names(df)
-  cn_norm <- normalize_ascii(cn)
-  idx <- which(str_detect(cn_norm, str_c(patterns, collapse = "|")))
-  if (length(idx) == 0) return(NA_character_)
-  if (length(idx) > 1) message("Multiple matches for ", label, ": ", paste(cn[idx], collapse = ", "), ". Using first: ", cn[idx[1]])
-  cn[idx[1]]
 }
 
 coerce_numeric <- function(x) {
@@ -93,218 +43,370 @@ coerce_numeric <- function(x) {
   suppressWarnings(as.numeric(x_chr))
 }
 
-non_empty_unique <- function(x) {
-  x_chr <- str_trim(as.character(x))
-  x_chr <- x_chr[!is.na(x_chr) & x_chr != "" & x_chr != "NA"]
-  unique(x_chr)
-}
-
-infer_site_columns <- function(df) {
+pick_column <- function(df, patterns, label, required = FALSE) {
   cn <- names(df)
   cn_norm <- normalize_ascii(cn)
-  site_like_patterns <- c("^site$", "site_?id", "id_?site", "code_?site", "num_?site", "no_?site", "placette", "parcelle", "plot", "station", "localite", "location", "bloc", "block")
-  idx <- which(str_detect(cn_norm, str_c(site_like_patterns, collapse = "|")))
-  
-  distinct_counts <- vapply(df, function(col) length(non_empty_unique(col)), integer(1))
-  broad_idx <- which(distinct_counts >= 4 & distinct_counts <= 100)
-  unique(c(cn[idx], cn[broad_idx]))
+  idx <- which(str_detect(cn_norm, str_c(patterns, collapse = "|")))
+  if (length(idx) == 0) {
+    if (required) warning("Could not detect required column for ", label, call. = FALSE)
+    return(NA_character_)
+  }
+  if (length(idx) > 1) {
+    message("Multiple matches for ", label, ": ", paste(cn[idx], collapse = ", "), ". Using: ", cn[idx[1]])
+  }
+  cn[idx[1]]
 }
 
-choose_best_site_column <- function(df, candidate_cols) {
-  if (length(candidate_cols) == 0) stop("No possible site column candidates were found in 'arbre'.", call. = FALSE)
+find_raw_workbook <- function(raw_dir) {
+  if (!dir.exists(raw_dir)) stop("Directory not found: ", raw_dir, call. = FALSE)
+  files <- list.files(raw_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(files) == 0) stop("No Excel file found in data/raw.", call. = FALSE)
   
-  diagnostics <- purrr::map_dfr(candidate_cols, function(colname) {
-    vals_raw <- non_empty_unique(df[[colname]])
-    vals_num <- suppressWarnings(as.numeric(vals_raw))
-    numeric_share <- ifelse(length(vals_raw) == 0, 0, mean(!is.na(vals_num)))
-    
-    tibble(
-      column_name = colname,
-      n_unique = length(vals_raw),
-      numeric_share = numeric_share,
-      unique_values_preview = paste(utils::head(vals_raw, 25), collapse = ", ")
-    )
-  }) %>%
-    mutate(
-      name_bonus = if_else(str_detect(normalize_ascii(column_name), "^site$|site_?id|id_?site|placette|parcelle|plot|station"), 1000, 0),
-      numeric_penalty = if_else(numeric_share > 0.95, 200, 0),
-      score = name_bonus + n_unique - numeric_penalty
-    ) %>%
-    arrange(desc(score), desc(n_unique), column_name)
+  norm_names <- normalize_ascii(basename(files))
+  preferred_idx <- which(str_detect(norm_names, "donnee|modifie|west|summer|copie"))
+  chosen <- if (length(preferred_idx) > 0) files[preferred_idx[1]] else files[1]
   
-  message("\nPossible site/location columns in 'arbre' (diagnostics):")
-  print(diagnostics, n = Inf, width = Inf)
-  
-  list(best_column = diagnostics$column_name[1], diagnostics = diagnostics)
+  message("Excel files found in data/raw:")
+  message(paste0(" - ", basename(files), collapse = "\n"))
+  message("Selected workbook: ", basename(chosen))
+  chosen
 }
 
-# -----------------------------
-# Load workbook
-# -----------------------------
-project_root <- resolve_project_root()
-message("Project root resolved to: ", project_root)
+extract_dbh_midpoint <- function(x) {
+  x_chr <- as.character(x)
+  x_chr <- str_replace_all(x_chr, ",", ".")
+  x_chr <- str_replace_all(x_chr, "\\s+", "")
+  
+  # examples: 0-1, 1_2, ]2-4], 4+, >=4
+  ranges <- str_match(x_chr, "(-?[0-9]+\\.?[0-9]*)[^0-9]+(-?[0-9]+\\.?[0-9]*)")
+  low <- suppressWarnings(as.numeric(ranges[, 2]))
+  high <- suppressWarnings(as.numeric(ranges[, 3]))
+  midpoint <- ifelse(!is.na(low) & !is.na(high), (low + high) / 2, NA_real_)
+  
+  plus_single <- str_match(x_chr, "([0-9]+\\.?[0-9]*)\\+")
+  plus_val <- suppressWarnings(as.numeric(plus_single[, 2]))
+  midpoint <- ifelse(is.na(midpoint) & !is.na(plus_val), plus_val + 0.5, midpoint)
+  
+  ge_single <- str_match(x_chr, ">=?([0-9]+\\.?[0-9]*)")
+  ge_val <- suppressWarnings(as.numeric(ge_single[, 2]))
+  midpoint <- ifelse(is.na(midpoint) & !is.na(ge_val), ge_val + 0.5, midpoint)
+  
+  midpoint
+}
 
+beech_pattern <- "fagus\\s*grandifolia|^heg$|hetre|h[êe]tre|american\\s*beech"
+
+# -----------------------------
+# Paths and workbook loading
+# -----------------------------
+project_root <- getwd()
 raw_dir <- file.path(project_root, "data", "raw")
-excel_path <- find_excel_file(raw_dir)
-message("Using Excel file: ", excel_path)
-
-all_sheets <- readxl::excel_sheets(excel_path)
-if (!("arbre" %in% all_sheets)) {
-  stop(paste0("Sheet 'arbre' not found. Available sheets: ", paste(all_sheets, collapse = ", ")), call. = FALSE)
-}
-
-arbre_raw <- readxl::read_excel(excel_path, sheet = "arbre") %>% janitor::clean_names()
-message("All columns in 'arbre':")
-message(paste0(" - ", names(arbre_raw), collapse = "\n"))
-
-# -----------------------------
-# Detect columns
-# -----------------------------
-species_col <- pick_column(arbre_raw, c("espece", "species", "specie", "taxon", "code_?ess", "essence", "sp$", "^sp_"), "species")
-dbh_col <- pick_column(arbre_raw, c("dbh", "dhp", "diam", "diametre", "diameter", "d130", "d_?bh"), "DBH")
-ba_col <- pick_column(arbre_raw, c("basal", "surface_?terr", "g_?ind", "ba_?m2", "barea", "st_tige"), "basal area")
-plot_area_col <- pick_column(arbre_raw, c("plot_?area", "surface_?plac", "area_?m2", "superficie", "quadrat_?area"), "plot area")
-
-site_candidates <- infer_site_columns(arbre_raw)
-site_choice <- choose_best_site_column(arbre_raw, site_candidates)
-site_col <- site_choice$best_column
-
-if (!is.na(manual_site_column)) {
-  if (!(manual_site_column %in% names(arbre_raw))) {
-    stop(paste0("manual_site_column '", manual_site_column, "' does not exist. Available columns: ", paste(names(arbre_raw), collapse = ", ")), call. = FALSE)
-  }
-  site_col <- manual_site_column
-  message("Manual site column override applied: ", site_col)
-}
-
-message("\nDetected columns in 'arbre':")
-message(" - Site (selected): ", site_col)
-message(" - Species: ", species_col)
-message(" - DBH: ", dbh_col)
-message(" - Basal area (existing): ", ba_col)
-message(" - Plot area in arbre: ", plot_area_col)
-
-required_for_core <- c(site_col, species_col, dbh_col)
-if (any(is.na(required_for_core))) {
-  stop(paste0("Failed to detect required columns. Detected: site=", site_col, ", species=", species_col, ", dbh=", dbh_col), call. = FALSE)
-}
-
-# required diagnostics
-message("\nSite-column diagnostics for all possible site/location columns:")
-for (colname in site_candidates) {
-  vals <- non_empty_unique(arbre_raw[[colname]])
-  message("\nColumn: ", colname)
-  message(" - Number of unique values: ", length(vals))
-  message(" - Unique values: ", paste(vals, collapse = ", "))
-}
-
-arbre <- arbre_raw %>%
-  mutate(
-    site_id_raw = str_trim(as.character(.data[[site_col]])),
-    species_clean = str_to_upper(str_trim(as.character(.data[[species_col]]))),
-    dbh_cm = coerce_numeric(.data[[dbh_col]])
-  ) %>%
-  mutate(site_id_raw = if_else(site_id_raw == "", NA_character_, site_id_raw))
-
-unique_sites <- length(unique(na.omit(arbre$site_id_raw)))
-message("\nDiagnostic - unique sites detected in selected column '", site_col, "': ", unique_sites)
-
-if (unique_sites < min_expected_sites && is.na(manual_site_column)) {
-  stop(paste0("Automatic site-column detection found only ", unique_sites, " sites (< ", min_expected_sites, "). Set manual_site_column. Candidates: ", paste(site_candidates, collapse = ", ")), call. = FALSE)
-}
-
-site_frequency <- arbre %>% filter(!is.na(site_id_raw)) %>% count(site_id_raw, name = "n_individuals") %>% arrange(site_id_raw)
-message("Diagnostic - individuals per site:")
-print(site_frequency, n = Inf)
-
-diag_preview <- arbre %>% transmute(site = site_id_raw, espece = .data[[species_col]], dhp_cm = dbh_cm)
-message("Diagnostic - first 20 rows of site/espece/dhp_cm:")
-print(utils::head(diag_preview, 20), n = 20)
-
-if (all(is.na(arbre$site_id_raw))) stop("All site IDs are missing after processing selected site column.", call. = FALSE)
-
-plot_area_m2_used <- plot_area_m2
-if (!is.na(plot_area_col)) {
-  pa <- coerce_numeric(arbre[[plot_area_col]])
-  pa <- pa[!is.na(pa) & pa > 0]
-  if (length(pa) > 0) {
-    plot_area_m2_used <- unique(pa)[1]
-    message("Using detected plot area from data: ", plot_area_m2_used, " m2")
-  } else {
-    message("Plot area column detected but invalid; using fallback: ", plot_area_m2)
-  }
-} else {
-  message("No plot area column detected; using fallback plot_area_m2 = ", plot_area_m2)
-}
-
-if (!is.na(ba_col)) {
-  arbre <- arbre %>% mutate(individual_basal_area_m2 = coerce_numeric(.data[[ba_col]]))
-  idx <- is.na(arbre$individual_basal_area_m2)
-  arbre$individual_basal_area_m2[idx] <- pi * (arbre$dbh_cm[idx] / 200)^2
-} else {
-  arbre <- arbre %>% mutate(individual_basal_area_m2 = pi * (dbh_cm / 200)^2)
-}
-
-all_sites <- arbre %>% filter(!is.na(site_id_raw), site_id_raw != "") %>% distinct(site_id_raw)
-
-site_summary <- arbre %>%
-  filter(!is.na(site_id_raw), site_id_raw != "") %>%
-  group_by(site_id_raw) %>%
-  summarise(
-    basal_area_m2_ha = ifelse(all(is.na(individual_basal_area_m2)), NA_real_, sum(individual_basal_area_m2, na.rm = TRUE) / plot_area_m2_used * 10000),
-    mean_dbh_cm = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
-    sd_dbh_cm = ifelse(all(is.na(dbh_cm)), NA_real_, sd(dbh_cm, na.rm = TRUE)),
-    .groups = "drop"
-  )
-
-beech_summary <- arbre %>%
-  filter(!is.na(site_id_raw), site_id_raw != "", species_clean == beech_code) %>%
-  group_by(site_id_raw) %>%
-  summarise(
-    beech_basal_area_m2_ha = ifelse(all(is.na(individual_basal_area_m2)), NA_real_, sum(individual_basal_area_m2, na.rm = TRUE) / plot_area_m2_used * 10000),
-    mean_beech_dbh_cm = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
-    sd_beech_dbh_cm = ifelse(all(is.na(dbh_cm)), NA_real_, sd(dbh_cm, na.rm = TRUE)),
-    .groups = "drop"
-  )
-
-site_description <- all_sites %>%
-  left_join(site_summary, by = "site_id_raw") %>%
-  left_join(beech_summary, by = "site_id_raw") %>%
-  arrange(site_id_raw) %>%
-  transmute(
-    site_label = site_id_raw,
-    basal_area_m2_ha,
-    mean_dbh_cm,
-    sd_dbh_cm,
-    beech_basal_area_m2_ha,
-    mean_beech_dbh_cm,
-    sd_beech_dbh_cm
-  )
-
-formatted_table <- site_description %>%
-  mutate(
-    `Mean DBH (cm)` = if_else(is.na(mean_dbh_cm), NA_character_, sprintf("%.1f (%.2f)", mean_dbh_cm, if_else(is.na(sd_dbh_cm), 0, sd_dbh_cm))),
-    `Mean beech DBH (cm)` = if_else(is.na(mean_beech_dbh_cm), NA_character_, sprintf("%.1f (%.2f)", mean_beech_dbh_cm, if_else(is.na(sd_beech_dbh_cm), 0, sd_beech_dbh_cm)))
-  ) %>%
-  transmute(
-    `Site #` = site_label,
-    `Basal area (m²·ha⁻¹)` = round(basal_area_m2_ha, 3),
-    `Mean DBH (cm)`,
-    `Beech basal area (m²·ha⁻¹)` = round(beech_basal_area_m2_ha, 3),
-    `Mean beech DBH (cm)`
-  )
-
 out_dir <- file.path(project_root, "outputs", "tables")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-readr::write_csv(site_description, file.path(out_dir, "site_description_table.csv"), na = "")
-openxlsx::write.xlsx(site_description, file.path(out_dir, "site_description_table.xlsx"), overwrite = TRUE)
-readr::write_csv(formatted_table, file.path(out_dir, "site_description_table_formatted.csv"), na = "")
+excel_path <- find_raw_workbook(raw_dir)
+sheets <- excel_sheets(excel_path)
+message("Workbook sheets: ", paste(sheets, collapse = ", "))
 
-message("\nFinal formatted table:")
-print(formatted_table, n = Inf)
+read_sheet_safe <- function(sheet_name) {
+  if (!(sheet_name %in% sheets)) {
+    warning("Sheet '", sheet_name, "' not found.", call. = FALSE)
+    return(NULL)
+  }
+  read_excel(excel_path, sheet = sheet_name)
+}
 
-message("\nOutputs saved to:")
-message(" - ", file.path(out_dir, "site_description_table.csv"))
-message(" - ", file.path(out_dir, "site_description_table.xlsx"))
-message(" - ", file.path(out_dir, "site_description_table_formatted.csv"))
+arbre_raw <- read_sheet_safe("arbre")
+gaule_raw <- read_sheet_safe("gaule")
+genetique_raw <- read_sheet_safe("genetique")
+
+if (is.null(arbre_raw)) stop("Sheet 'arbre' is required.", call. = FALSE)
+
+message("Detected columns in 'arbre': ", paste(names(arbre_raw), collapse = ", "))
+if (!is.null(gaule_raw)) message("Detected columns in 'gaule': ", paste(names(gaule_raw), collapse = ", "))
+if (!is.null(genetique_raw)) message("Detected columns in 'genetique': ", paste(names(genetique_raw), collapse = ", "))
+
+# -----------------------------
+# Column detection
+# -----------------------------
+site_patterns <- c("^site$", "site_?id", "id_?site", "placette", "parcelle", "plot", "station", "localite", "location")
+species_patterns <- c("espece", "species", "taxon", "essence", "code_?ess", "^sp$")
+dbh_patterns <- c("^dbh$", "dhp", "dhp_cm", "diam", "diametre", "diameter", "d130")
+plot_area_patterns <- c("plot_?area", "surface_?plac", "superficie", "area_?m2")
+lat_patterns <- c("^lat", "latitude", "y_coord", "coord_?y")
+lon_patterns <- c("^lon", "long", "longitude", "x_coord", "coord_?x")
+elev_patterns <- c("elev", "alt", "altitude", "hauteur")
+count_patterns <- c("^n$", "count", "nombre", "effectif", "nb", "abond")
+
+arbre_site_col <- pick_column(arbre_raw, site_patterns, "arbre site", required = TRUE)
+arbre_species_col <- pick_column(arbre_raw, species_patterns, "arbre species", required = TRUE)
+arbre_dbh_col <- pick_column(arbre_raw, dbh_patterns, "arbre dbh", required = TRUE)
+arbre_plot_area_col <- pick_column(arbre_raw, plot_area_patterns, "arbre plot area")
+
+if (any(is.na(c(arbre_site_col, arbre_species_col, arbre_dbh_col)))) {
+  stop("Could not detect required columns in 'arbre' (site/species/dbh).", call. = FALSE)
+}
+
+# -----------------------------
+# Arbre metrics
+# -----------------------------
+arbre <- arbre_raw |>
+  mutate(
+    site = str_trim(as.character(.data[[arbre_site_col]])),
+    species = str_trim(as.character(.data[[arbre_species_col]])),
+    species_norm = normalize_ascii(species),
+    dbh_cm = coerce_numeric(.data[[arbre_dbh_col]]),
+    plot_area_m2 = if (!is.na(arbre_plot_area_col)) coerce_numeric(.data[[arbre_plot_area_col]]) else NA_real_
+  ) |>
+  mutate(
+    plot_area_m2 = ifelse(is.na(plot_area_m2) | plot_area_m2 <= 0, fallback_plot_area_m2, plot_area_m2),
+    ba_m2_tree = pi * (dbh_cm / 200)^2
+  ) |>
+  filter(!is.na(site) & site != "")
+
+if (is.na(arbre_plot_area_col)) {
+  warning("No plot area column found in 'arbre'; fallback area of 576 m² used.", call. = FALSE)
+}
+
+arbre_site_summary <- arbre |>
+  group_by(site) |>
+  summarise(
+    Site = first(site),
+    Basal_Area = sum(ba_m2_tree * (10000 / plot_area_m2), na.rm = TRUE),
+    Beech_Basal_Area = sum(ifelse(str_detect(species_norm, beech_pattern), ba_m2_tree * (10000 / plot_area_m2), 0), na.rm = TRUE),
+    Mean_DBH = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
+    Mean_Beech_DBH = {
+      beech_dbh <- dbh_cm[str_detect(species_norm, beech_pattern)]
+      if (length(beech_dbh) == 0 || all(is.na(beech_dbh))) NA_real_ else mean(beech_dbh, na.rm = TRUE)
+    },
+    .groups = "drop"
+  )
+
+dominant_species <- arbre |>
+  mutate(ba_ha = ba_m2_tree * (10000 / plot_area_m2)) |>
+  group_by(site, species) |>
+  summarise(ba_ha = sum(ba_ha, na.rm = TRUE), .groups = "drop") |>
+  group_by(site) |>
+  slice_max(order_by = ba_ha, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  transmute(Site = site, Dominant_Species = species)
+
+arbre_site_summary <- arbre_site_summary |>
+  left_join(dominant_species, by = "Site")
+
+# -----------------------------
+# Gaule metrics (Beech Sapling Basal Area)
+# -----------------------------
+if (!is.null(gaule_raw)) {
+  gaule_site_col <- pick_column(gaule_raw, site_patterns, "gaule site")
+  gaule_species_col <- pick_column(gaule_raw, species_patterns, "gaule species")
+  gaule_dbh_col <- pick_column(gaule_raw, dbh_patterns, "gaule dbh")
+  gaule_count_col <- pick_column(gaule_raw, count_patterns, "gaule count")
+  gaule_plot_area_col <- pick_column(gaule_raw, plot_area_patterns, "gaule plot area")
+  
+  if (is.na(gaule_site_col) || is.na(gaule_species_col) || (is.na(gaule_dbh_col) && is.na(gaule_count_col))) {
+    warning("Could not detect enough columns in 'gaule' to compute Beech Sapling Basal Area; keeping NA.", call. = FALSE)
+    gaule_summary <- tibble(Site = unique(arbre_site_summary$Site), Beech_Sapling_Basal_Area = NA_real_)
+  } else {
+    gaule <- gaule_raw |>
+      mutate(
+        site = str_trim(as.character(.data[[gaule_site_col]])),
+        species = str_trim(as.character(.data[[gaule_species_col]])),
+        species_norm = normalize_ascii(species),
+        dbh_exact = if (!is.na(gaule_dbh_col)) coerce_numeric(.data[[gaule_dbh_col]]) else NA_real_,
+        dbh_mid = if (!is.na(gaule_dbh_col)) extract_dbh_midpoint(.data[[gaule_dbh_col]]) else NA_real_,
+        dbh_cm = ifelse(!is.na(dbh_exact), dbh_exact, dbh_mid),
+        n_stems = if (!is.na(gaule_count_col)) coerce_numeric(.data[[gaule_count_col]]) else 1,
+        plot_area_m2 = if (!is.na(gaule_plot_area_col)) coerce_numeric(.data[[gaule_plot_area_col]]) else fallback_plot_area_m2
+      ) |>
+      mutate(
+        n_stems = ifelse(is.na(n_stems) | n_stems <= 0, 1, n_stems),
+        plot_area_m2 = ifelse(is.na(plot_area_m2) | plot_area_m2 <= 0, fallback_plot_area_m2, plot_area_m2)
+      ) |>
+      filter(!is.na(site) & site != "", str_detect(species_norm, beech_pattern))
+    
+    if (all(is.na(gaule$dbh_cm))) {
+      warning("Could not derive DBH (exact or class midpoint) in 'gaule'; keeping Beech Sapling Basal Area as NA.", call. = FALSE)
+      gaule_summary <- tibble(Site = unique(arbre_site_summary$Site), Beech_Sapling_Basal_Area = NA_real_)
+    } else {
+      gaule_summary <- gaule |>
+        mutate(ba_m2 = pi * (dbh_cm / 200)^2,
+               ba_ha = ba_m2 * n_stems * (10000 / plot_area_m2)) |>
+        group_by(site) |>
+        summarise(Beech_Sapling_Basal_Area = sum(ba_ha, na.rm = TRUE), .groups = "drop") |>
+        transmute(Site = site, Beech_Sapling_Basal_Area)
+    }
+  }
+} else {
+  warning("Sheet 'gaule' unavailable; Beech Sapling Basal Area set to NA.", call. = FALSE)
+  gaule_summary <- tibble(Site = unique(arbre_site_summary$Site), Beech_Sapling_Basal_Area = NA_real_)
+}
+
+# -----------------------------
+# Genetique metrics (Elevation, Latitude ordering)
+# -----------------------------
+latlon_elev_summary <- NULL
+if (!is.null(genetique_raw)) {
+  gen_site_col <- pick_column(genetique_raw, site_patterns, "genetique site")
+  gen_lat_col <- pick_column(genetique_raw, lat_patterns, "genetique latitude")
+  gen_lon_col <- pick_column(genetique_raw, lon_patterns, "genetique longitude")
+  gen_elev_col <- pick_column(genetique_raw, elev_patterns, "genetique elevation")
+  
+  if (!is.na(gen_site_col)) {
+    gen <- genetique_raw |>
+      mutate(
+        site = str_trim(as.character(.data[[gen_site_col]])),
+        latitude = if (!is.na(gen_lat_col)) coerce_numeric(.data[[gen_lat_col]]) else NA_real_,
+        longitude = if (!is.na(gen_lon_col)) coerce_numeric(.data[[gen_lon_col]]) else NA_real_,
+        elevation = if (!is.na(gen_elev_col)) coerce_numeric(.data[[gen_elev_col]]) else NA_real_
+      ) |>
+      filter(!is.na(site) & site != "")
+    
+    latlon_elev_summary <- gen |>
+      group_by(site) |>
+      summarise(
+        mean_latitude = ifelse(all(is.na(latitude)), NA_real_, mean(latitude, na.rm = TRUE)),
+        mean_longitude = ifelse(all(is.na(longitude)), NA_real_, mean(longitude, na.rm = TRUE)),
+        Elevation = ifelse(all(is.na(elevation)), NA_real_, mean(elevation, na.rm = TRUE)),
+        .groups = "drop"
+      ) |>
+      transmute(Site = site, mean_latitude, mean_longitude, Elevation)
+  } else {
+    warning("No site column detected in 'genetique'; cannot compute elevation/latitude from this sheet.", call. = FALSE)
+  }
+}
+
+# latitude fallback from arbre/gaule if genetique latitude unavailable
+if (is.null(latlon_elev_summary) || all(is.na(latlon_elev_summary$mean_latitude))) {
+  lat_source <- NULL
+  lat_from_arbre <- pick_column(arbre_raw, lat_patterns, "arbre latitude")
+  lon_from_arbre <- pick_column(arbre_raw, lon_patterns, "arbre longitude")
+  if (!is.na(lat_from_arbre)) {
+    lat_source <- arbre_raw |>
+      mutate(
+        Site = str_trim(as.character(.data[[arbre_site_col]])),
+        mean_latitude = coerce_numeric(.data[[lat_from_arbre]]),
+        mean_longitude = if (!is.na(lon_from_arbre)) coerce_numeric(.data[[lon_from_arbre]]) else NA_real_
+      ) |>
+      filter(!is.na(Site) & Site != "") |>
+      group_by(Site) |>
+      summarise(
+        mean_latitude = ifelse(all(is.na(mean_latitude)), NA_real_, mean(mean_latitude, na.rm = TRUE)),
+        mean_longitude = ifelse(all(is.na(mean_longitude)), NA_real_, mean(mean_longitude, na.rm = TRUE)),
+        .groups = "drop"
+      )
+  }
+  
+  if (!is.null(lat_source)) {
+    message("Using latitude fallback from 'arbre'.")
+    if (is.null(latlon_elev_summary)) {
+      latlon_elev_summary <- lat_source |> mutate(Elevation = NA_real_)
+    } else {
+      latlon_elev_summary <- latlon_elev_summary |>
+        select(-mean_latitude, -mean_longitude) |>
+        left_join(lat_source, by = "Site")
+    }
+  } else {
+    warning("No latitude column found in genetique or other raw sheets; ordering will fall back to Site name.", call. = FALSE)
+    if (is.null(latlon_elev_summary)) {
+      latlon_elev_summary <- tibble(Site = unique(arbre_site_summary$Site), mean_latitude = NA_real_, mean_longitude = NA_real_, Elevation = NA_real_)
+    }
+  }
+}
+
+# -----------------------------
+# Assemble final table
+# -----------------------------
+final_tbl <- arbre_site_summary |>
+  left_join(gaule_summary, by = "Site") |>
+  left_join(latlon_elev_summary, by = "Site") |>
+  mutate(
+    Site = as.character(Site)
+  ) |>
+  distinct(Site, .keep_all = TRUE)
+
+if (any(!is.na(final_tbl$mean_latitude))) {
+  final_tbl <- final_tbl |> arrange(mean_latitude)
+} else {
+  final_tbl <- final_tbl |> arrange(Site)
+}
+
+final_tbl <- final_tbl |>
+  transmute(
+    Site = Site,
+    `Basal Area` = Basal_Area,
+    `Beech Basal Area` = Beech_Basal_Area,
+    `Mean DBH` = Mean_DBH,
+    `Mean Beech DBH` = Mean_Beech_DBH,
+    `Beech Sapling Basal Area` = Beech_Sapling_Basal_Area,
+    `Dominant Species` = Dominant_Species,
+    Elevation = Elevation
+  )
+
+# -----------------------------
+# Quality checks
+# -----------------------------
+if (!is.null(latlon_elev_summary) && any(!is.na(latlon_elev_summary$mean_longitude))) {
+  pos_long <- latlon_elev_summary |> filter(!is.na(mean_longitude) & mean_longitude > 0)
+  if (nrow(pos_long) > 0) {
+    warning("Longitude check: some longitudes are positive, unexpected for Québec. Sites: ", paste(pos_long$Site, collapse = ", "), call. = FALSE)
+  }
+}
+
+if (nrow(final_tbl) != dplyr::n_distinct(final_tbl$Site)) {
+  warning("Table does not have exactly one row per site.", call. = FALSE)
+}
+
+neg_ba_sites <- final_tbl |> filter(`Basal Area` < 0 | `Beech Basal Area` < 0 | `Beech Sapling Basal Area` < 0)
+if (nrow(neg_ba_sites) > 0) {
+  warning("Negative basal area values detected for site(s): ", paste(neg_ba_sites$Site, collapse = ", "), call. = FALSE)
+}
+
+beech_presence <- arbre |>
+  group_by(site) |>
+  summarise(has_beech = any(str_detect(species_norm, beech_pattern), na.rm = TRUE), .groups = "drop") |>
+  transmute(Site = site, has_beech)
+
+check_beech_dbh <- final_tbl |>
+  left_join(beech_presence, by = "Site") |>
+  filter(is.na(`Mean Beech DBH`) & isTRUE(has_beech))
+if (nrow(check_beech_dbh) > 0) {
+  warning("Mean Beech DBH is NA for site(s) where beech is present in arbre: ", paste(check_beech_dbh$Site, collapse = ", "), call. = FALSE)
+}
+
+if (!is.null(gaule_raw)) {
+  if (any(is.na(final_tbl$`Beech Sapling Basal Area`))) {
+    warning("Beech Sapling Basal Area has NA values. This should occur only when gaule columns were unavailable or unusable.", call. = FALSE)
+  }
+}
+
+# -----------------------------
+# Save outputs
+# -----------------------------
+csv_path <- file.path(out_dir, "site_description_table_article.csv")
+xlsx_path <- file.path(out_dir, "site_description_table_article.xlsx")
+
+write.csv(final_tbl, csv_path, row.names = FALSE, na = "")
+openxlsx::write.xlsx(final_tbl, xlsx_path, overwrite = TRUE)
+
+message("\nFinal table:")
+print(final_tbl, n = Inf, width = Inf)
+
+# Summary block
+range_or_na <- function(x) {
+  if (all(is.na(x))) return("NA to NA")
+  paste0(round(min(x, na.rm = TRUE), 4), " to ", round(max(x, na.rm = TRUE), 4))
+}
+
+message("\nSummary:")
+message(" - Number of sites included: ", nrow(final_tbl))
+message(" - Basal area range: ", range_or_na(final_tbl$`Basal Area`))
+message(" - Beech basal area range: ", range_or_na(final_tbl$`Beech Basal Area`))
+message(" - Mean DBH range: ", range_or_na(final_tbl$`Mean DBH`))
+message(" - Mean beech DBH range: ", range_or_na(final_tbl$`Mean Beech DBH`))
+message(" - Beech sapling basal area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
+message(" - Number of sites with missing elevation: ", sum(is.na(final_tbl$Elevation)))
+
+message("\nSaved:")
+message(" - ", csv_path)
+message(" - ", xlsx_path)

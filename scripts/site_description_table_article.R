@@ -19,9 +19,16 @@ suppressPackageStartupMessages({
 })
 
 # -----------------------------
-# Constants
+# User-setting required for prism BA (MUST be set)
 # -----------------------------
-fallback_plot_area_m2 <- 576 # 24m x 24m
+prism_baf <- NA_real_  # <-- Replace with your prism basal area factor before running
+
+if (is.na(prism_baf) || !is.finite(prism_baf) || prism_baf <= 0) {
+  stop(
+    "`prism_baf` is required and currently NA/invalid. Please set prism_baf near the top of this script (e.g., prism_baf <- 2 or 4) before running.",
+    call. = FALSE
+  )
+}
 
 # -----------------------------
 # Helpers
@@ -77,7 +84,6 @@ extract_dbh_midpoint <- function(x) {
   x_chr <- str_replace_all(x_chr, ",", ".")
   x_chr <- str_replace_all(x_chr, "\\s+", "")
   
-  # examples: 0-1, 1_2, ]2-4], 4+, >=4
   ranges <- str_match(x_chr, "(-?[0-9]+\\.?[0-9]*)[^0-9]+(-?[0-9]+\\.?[0-9]*)")
   low <- suppressWarnings(as.numeric(ranges[, 2]))
   high <- suppressWarnings(as.numeric(ranges[, 3]))
@@ -94,11 +100,6 @@ extract_dbh_midpoint <- function(x) {
   midpoint
 }
 
-beech_pattern <- "fagus\\s*grandifolia|^heg$|hetre|h[êe]tre|american\\s*beech"
-
-# -----------------------------
-# Paths and workbook loading
-# -----------------------------
 resolve_project_root <- function() {
   script_path <- tryCatch(normalizePath(sys.frames()[[1]]$ofile, winslash = "/", mustWork = FALSE), error = function(e) NA_character_)
   if (is.na(script_path) || script_path == "") {
@@ -119,6 +120,11 @@ resolve_project_root <- function() {
   getwd()
 }
 
+beech_pattern <- "fagus\\s*grandifolia|^heg$|hetre|h[êe]tre|american\\s*beech"
+
+# -----------------------------
+# Paths and workbook loading
+# -----------------------------
 project_root <- resolve_project_root()
 raw_dir <- file.path(project_root, "data", "raw")
 out_dir <- file.path(project_root, "outputs", "tables")
@@ -141,18 +147,21 @@ gaule_raw <- read_sheet_safe("gaule")
 genetique_raw <- read_sheet_safe("genetique")
 
 if (is.null(arbre_raw)) stop("Sheet 'arbre' is required.", call. = FALSE)
+if (is.null(gaule_raw)) stop("Sheet 'gaule' is required for this article table workflow.", call. = FALSE)
+if (is.null(genetique_raw)) stop("Sheet 'genetique' is required for south-to-north ordering and elevation.", call. = FALSE)
 
 message("Detected columns in 'arbre': ", paste(names(arbre_raw), collapse = ", "))
-if (!is.null(gaule_raw)) message("Detected columns in 'gaule': ", paste(names(gaule_raw), collapse = ", "))
-if (!is.null(genetique_raw)) message("Detected columns in 'genetique': ", paste(names(genetique_raw), collapse = ", "))
+message("Detected columns in 'gaule': ", paste(names(gaule_raw), collapse = ", "))
+message("Detected columns in 'genetique': ", paste(names(genetique_raw), collapse = ", "))
 
 # -----------------------------
 # Column detection
 # -----------------------------
 site_patterns <- c("^site$", "site_?id", "id_?site", "placette", "parcelle", "plot", "station", "localite", "location")
 species_patterns <- c("espece", "species", "taxon", "essence", "code_?ess", "^sp$")
-dbh_patterns <- c("^dbh$", "dhp", "dhp_cm", "diam", "diametre", "diameter", "d130")
-plot_area_patterns <- c("plot_?area", "surface_?plac", "superficie", "area_?m2")
+dbh_patterns <- c("^dbh$", "dhp", "dhp_cm", "diam", "diametre", "diameter", "d130", "dhp_tige")
+point_patterns <- c("point_?prisme", "prism_?point", "point")
+val_prism_patterns <- c("valeur_?prisme", "inclusion", "inclu", "prism_?value")
 lat_patterns <- c("^lat", "latitude", "y_coord", "coord_?y")
 lon_patterns <- c("^lon", "long", "longitude", "x_coord", "coord_?x")
 elev_patterns <- c("elev", "alt", "altitude", "hauteur")
@@ -161,272 +170,303 @@ count_patterns <- c("^n$", "count", "nombre", "effectif", "nb", "abond")
 arbre_site_col <- pick_column(arbre_raw, site_patterns, "arbre site", required = TRUE)
 arbre_species_col <- pick_column(arbre_raw, species_patterns, "arbre species", required = TRUE)
 arbre_dbh_col <- pick_column(arbre_raw, dbh_patterns, "arbre dbh", required = TRUE)
-arbre_plot_area_col <- pick_column(arbre_raw, plot_area_patterns, "arbre plot area")
+arbre_point_col <- pick_column(arbre_raw, point_patterns, "arbre point_prisme", required = TRUE)
+arbre_val_prism_col <- pick_column(arbre_raw, val_prism_patterns, "arbre valeur_prisme", required = TRUE)
 
-if (any(is.na(c(arbre_site_col, arbre_species_col, arbre_dbh_col)))) {
-  stop("Could not detect required columns in 'arbre' (site/species/dbh).", call. = FALSE)
+if (any(is.na(c(arbre_site_col, arbre_species_col, arbre_dbh_col, arbre_point_col, arbre_val_prism_col)))) {
+  stop("Could not detect required arbre columns (site/species/dbh/point_prisme/valeur_prisme).", call. = FALSE)
 }
 
 # -----------------------------
-# Arbre metrics
+# Arbre: included prism trees only (Valeur_prisme == 2)
 # -----------------------------
-arbre <- arbre_raw |>
+arbre_all <- arbre_raw |>
   mutate(
-    site = str_trim(as.character(.data[[arbre_site_col]])),
-    species = str_trim(as.character(.data[[arbre_species_col]])),
-    species_norm = normalize_ascii(species),
+    Site = str_trim(as.character(.data[[arbre_site_col]])),
+    Point_prisme = str_trim(as.character(.data[[arbre_point_col]])),
+    species_raw = str_trim(as.character(.data[[arbre_species_col]])),
+    species_norm = normalize_ascii(species_raw),
     dbh_cm = coerce_numeric(.data[[arbre_dbh_col]]),
-    plot_area_m2 = if (!is.na(arbre_plot_area_col)) coerce_numeric(.data[[arbre_plot_area_col]]) else NA_real_
+    valeur_prisme = coerce_numeric(.data[[arbre_val_prism_col]])
   ) |>
-  mutate(
-    plot_area_m2 = ifelse(is.na(plot_area_m2) | plot_area_m2 <= 0, fallback_plot_area_m2, plot_area_m2),
-    ba_m2_tree = pi * (dbh_cm / 200)^2
-  ) |>
-  filter(!is.na(site) & site != "")
+  filter(!is.na(Site) & Site != "", !is.na(Point_prisme) & Point_prisme != "")
 
-if (is.na(arbre_plot_area_col)) {
-  warning("No plot area column found in 'arbre'; fallback area of 576 m² used.", call. = FALSE)
+arbre_inc <- arbre_all |>
+  filter(!is.na(valeur_prisme) & valeur_prisme == 2)
+
+if (nrow(arbre_inc) == 0) {
+  stop("No included prism trees found with Valeur_prisme == 2 in 'arbre'.", call. = FALSE)
 }
 
-arbre_site_summary <- arbre |>
-  group_by(site) |>
+message("Beech detection pattern used: ", beech_pattern)
+message("Mean DBH metrics are calculated using included prism trees only (Valeur_prisme == 2).")
+
+# per point prism BA
+point_totals <- arbre_inc |>
+  group_by(Site, Point_prisme) |>
+  summarise(n_included_total = n(), total_basal_area_by_point = n_included_total * prism_baf, .groups = "drop")
+
+point_beech <- arbre_inc |>
+  filter(str_detect(species_norm, beech_pattern)) |>
+  group_by(Site, Point_prisme) |>
+  summarise(n_included_beech = n(), beech_basal_area_by_point = n_included_beech * prism_baf, .groups = "drop")
+
+point_species <- arbre_inc |>
+  group_by(Site, Point_prisme, species_raw) |>
+  summarise(n_included_species = n(), species_ba_point = n_included_species * prism_baf, .groups = "drop")
+
+# full point grid from included trees
+site_points <- arbre_inc |>
+  distinct(Site, Point_prisme)
+
+point_diag <- site_points |>
+  left_join(point_totals, by = c("Site", "Point_prisme")) |>
+  left_join(point_beech, by = c("Site", "Point_prisme")) |>
+  mutate(
+    n_included_total = coalesce(n_included_total, 0L),
+    total_basal_area_by_point = coalesce(total_basal_area_by_point, 0),
+    n_included_beech = coalesce(n_included_beech, 0L),
+    beech_basal_area_by_point = coalesce(beech_basal_area_by_point, 0)
+  )
+
+site_ba <- point_diag |>
+  group_by(Site) |>
   summarise(
-    Site = first(site),
-    Basal_Area = sum(ba_m2_tree * (10000 / plot_area_m2), na.rm = TRUE),
-    Beech_Basal_Area = sum(ifelse(str_detect(species_norm, beech_pattern), ba_m2_tree * (10000 / plot_area_m2), 0), na.rm = TRUE),
-    Mean_DBH = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
-    Mean_Beech_DBH = {
-      beech_dbh <- dbh_cm[str_detect(species_norm, beech_pattern)]
-      if (length(beech_dbh) == 0 || all(is.na(beech_dbh))) NA_real_ else mean(beech_dbh, na.rm = TRUE)
-    },
+    n_prism_points_detected = n_distinct(Point_prisme),
+    n_included_arbre_total = sum(n_included_total, na.rm = TRUE),
+    n_included_arbre_beech = sum(n_included_beech, na.rm = TRUE),
+    Basal_Area = mean(total_basal_area_by_point, na.rm = TRUE),
+    Beech_Basal_Area = mean(beech_basal_area_by_point, na.rm = TRUE),
+    n_included_by_point = paste0(Point_prisme, ":", n_included_total, collapse = " | "),
+    total_basal_area_by_point = paste0(Point_prisme, ":", round(total_basal_area_by_point, 4), collapse = " | "),
+    beech_basal_area_by_point = paste0(Point_prisme, ":", round(beech_basal_area_by_point, 4), collapse = " | "),
     .groups = "drop"
   )
 
-dominant_species <- arbre |>
-  mutate(ba_ha = ba_m2_tree * (10000 / plot_area_m2)) |>
-  group_by(site, species) |>
-  summarise(ba_ha = sum(ba_ha, na.rm = TRUE), .groups = "drop") |>
-  group_by(site) |>
-  slice_max(order_by = ba_ha, n = 1, with_ties = FALSE) |>
+# mean DBH on included only
+dbh_site <- arbre_inc |>
+  group_by(Site) |>
+  summarise(
+    Mean_DBH = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
+    Mean_Beech_DBH = {
+      b <- dbh_cm[str_detect(species_norm, beech_pattern)]
+      if (length(b) == 0 || all(is.na(b))) NA_real_ else mean(b, na.rm = TRUE)
+    },
+    n_beech_for_mean_dbh = sum(str_detect(species_norm, beech_pattern) & !is.na(dbh_cm), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# dominant species by average prism BA across points
+species_site <- point_species |>
+  group_by(Site, species_raw) |>
+  summarise(avg_species_ba = mean(species_ba_point, na.rm = TRUE), .groups = "drop")
+
+dom_ties <- species_site |>
+  group_by(Site) |>
+  filter(avg_species_ba == max(avg_species_ba, na.rm = TRUE)) |>
+  summarise(n_top = n(), top_species = paste(species_raw, collapse = ", "), .groups = "drop") |>
+  filter(n_top > 1)
+if (nrow(dom_ties) > 0) {
+  warning(
+    "Dominant species ties detected; first species after sorting kept. Sites: ",
+    paste0(dom_ties$Site, " [", dom_ties$top_species, "]", collapse = "; "),
+    call. = FALSE
+  )
+}
+
+dominant_species <- species_site |>
+  arrange(Site, desc(avg_species_ba), species_raw) |>
+  group_by(Site) |>
+  slice(1) |>
   ungroup() |>
-  transmute(Site = site, Dominant_Species = species)
-
-arbre_site_summary <- arbre_site_summary |>
-  left_join(dominant_species, by = "Site")
+  transmute(Site, Dominant_Species = species_raw)
 
 # -----------------------------
-# Gaule metrics (Beech Sapling Basal Area)
+# Gaule: method check + computation
 # -----------------------------
-if (!is.null(gaule_raw)) {
-  gaule_site_col <- pick_column(gaule_raw, site_patterns, "gaule site")
-  gaule_species_col <- pick_column(gaule_raw, species_patterns, "gaule species")
-  gaule_dbh_col <- pick_column(gaule_raw, dbh_patterns, "gaule dbh")
-  gaule_count_col <- pick_column(gaule_raw, count_patterns, "gaule count")
-  gaule_plot_area_col <- pick_column(gaule_raw, plot_area_patterns, "gaule plot area")
-  
-  if (is.na(gaule_site_col) || is.na(gaule_species_col) || (is.na(gaule_dbh_col) && is.na(gaule_count_col))) {
-    warning("Could not detect enough columns in 'gaule' to compute Beech Sapling Basal Area; keeping NA.", call. = FALSE)
-    gaule_summary <- tibble(Site = unique(arbre_site_summary$Site), Beech_Sapling_Basal_Area = NA_real_)
-  } else {
-    gaule <- gaule_raw |>
-      mutate(
-        site = str_trim(as.character(.data[[gaule_site_col]])),
-        species = str_trim(as.character(.data[[gaule_species_col]])),
-        species_norm = normalize_ascii(species),
-        dbh_exact = if (!is.na(gaule_dbh_col)) coerce_numeric(.data[[gaule_dbh_col]]) else NA_real_,
-        dbh_mid = if (!is.na(gaule_dbh_col)) extract_dbh_midpoint(.data[[gaule_dbh_col]]) else NA_real_,
-        dbh_cm = ifelse(!is.na(dbh_exact), dbh_exact, dbh_mid),
-        n_stems = if (!is.na(gaule_count_col)) coerce_numeric(.data[[gaule_count_col]]) else 1,
-        plot_area_m2 = if (!is.na(gaule_plot_area_col)) coerce_numeric(.data[[gaule_plot_area_col]]) else fallback_plot_area_m2
-      ) |>
-      mutate(
-        n_stems = ifelse(is.na(n_stems) | n_stems <= 0, 1, n_stems),
-        plot_area_m2 = ifelse(is.na(plot_area_m2) | plot_area_m2 <= 0, fallback_plot_area_m2, plot_area_m2)
-      ) |>
-      filter(!is.na(site) & site != "", str_detect(species_norm, beech_pattern))
-    
-    if (all(is.na(gaule$dbh_cm))) {
-      warning("Could not derive DBH (exact or class midpoint) in 'gaule'; keeping Beech Sapling Basal Area as NA.", call. = FALSE)
-      gaule_summary <- tibble(Site = unique(arbre_site_summary$Site), Beech_Sapling_Basal_Area = NA_real_)
-    } else {
-      gaule_summary <- gaule |>
-        mutate(ba_m2 = pi * (dbh_cm / 200)^2,
-               ba_ha = ba_m2 * n_stems * (10000 / plot_area_m2)) |>
-        group_by(site) |>
-        summarise(Beech_Sapling_Basal_Area = sum(ba_ha, na.rm = TRUE), .groups = "drop") |>
-        transmute(Site = site, Beech_Sapling_Basal_Area)
-    }
-  }
-} else {
-  warning("Sheet 'gaule' unavailable; Beech Sapling Basal Area set to NA.", call. = FALSE)
-  gaule_summary <- tibble(Site = unique(arbre_site_summary$Site), Beech_Sapling_Basal_Area = NA_real_)
+gaule_site_col <- pick_column(gaule_raw, site_patterns, "gaule site", required = TRUE)
+gaule_species_col <- pick_column(gaule_raw, species_patterns, "gaule species", required = TRUE)
+gaule_dbh_col <- pick_column(gaule_raw, dbh_patterns, "gaule dbh")
+gaule_count_col <- pick_column(gaule_raw, count_patterns, "gaule count")
+gaule_point_col <- pick_column(gaule_raw, point_patterns, "gaule point_prisme")
+gaule_r_utilise_col <- pick_column(gaule_raw, c("r_?utilise", "rayon", "radius"), "gaule r_utilise")
+
+if (any(is.na(c(gaule_site_col, gaule_species_col)))) {
+  stop("Cannot compute Beech Sapling Basal Area: missing site/species columns in gaule.", call. = FALSE)
 }
 
-# -----------------------------
-# Genetique metrics (Elevation, Latitude ordering)
-# -----------------------------
-latlon_elev_summary <- NULL
-if (!is.null(genetique_raw)) {
-  gen_site_col <- pick_column(genetique_raw, site_patterns, "genetique site")
-  gen_lat_col <- pick_column(genetique_raw, lat_patterns, "genetique latitude")
-  gen_lon_col <- pick_column(genetique_raw, lon_patterns, "genetique longitude")
-  gen_elev_col <- pick_column(genetique_raw, elev_patterns, "genetique elevation")
-  
-  if (!is.na(gen_site_col)) {
-    gen <- genetique_raw |>
-      mutate(
-        site = str_trim(as.character(.data[[gen_site_col]])),
-        latitude = if (!is.na(gen_lat_col)) coerce_numeric(.data[[gen_lat_col]]) else NA_real_,
-        longitude = if (!is.na(gen_lon_col)) coerce_numeric(.data[[gen_lon_col]]) else NA_real_,
-        elevation = if (!is.na(gen_elev_col)) coerce_numeric(.data[[gen_elev_col]]) else NA_real_
-      ) |>
-      filter(!is.na(site) & site != "")
-    
-    latlon_elev_summary <- gen |>
-      group_by(site) |>
-      summarise(
-        mean_latitude = ifelse(all(is.na(latitude)), NA_real_, mean(latitude, na.rm = TRUE)),
-        mean_longitude = ifelse(all(is.na(longitude)), NA_real_, mean(longitude, na.rm = TRUE)),
-        Elevation = ifelse(all(is.na(elevation)), NA_real_, mean(elevation, na.rm = TRUE)),
-        .groups = "drop"
-      ) |>
-      transmute(Site = site, mean_latitude, mean_longitude, Elevation)
-  } else {
-    warning("No site column detected in 'genetique'; cannot compute elevation/latitude from this sheet.", call. = FALSE)
-  }
+if (is.na(gaule_dbh_col)) {
+  stop("Cannot compute Beech Sapling Basal Area: no DBH or DBH class column detected in gaule.", call. = FALSE)
 }
 
-# latitude fallback from arbre/gaule if genetique latitude unavailable
-if (is.null(latlon_elev_summary) || all(is.na(latlon_elev_summary$mean_latitude))) {
-  lat_source <- NULL
-  lat_from_arbre <- pick_column(arbre_raw, lat_patterns, "arbre latitude")
-  lon_from_arbre <- pick_column(arbre_raw, lon_patterns, "arbre longitude")
-  if (!is.na(lat_from_arbre)) {
-    lat_source <- arbre_raw |>
-      mutate(
-        Site = str_trim(as.character(.data[[arbre_site_col]])),
-        mean_latitude = coerce_numeric(.data[[lat_from_arbre]]),
-        mean_longitude = if (!is.na(lon_from_arbre)) coerce_numeric(.data[[lon_from_arbre]]) else NA_real_
-      ) |>
-      filter(!is.na(Site) & Site != "") |>
-      group_by(Site) |>
-      summarise(
-        mean_latitude = ifelse(all(is.na(mean_latitude)), NA_real_, mean(mean_latitude, na.rm = TRUE)),
-        mean_longitude = ifelse(all(is.na(mean_longitude)), NA_real_, mean(mean_longitude, na.rm = TRUE)),
-        .groups = "drop"
-      )
-  }
-  
-  if (!is.null(lat_source)) {
-    message("Using latitude fallback from 'arbre'.")
-    if (is.null(latlon_elev_summary)) {
-      latlon_elev_summary <- lat_source |> mutate(Elevation = NA_real_)
-    } else {
-      latlon_elev_summary <- latlon_elev_summary |>
-        select(-mean_latitude, -mean_longitude) |>
-        left_join(lat_source, by = "Site")
-    }
-  } else {
-    warning("No latitude column found in genetique or other raw sheets; ordering will fall back to Site name.", call. = FALSE)
-    if (is.null(latlon_elev_summary)) {
-      latlon_elev_summary <- tibble(Site = unique(arbre_site_summary$Site), mean_latitude = NA_real_, mean_longitude = NA_real_, Elevation = NA_real_)
-    }
-  }
+message("Gaule method: treating gaule as non-prism sapling observations; computing individual basal area from DBH (or DBH midpoint) and summing by site (no prism BAF applied).")
+message("If this assumption is not correct for your field protocol, STOP and adjust this section before using outputs.")
+
+gaule <- gaule_raw |>
+  mutate(
+    Site = str_trim(as.character(.data[[gaule_site_col]])),
+    species_raw = str_trim(as.character(.data[[gaule_species_col]])),
+    species_norm = normalize_ascii(species_raw),
+    dbh_exact = coerce_numeric(.data[[gaule_dbh_col]]),
+    dbh_mid = extract_dbh_midpoint(.data[[gaule_dbh_col]]),
+    dbh_cm = ifelse(!is.na(dbh_exact), dbh_exact, dbh_mid),
+    n_stems = if (!is.na(gaule_count_col)) coerce_numeric(.data[[gaule_count_col]]) else 1
+  ) |>
+  mutate(n_stems = ifelse(is.na(n_stems) | n_stems <= 0, 1, n_stems)) |>
+  filter(!is.na(Site) & Site != "", str_detect(species_norm, beech_pattern))
+
+if (nrow(gaule) == 0) {
+  warning("No beech sapling rows detected in gaule for the selected beech code/pattern.", call. = FALSE)
+}
+
+if (all(is.na(gaule$dbh_cm)) && nrow(gaule) > 0) {
+  stop("Cannot compute Beech Sapling Basal Area: gaule has beech rows but DBH values/classes could not be interpreted.", call. = FALSE)
+}
+
+gaule_summary <- gaule |>
+  mutate(ba_m2 = pi * (dbh_cm / 200)^2 * n_stems) |>
+  group_by(Site) |>
+  summarise(
+    Beech_Sapling_Basal_Area = ifelse(all(is.na(ba_m2)), NA_real_, sum(ba_m2, na.rm = TRUE)),
+    n_gaule_beech = n(),
+    .groups = "drop"
+  )
+
+# -----------------------------
+# Genetique: elevation + latitude for ordering
+# -----------------------------
+gen_site_col <- pick_column(genetique_raw, site_patterns, "genetique site", required = TRUE)
+gen_lat_col <- pick_column(genetique_raw, lat_patterns, "genetique latitude", required = TRUE)
+gen_lon_col <- pick_column(genetique_raw, lon_patterns, "genetique longitude")
+gen_elev_col <- pick_column(genetique_raw, elev_patterns, "genetique elevation", required = TRUE)
+
+if (any(is.na(c(gen_site_col, gen_lat_col, gen_elev_col)))) {
+  stop("genetique must provide site, latitude, and elevation columns for this workflow.", call. = FALSE)
+}
+
+gen <- genetique_raw |>
+  mutate(
+    Site = str_trim(as.character(.data[[gen_site_col]])),
+    latitude = coerce_numeric(.data[[gen_lat_col]]),
+    longitude = if (!is.na(gen_lon_col)) coerce_numeric(.data[[gen_lon_col]]) else NA_real_,
+    elevation = coerce_numeric(.data[[gen_elev_col]])
+  ) |>
+  filter(!is.na(Site) & Site != "")
+
+latlon_elev <- gen |>
+  group_by(Site) |>
+  summarise(
+    latitude_used_for_sorting = ifelse(all(is.na(latitude)), NA_real_, mean(latitude, na.rm = TRUE)),
+    mean_longitude = ifelse(all(is.na(longitude)), NA_real_, mean(longitude, na.rm = TRUE)),
+    Elevation = ifelse(all(is.na(elevation)), NA_real_, mean(elevation, na.rm = TRUE)),
+    n_elevation_records = sum(!is.na(elevation)),
+    .groups = "drop"
+  )
+
+if (any(!is.na(latlon_elev$mean_longitude) & latlon_elev$mean_longitude > 0)) {
+  bad <- latlon_elev |> filter(!is.na(mean_longitude) & mean_longitude > 0)
+  warning("Longitude check: positive longitudes found (unexpected for Québec): ", paste(bad$Site, collapse = ", "), call. = FALSE)
 }
 
 # -----------------------------
 # Assemble final table
 # -----------------------------
-final_tbl <- arbre_site_summary |>
-  left_join(gaule_summary, by = "Site") |>
-  left_join(latlon_elev_summary, by = "Site") |>
-  mutate(
-    Site = as.character(Site)
-  ) |>
-  distinct(Site, .keep_all = TRUE)
+final_tbl <- site_ba |>
+  left_join(dbh_site, by = "Site") |>
+  left_join(gaule_summary |> select(Site, Beech_Sapling_Basal_Area), by = "Site") |>
+  left_join(dominant_species, by = "Site") |>
+  left_join(latlon_elev |> select(Site, latitude_used_for_sorting, Elevation), by = "Site")
 
-if (any(!is.na(final_tbl$mean_latitude))) {
-  final_tbl <- final_tbl |> arrange(mean_latitude)
-} else {
-  final_tbl <- final_tbl |> arrange(Site)
+if (any(is.na(final_tbl$latitude_used_for_sorting))) {
+  stop("Cannot sort south-to-north: missing latitude for one or more sites in genetique.", call. = FALSE)
 }
 
 final_tbl <- final_tbl |>
+  arrange(latitude_used_for_sorting) |>
   transmute(
-    Site = Site,
+    Site,
     `Basal Area` = Basal_Area,
     `Beech Basal Area` = Beech_Basal_Area,
     `Mean DBH` = Mean_DBH,
     `Mean Beech DBH` = Mean_Beech_DBH,
     `Beech Sapling Basal Area` = Beech_Sapling_Basal_Area,
     `Dominant Species` = Dominant_Species,
-    Elevation = Elevation
+    Elevation
   )
 
-# -----------------------------
-# Quality checks
-# -----------------------------
-if (!is.null(latlon_elev_summary) && any(!is.na(latlon_elev_summary$mean_longitude))) {
-  pos_long <- latlon_elev_summary |> filter(!is.na(mean_longitude) & mean_longitude > 0)
-  if (nrow(pos_long) > 0) {
-    warning("Longitude check: some longitudes are positive, unexpected for Québec. Sites: ", paste(pos_long$Site, collapse = ", "), call. = FALSE)
-  }
-}
-
 if (nrow(final_tbl) != dplyr::n_distinct(final_tbl$Site)) {
-  warning("Table does not have exactly one row per site.", call. = FALSE)
+  stop("Final table does not have exactly one row per site.", call. = FALSE)
+}
+if (any(final_tbl$`Basal Area` < 0, na.rm = TRUE) || any(final_tbl$`Beech Basal Area` < 0, na.rm = TRUE)) {
+  stop("Negative prism basal area detected in final table.", call. = FALSE)
 }
 
-neg_ba_sites <- final_tbl |> filter(`Basal Area` < 0 | `Beech Basal Area` < 0 | `Beech Sapling Basal Area` < 0)
-if (nrow(neg_ba_sites) > 0) {
-  warning("Negative basal area values detected for site(s): ", paste(neg_ba_sites$Site, collapse = ", "), call. = FALSE)
-}
-
-beech_presence <- arbre |>
-  group_by(site) |>
-  summarise(has_beech = any(str_detect(species_norm, beech_pattern), na.rm = TRUE), .groups = "drop") |>
-  transmute(Site = site, has_beech)
-
-check_beech_dbh <- final_tbl |>
-  left_join(beech_presence, by = "Site") |>
-  filter(is.na(`Mean Beech DBH`) & isTRUE(has_beech))
-if (nrow(check_beech_dbh) > 0) {
-  warning("Mean Beech DBH is NA for site(s) where beech is present in arbre: ", paste(check_beech_dbh$Site, collapse = ", "), call. = FALSE)
-}
-
-if (!is.null(gaule_raw)) {
-  if (any(is.na(final_tbl$`Beech Sapling Basal Area`))) {
-    warning("Beech Sapling Basal Area has NA values. This should occur only when gaule columns were unavailable or unusable.", call. = FALSE)
-  }
-}
+# -----------------------------
+# Diagnostics table
+# -----------------------------
+diagnostics_tbl <- site_ba |>
+  left_join(dbh_site |> select(Site, n_beech_for_mean_dbh), by = "Site") |>
+  left_join(gaule_summary |> select(Site, n_gaule_beech), by = "Site") |>
+  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting), by = "Site") |>
+  mutate(
+    n_gaule_beech = coalesce(n_gaule_beech, 0L),
+    basal_area_method_used = "Prism BA = mean across Point_prisme of (n included trees where Valeur_prisme==2 * prism_baf)",
+    prism_baf_used = prism_baf
+  ) |>
+  select(
+    Site,
+    n_prism_points_detected,
+    n_included_arbre_total,
+    n_included_arbre_beech,
+    n_included_by_point,
+    total_basal_area_by_point,
+    beech_basal_area_by_point,
+    n_beech_for_mean_dbh,
+    n_gaule_beech,
+    n_elevation_records,
+    latitude_used_for_sorting,
+    basal_area_method_used,
+    prism_baf_used
+  ) |>
+  arrange(latitude_used_for_sorting)
 
 # -----------------------------
 # Save outputs
 # -----------------------------
 csv_path <- file.path(out_dir, "site_description_table_article.csv")
 xlsx_path <- file.path(out_dir, "site_description_table_article.xlsx")
+diag_path <- file.path(out_dir, "site_description_table_article_diagnostics.csv")
 
 write.csv(final_tbl, csv_path, row.names = FALSE, na = "")
 openxlsx::write.xlsx(final_tbl, xlsx_path, overwrite = TRUE)
+write.csv(diagnostics_tbl, diag_path, row.names = FALSE, na = "")
 
+# -----------------------------
+# Console output
+# -----------------------------
 message("\nFinal table:")
 print(final_tbl, n = Inf, width = Inf)
 
-# Summary block
+message("\nDiagnostics table:")
+print(diagnostics_tbl, n = Inf, width = Inf)
+
+sites_lt3 <- diagnostics_tbl |> filter(n_prism_points_detected < 3)
+
 range_or_na <- function(x) {
   if (all(is.na(x))) return("NA to NA")
   paste0(round(min(x, na.rm = TRUE), 4), " to ", round(max(x, na.rm = TRUE), 4))
 }
 
 message("\nSummary:")
-message(" - Number of sites included: ", nrow(final_tbl))
-message(" - Basal area range: ", range_or_na(final_tbl$`Basal Area`))
-message(" - Beech basal area range: ", range_or_na(final_tbl$`Beech Basal Area`))
-message(" - Mean DBH range: ", range_or_na(final_tbl$`Mean DBH`))
-message(" - Mean beech DBH range: ", range_or_na(final_tbl$`Mean Beech DBH`))
-message(" - Beech sapling basal area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
-message(" - Number of sites with missing elevation: ", sum(is.na(final_tbl$Elevation)))
+message(" - prism_baf used: ", prism_baf)
+message(" - Prism points per site: ", paste0(diagnostics_tbl$Site, "=", diagnostics_tbl$n_prism_points_detected, collapse = "; "))
+message(" - Any sites with fewer than 3 prism points: ", ifelse(nrow(sites_lt3) > 0, paste(sites_lt3$Site, collapse = ", "), "No"))
+message(" - Any sites with Beech Basal Area = 0: ", ifelse(any(final_tbl$`Beech Basal Area` == 0, na.rm = TRUE), "Yes", "No"))
+message(" - Any Mean Beech DBH values NA: ", ifelse(any(is.na(final_tbl$`Mean Beech DBH`)), "Yes", "No"))
+message(" - Basal Area range: ", range_or_na(final_tbl$`Basal Area`))
+message(" - Beech Basal Area range: ", range_or_na(final_tbl$`Beech Basal Area`))
 
 message("\nSaved:")
 message(" - ", csv_path)
 message(" - ", xlsx_path)
+message(" - ", diag_path)

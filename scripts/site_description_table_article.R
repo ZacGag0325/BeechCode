@@ -21,13 +21,12 @@ suppressPackageStartupMessages({
 # -----------------------------
 # User-setting required for prism BA (MUST be set)
 # -----------------------------
-prism_baf <- NA_real_  # <-- Replace with your prism basal area factor before running
+prism_baf <- 2  # prism basal area factor (m²/ha). Facteur 2 prism => prism_baf <- 2.
+# Basal area per prism point = n included trees (Valeur_prisme == 2) * prism_baf.
+# Site-level basal area = average of prism-point basal areas across Point_prisme values (typically 3 points/site).
 
-if (is.na(prism_baf) || !is.finite(prism_baf) || prism_baf <= 0) {
-  stop(
-    "`prism_baf` is required and currently NA/invalid. Please set prism_baf near the top of this script (e.g., prism_baf <- 2 or 4) before running.",
-    call. = FALSE
-  )
+if (!is.finite(prism_baf) || prism_baf <= 0) {
+  stop("`prism_baf` must be a positive finite value.", call. = FALSE)
 }
 
 # -----------------------------
@@ -461,8 +460,8 @@ message("\nSummary:")
 message(" - prism_baf used: ", prism_baf)
 message(" - Prism points per site: ", paste0(diagnostics_tbl$Site, "=", diagnostics_tbl$n_prism_points_detected, collapse = "; "))
 message(" - Any sites with fewer than 3 prism points: ", ifelse(nrow(sites_lt3) > 0, paste(sites_lt3$Site, collapse = ", "), "No"))
-message(" - Any sites with Beech Basal Area = 0: ", ifelse(any(final_tbl$`Beech Basal Area` == 0, na.rm = TRUE), "Yes", "No"))
-message(" - Any Mean Beech DBH values NA: ", ifelse(any(is.na(final_tbl$`Mean Beech DBH`)), "Yes", "No"))
+message(" - Sites with Beech Basal Area = 0: ", {s <- final_tbl$Site[!is.na(final_tbl$`Beech Basal Area`) & final_tbl$`Beech Basal Area` == 0]; if (length(s)==0) "None" else paste(s, collapse=", ")})
+message(" - Sites with Mean Beech DBH = NA: ", {s <- final_tbl$Site[is.na(final_tbl$`Mean Beech DBH`)]; if (length(s)==0) "None" else paste(s, collapse=", ")})
 message(" - Basal Area range: ", range_or_na(final_tbl$`Basal Area`))
 message(" - Beech Basal Area range: ", range_or_na(final_tbl$`Beech Basal Area`))
 

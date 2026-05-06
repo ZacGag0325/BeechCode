@@ -26,6 +26,9 @@ output_dir <- "outputs/nearest_neighbor_sampling_check"
 # Optional Excel sheet override (only used for .xlsx/.xls)
 sheet_name_override <- NULL
 
+# Site display labels are read from this sheet in the same Excel workbook.
+site_lookup_sheet <- "site_lookup"
+
 # Optional column overrides (set exact column names to force mapping)
 site_col_override <- NULL
 sample_col_override <- NULL
@@ -193,6 +196,7 @@ resolve_input_file <- function(path_in) {
     file.path(script_dir, path_in),
     file.path(script_dir, "..", path_in),
     file.path(script_dir, "..", "data", path_in),
+    file.path(script_dir, "..", "data", "raw", path_in),
     file.path(script_dir, "..", "inputs", path_in)
   ))
   
@@ -282,6 +286,94 @@ choose_excel_sheet <- function(path_in, sheet_override = NULL) {
   )
 }
 
+read_site_lookup <- function(path_in, sheet = "site_lookup") {
+  ext <- tolower(tools::file_ext(path_in))
+  if (!(ext %in% c("xlsx", "xls"))) {
+    stop(
+      paste0("Site lookup sheet '", sheet, "' can only be read from an Excel workbook. ",
+             "Resolved input file is: ", path_in),
+      call. = FALSE
+    )
+  }
+  
+  sheets <- readxl::excel_sheets(path_in)
+  if (!(sheet %in% sheets)) {
+    stop(
+      paste0("Required site lookup sheet '", sheet, "' was not found in workbook: ", path_in, "\n",
+             "Available sheets: ", paste(sheets, collapse = ", ")),
+      call. = FALSE
+    )
+  }
+  
+  lookup_raw <- suppressMessages(readxl::read_excel(path_in, sheet = sheet))
+  required_cols <- c("Site", "Site_label", "Region", "Site_order")
+  missing_cols <- setdiff(required_cols, names(lookup_raw))
+  if (length(missing_cols) > 0) {
+    stop(
+      paste0("Sheet '", sheet, "' is missing required columns: ",
+             paste(missing_cols, collapse = ", "), "\n",
+             "Required columns are: ", paste(required_cols, collapse = ", ")),
+      call. = FALSE
+    )
+  }
+  
+  lookup <- lookup_raw %>%
+    transmute(
+      Site = stringr::str_squish(as.character(.data$Site)),
+      Site_label = stringr::str_squish(as.character(.data$Site_label)),
+      Region = stringr::str_squish(as.character(.data$Region)),
+      Site_order = as_numeric_safely(.data$Site_order)
+    ) %>%
+    filter(!is.na(Site), Site != "")
+  
+  duplicated_sites <- lookup %>%
+    count(Site, name = "n") %>%
+    filter(n > 1)
+  if (nrow(duplicated_sites) > 0) {
+    stop(
+      paste0("Duplicate Site values found in sheet '", sheet, "': ",
+             paste(duplicated_sites$Site, collapse = ", ")),
+      call. = FALSE
+    )
+  }
+  
+  invalid_lookup <- lookup %>%
+    filter(is.na(Site_label) | Site_label == "" | is.na(Region) | Region == "" | is.na(Site_order))
+  if (nrow(invalid_lookup) > 0) {
+    stop(
+      paste0("Site lookup rows must have non-missing Site_label, Region, and numeric Site_order. ",
+             "Problem Site values: ", paste(invalid_lookup$Site, collapse = ", ")),
+      call. = FALSE
+    )
+  }
+  
+  lookup %>% arrange(Site_order, Site_label)
+}
+
+attach_site_lookup <- function(df, lookup, df_name = "data frame") {
+  if (!("Site" %in% names(df))) return(df)
+  
+  missing_sites <- setdiff(sort(unique(df$Site[!is.na(df$Site) & df$Site != ""])), lookup$Site)
+  if (length(missing_sites) > 0) {
+    stop(
+      paste0("The following Site value(s) in ", df_name, " are missing from site_lookup: ",
+             paste(missing_sites, collapse = ", "), "\n",
+             "Add them to the 'site_lookup' sheet with Site_label, Region, and Site_order."),
+      call. = FALSE
+    )
+  }
+  
+  label_levels <- lookup %>%
+    arrange(Site_order, Site_label) %>%
+    pull(Site_label)
+  
+  df %>%
+    select(-any_of(c("Site_label", "Region", "Site_order"))) %>%
+    left_join(lookup, by = "Site") %>%
+    mutate(Site_label = factor(Site_label, levels = label_levels)) %>%
+    arrange(Site_order, Site_label)
+}
+
 resolve_input_data <- function(path_in, sheet_override = NULL) {
   path_resolved <- resolve_input_file(path_in)
   
@@ -313,6 +405,7 @@ resolve_input_data <- function(path_in, sheet_override = NULL) {
 # ----------------------------- MAIN ------------------------------------------
 input_obj <- resolve_input_data(input_file, sheet_name_override)
 raw_df <- input_obj$data
+site_lookup <- read_site_lookup(input_obj$path, site_lookup_sheet)
 
 site_col <- pick_unique_column(
   raw_df,
@@ -374,52 +467,58 @@ coord_type <- if (!is.na(lat_col) && !is.na(lon_col)) {
 stems <- if (coord_type == "latlon") {
   raw_df %>%
     transmute(
-      site = as.character(.data[[site_col]]),
+      Site = stringr::str_squish(as.character(.data[[site_col]])),
       sample_id = as.character(.data[[sample_col]]),
       lat = as_numeric_safely(.data[[lat_col]]),
       lon = as_numeric_safely(.data[[lon_col]]),
       coord_type = "latlon"
     ) %>%
-    filter(!is.na(site), site != "", !is.na(sample_id), sample_id != "", !is.na(lat), !is.na(lon))
+    filter(!is.na(Site), Site != "", !is.na(sample_id), sample_id != "", !is.na(lat), !is.na(lon))
 } else {
   raw_df %>%
     transmute(
-      site = as.character(.data[[site_col]]),
+      Site = stringr::str_squish(as.character(.data[[site_col]])),
       sample_id = as.character(.data[[sample_col]]),
       x = as_numeric_safely(.data[[x_col]]),
       y = as_numeric_safely(.data[[y_col]]),
       coord_type = "xy"
     ) %>%
-    filter(!is.na(site), site != "", !is.na(sample_id), sample_id != "", !is.na(x), !is.na(y))
+    filter(!is.na(Site), Site != "", !is.na(sample_id), sample_id != "", !is.na(x), !is.na(y))
 }
 
 if (nrow(stems) == 0) {
   stop("No rows left after cleaning. Check column mapping and coordinate values.", call. = FALSE)
 }
 
+# Join site_lookup once site codes are cleaned. The original Site code remains
+# unchanged and is still used for nearest-neighbour grouping/analysis.
+stems <- attach_site_lookup(stems, site_lookup, "cleaned stem data")
+
 dupes <- stems %>%
-  count(site, sample_id, name = "n") %>%
+  count(Site, sample_id, name = "n") %>%
   filter(n > 1)
 
 if (nrow(dupes) > 0) {
   stop(
     paste0(
       "Found duplicated sample IDs within site. Please ensure uniqueness.\n",
-      "Examples: ", paste(head(paste(dupes$site, dupes$sample_id, sep = ":"), 10), collapse = ", ")
+      "Examples: ", paste(head(paste(dupes$Site, dupes$sample_id, sep = ":"), 10), collapse = ", ")
     ),
     call. = FALSE
   )
 }
 
 nn_table <- stems %>%
-  arrange(site, sample_id) %>%
-  group_by(site) %>%
+  arrange(Site_order, Site, sample_id) %>%
+  group_by(Site) %>%
   group_modify(~ compute_true_nn_within_site(.x)) %>%
   ungroup() %>%
-  select(site, sample_id, nearest_neighbor_id, nearest_neighbor_distance_m)
+  select(Site, sample_id, nearest_neighbor_id, nearest_neighbor_distance_m) %>%
+  attach_site_lookup(site_lookup, "nearest-neighbour stem table") %>%
+  select(Site, Site_label, Region, Site_order, sample_id, nearest_neighbor_id, nearest_neighbor_distance_m)
 
 site_summary <- nn_table %>%
-  group_by(site) %>%
+  group_by(Site) %>%
   summarise(
     n_stems = n(),
     mean_nearest_neighbor_distance_m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, mean(nearest_neighbor_distance_m, na.rm = TRUE)),
@@ -433,7 +532,10 @@ site_summary <- nn_table %>%
     n_within_8m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, sum(nearest_neighbor_distance_m <= 8, na.rm = TRUE)),
     pct_within_8m = ifelse(all(is.na(nearest_neighbor_distance_m)), NA_real_, mean(nearest_neighbor_distance_m <= 8, na.rm = TRUE) * 100),
     .groups = "drop"
-  )
+  ) %>%
+  attach_site_lookup(site_lookup, "site summary table") %>%
+  select(Site, Site_label, Region, Site_order, everything()) %>%
+  arrange(Site_order, Site_label)
 
 # Save outputs
 # Keep existing outputs and add required file names.
@@ -464,12 +566,16 @@ histogram_data <- nn_table %>%
   count(distance_class, name = "n_stems", .drop = FALSE) %>%
   mutate(distance_class = factor(distance_class, levels = bin_labels))
 
-plot_theme <- theme_bw(base_size = 22) +
+plot_theme <- theme_classic(base_size = 22) +
   theme(
     plot.title = element_text(size = 26, face = "bold"),
     axis.title = element_text(size = 26, face = "bold"),
     axis.text = element_text(size = 22),
     panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    plot.background = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(linewidth = 0.4, color = "black"),
     # Enlarged tick marks for presentation readability
     axis.ticks = element_line(linewidth = 1.0),
     axis.ticks.length = grid::unit(0.28, "cm")
@@ -504,7 +610,7 @@ plot_labels <- list(
 
 build_hist_plot <- function(hist_data, labels, theme_obj) {
   ggplot(hist_data, aes(x = distance_class, y = n_stems)) +
-    geom_col(fill = "#2E8B57", color = "NA") +
+    geom_col(fill = "#2E8B57", color = NA) +
     labs(
       title = labels$title,
       x = labels$x,
@@ -517,8 +623,8 @@ build_hist_plot <- function(hist_data, labels, theme_obj) {
 build_box_plot <- function(nn_data, labels, theme_obj) {
   nn_data %>%
     filter(!is.na(nearest_neighbor_distance_m), nearest_neighbor_distance_m >= 0) %>%
-    ggplot(aes(x = site, y = nearest_neighbor_distance_m)) +
-    geom_boxplot(fill = "#2E8B57", color = "NA", outlier.alpha = 0.6) +
+    ggplot(aes(x = Site_label, y = nearest_neighbor_distance_m)) +
+    geom_boxplot(fill = "#2E8B57", color = NA, outlier.alpha = 0.6) +
     labs(
       title = labels$title,
       x = labels$x,
@@ -535,8 +641,8 @@ box_plot <- build_box_plot(nn_table, plot_labels$en$boxplot, plot_theme)
 hist_out <- file.path(output_dir, "true_nearest_neighbour_distance_histogram.png")
 box_out <- file.path(output_dir, "true_nearest_neighbour_distance_by_site.png")
 
-ggsave(filename = hist_out, plot = hist_plot, width = 10, height = 7, dpi = 400)
-ggsave(filename = box_out, plot = box_plot, width = 9, height = 6, dpi = 400)
+ggsave(filename = hist_out, plot = hist_plot, width = 10, height = 7, dpi = 400, bg = "white")
+ggsave(filename = box_out, plot = box_plot, width = 9, height = 6, dpi = 400, bg = "white")
 
 # ----------------------------- FRENCH FIGURES --------------------------------
 hist_plot_fr <- build_hist_plot(histogram_data, plot_labels$fr$histogram, plot_theme)
@@ -545,8 +651,8 @@ box_plot_fr <- build_box_plot(nn_table, plot_labels$fr$boxplot, plot_theme)
 hist_out_fr <- file.path(output_dir, "true_nearest_neighbour_distance_histogram_fr.png")
 box_out_fr <- file.path(output_dir, "true_nearest_neighbour_distance_by_site_fr.png")
 
-ggsave(filename = hist_out_fr, plot = hist_plot_fr, width = 10, height = 7, dpi = 400)
-ggsave(filename = box_out_fr, plot = box_plot_fr, width = 9, height = 6, dpi = 400)
+ggsave(filename = hist_out_fr, plot = hist_plot_fr, width = 10, height = 7, dpi = 400, bg = "white")
+ggsave(filename = box_out_fr, plot = box_plot_fr, width = 9, height = 6, dpi = 400, bg = "white")
 
 # Console summaries
 nn_non_missing <- nn_table %>%
@@ -564,6 +670,7 @@ message("Nearest-neighbour sampling check complete.")
 message("Resolved input path: ", input_obj$path)
 message("Resolved source: ", input_obj$source)
 if (!is.na(input_obj$sheet)) message("Resolved sheet: ", input_obj$sheet)
+message("Resolved site lookup sheet: ", site_lookup_sheet)
 message("Resolved columns:")
 message("  site: ", site_col)
 message("  sample: ", sample_col)
@@ -587,12 +694,13 @@ for (th in thresholds_m) {
 
 message("Site-level nearest-neighbour summaries:")
 for (i in seq_len(nrow(site_summary))) {
-  this_site <- site_summary$site[i]
+  this_site_label <- as.character(site_summary$Site_label[i])
+  this_site <- site_summary$Site[i]
   this_n <- site_summary$n_stems[i]
   this_med <- site_summary$median_nearest_neighbor_distance_m[i]
   this_mean <- site_summary$mean_nearest_neighbor_distance_m[i]
   
-  message("  Site ", this_site, ":")
+  message("  Site ", this_site_label, " (", this_site, "):")
   message("    stems = ", this_n)
   message("    median (m) = ", sprintf("%.3f", this_med))
   message("    mean (m) = ", sprintf("%.3f", this_mean))

@@ -17,6 +17,7 @@ suppressPackageStartupMessages({
   library(adegenet)
   library(dplyr)
   library(ggplot2)
+  library(readxl)
 })
 
 source("scripts/_load_objects.R")
@@ -25,6 +26,192 @@ message("[01_clonality] Calculating clonality summaries for both MLG and Bruvo-b
 
 DEFAULT_BRUVO_MLL_THRESHOLD <- 0.09
 DEFAULT_BRUVO_ALGORITHM <- "farthest_neighbor"
+
+SITE_LOOKUP_REQUIRED_COLUMNS <- c("Site", "Site_label", "Region", "Site_order", "Numéro_Population")
+SITE_LOOKUP_SHEET <- "site_lookup"
+
+normalize_lookup_key <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x[is.na(x)] <- ""
+  x
+}
+
+find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", "raw"), sheet = SITE_LOOKUP_SHEET) {
+  if (!dir.exists(raw_dir)) {
+    stop("[01_clonality] Cannot read site_lookup because data/raw does not exist: ", raw_dir)
+  }
+  excel_files <- list.files(raw_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(excel_files) == 0) {
+    stop("[01_clonality] site_lookup is missing: no Excel workbook was found in data/raw.")
+  }
+  
+  has_lookup <- vapply(
+    excel_files,
+    function(path) {
+      sheet_names <- tryCatch(readxl::excel_sheets(path), error = function(e) character(0))
+      sheet %in% sheet_names
+    },
+    logical(1)
+  )
+  lookup_files <- excel_files[has_lookup]
+  
+  if (length(lookup_files) == 0) {
+    stop(
+      "[01_clonality] site_lookup is missing: none of the Excel workbooks in data/raw contains a '",
+      sheet,
+      "' sheet. Checked: ",
+      paste(basename(excel_files), collapse = ", ")
+    )
+  }
+  if (length(lookup_files) > 1) {
+    message(
+      "[01_clonality] Multiple workbooks contain site_lookup; using the first one returned by list.files(): ",
+      basename(lookup_files[1]),
+      ". Other matches: ",
+      paste(basename(lookup_files[-1]), collapse = ", ")
+    )
+  } else {
+    message("[01_clonality] Reading site_lookup from: ", basename(lookup_files[1]))
+  }
+  
+  lookup_files[1]
+}
+
+load_site_lookup <- function() {
+  workbook <- find_site_lookup_workbook()
+  lookup <- suppressMessages(readxl::read_excel(workbook, sheet = SITE_LOOKUP_SHEET)) %>%
+    as.data.frame(stringsAsFactors = FALSE)
+  
+  missing_cols <- setdiff(SITE_LOOKUP_REQUIRED_COLUMNS, names(lookup))
+  if (length(missing_cols) > 0) {
+    stop(
+      "[01_clonality] site_lookup is missing required columns: ",
+      paste(missing_cols, collapse = ", "),
+      "\nRequired columns are: ",
+      paste(SITE_LOOKUP_REQUIRED_COLUMNS, collapse = ", ")
+    )
+  }
+  
+  lookup <- lookup %>%
+    mutate(
+      Site = normalize_lookup_key(Site),
+      Site_label = normalize_lookup_key(Site_label),
+      Region = normalize_lookup_key(Region),
+      Site_order = suppressWarnings(as.numeric(Site_order)),
+      Numéro_Population = normalize_lookup_key(Numéro_Population)
+    )
+  
+  if (any(is.na(lookup$Site_order))) {
+    stop("[01_clonality] site_lookup$Site_order must be numeric and non-missing for every row.")
+  }
+  if (any(!nzchar(lookup$Site))) {
+    stop("[01_clonality] site_lookup$Site contains blank or missing site codes.")
+  }
+  if (any(!nzchar(lookup$Site_label))) {
+    stop("[01_clonality] site_lookup$Site_label contains blank or missing display labels.")
+  }
+  if (anyDuplicated(lookup$Site)) {
+    dup_sites <- unique(lookup$Site[duplicated(lookup$Site)])
+    stop("[01_clonality] site_lookup$Site contains duplicate site codes: ", paste(dup_sites, collapse = ", "))
+  }
+  pop_nonblank <- nzchar(lookup$Numéro_Population)
+  if (anyDuplicated(lookup$Numéro_Population[pop_nonblank])) {
+    dup_pops <- unique(lookup$Numéro_Population[pop_nonblank][duplicated(lookup$Numéro_Population[pop_nonblank])])
+    stop("[01_clonality] site_lookup$Numéro_Population contains duplicate non-blank population numbers: ", paste(dup_pops, collapse = ", "))
+  }
+  
+  lookup
+}
+
+resolve_population_col <- function(df) {
+  resolve_col_ci(df, c("Numéro_Population", "Numero_Population", "numero_population", "population_number", "Population_Number"))
+}
+
+join_site_lookup <- function(df, lookup, context = "[01_clonality] clonality data") {
+  out <- df
+  out <- out %>%
+    select(-any_of(c("Site_label", "Region", "Site_order", "Numéro_Population_lookup")))
+  site_col_local <- resolve_col_ci(out, c("Site", "site"))
+  pop_col_local <- resolve_population_col(out)
+  
+  if (!is.na(site_col_local)) {
+    out$.__site_lookup_key <- normalize_lookup_key(out[[site_col_local]])
+    missing_keys <- sort(unique(out$.__site_lookup_key[!out$.__site_lookup_key %in% lookup$Site]))
+    missing_keys <- missing_keys[nzchar(missing_keys)]
+    if (length(missing_keys) > 0) {
+      stop(
+        context,
+        " contains Site values missing from site_lookup$Site: ",
+        paste(missing_keys, collapse = ", ")
+      )
+    }
+    
+    out <- out %>%
+      left_join(
+        lookup %>%
+          select(Site, Site_label, Region, Site_order, Numéro_Population) %>%
+          rename(.__site_lookup_key = Site, Numéro_Population_lookup = Numéro_Population),
+        by = ".__site_lookup_key"
+      ) %>%
+      select(-.__site_lookup_key)
+  } else if (!is.na(pop_col_local)) {
+    out$.__population_lookup_key <- normalize_lookup_key(out[[pop_col_local]])
+    lookup_pop <- lookup %>%
+      filter(nzchar(Numéro_Population))
+    missing_keys <- sort(unique(out$.__population_lookup_key[!out$.__population_lookup_key %in% lookup_pop$Numéro_Population]))
+    missing_keys <- missing_keys[nzchar(missing_keys)]
+    if (length(missing_keys) > 0) {
+      stop(
+        context,
+        " contains Numéro_Population values missing from site_lookup$Numéro_Population: ",
+        paste(missing_keys, collapse = ", ")
+      )
+    }
+    
+    out <- out %>%
+      left_join(
+        lookup_pop %>%
+          select(Site, Site_label, Region, Site_order, Numéro_Population) %>%
+          rename(.__population_lookup_key = Numéro_Population),
+        by = ".__population_lookup_key"
+      ) %>%
+      select(-.__population_lookup_key)
+  } else {
+    stop(context, " must contain either a Site column or a Numéro_Population column for site_lookup joining.")
+  }
+  
+  if (any(is.na(out$Site_label) | !nzchar(as.character(out$Site_label)))) {
+    stop(context, " could not be fully annotated with Site_label from site_lookup.")
+  }
+  if (any(is.na(out$Site_order))) {
+    stop(context, " could not be fully annotated with Site_order from site_lookup.")
+  }
+  
+  label_levels <- lookup %>%
+    arrange(Site_order) %>%
+    pull(Site_label) %>%
+    unique()
+  out$Site_label <- factor(out$Site_label, levels = label_levels, ordered = TRUE)
+  out
+}
+
+clonality_plot_theme <- function(base_size = 16) {
+  theme_classic(base_size = base_size) +
+    theme(
+      panel.border = element_blank(),
+      plot.background = element_blank(),
+      panel.background = element_blank(),
+      axis.line = element_line(linewidth = 0.4),
+      axis.title = element_text(size = 17),
+      axis.text = element_text(size = 16),
+      legend.title = element_text(size = 16),
+      legend.text = element_text(size = 15)
+    )
+}
+
+site_lookup <- load_site_lookup()
 
 find_synonym_col <- function(df, choices) {
   resolve_col_ci(df, choices)
@@ -117,7 +304,7 @@ recover_or_recompute_clonality_columns <- function(df_ids_tbl, gi, gi_mll) {
   out
 }
 
-make_clone_group_table <- function(assignments_df, clone_col, individual_col = "Individual", site_col = "Site") {
+make_clone_group_table <- function(assignments_df, clone_col, individual_col = "Individual", site_col = "Site_label") {
   clone_label <- rlang::sym(clone_col)
   individual_label <- rlang::sym(individual_col)
   has_site <- site_col %in% names(assignments_df)
@@ -162,7 +349,7 @@ print_clone_summary_block <- function(repeated_groups, clone_col, site_available
     cat("  Individuals:\n")
     
     for (i in seq_len(nrow(grp))) {
-      site_value <- grp$Site[i]
+      site_value <- as.character(grp[["Site_label"]][i])
       if (site_available && !is.na(site_value) && nzchar(site_value)) {
         cat("    - ", grp$Individual[i], " [Site: ", site_value, "]\n", sep = "")
       } else {
@@ -244,6 +431,7 @@ print_quick_clone_summary <- function(assignments_df, site_available = TRUE) {
 }
 
 df_ids <- recover_or_recompute_clonality_columns(df_ids, gi, gi_mll)
+df_ids <- join_site_lookup(df_ids, site_lookup, context = "[01_clonality] df_ids")
 
 df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[01_clonality]", require = TRUE)
 id_col <- df_ids_cols$id_col
@@ -253,17 +441,23 @@ algorithm_col <- resolve_col_ci(df_ids, c("Bruvo_algorithm", "bruvo_algorithm"))
 
 id_key <- normalize_id(df_ids[[id_col]])
 site_map <- setNames(as.character(df_ids[[site_col]]), id_key)
+site_label_map <- setNames(as.character(df_ids[["Site_label"]]), id_key)
+site_order_map <- setNames(as.numeric(df_ids[["Site_order"]]), id_key)
+region_map <- setNames(as.character(df_ids[["Region"]]), id_key)
 mlg_map <- setNames(as.character(df_ids[["MLG"]]), id_key)
 mll_map <- setNames(as.character(df_ids[["MLL"]]), id_key)
 
 ind_key <- normalize_id(adegenet::indNames(gi))
 site_labels <- site_map[ind_key]
+site_display_labels <- site_label_map[ind_key]
+site_orders <- site_order_map[ind_key]
+regions <- region_map[ind_key]
 mlg_labels <- mlg_map[ind_key]
 mll_labels <- mll_map[ind_key]
 
-site_available <- !any(is.na(site_labels) | !nzchar(site_labels))
+site_available <- !any(is.na(site_display_labels) | !nzchar(site_display_labels) | is.na(site_orders))
 if (!site_available) {
-  warning("[01_clonality] Site metadata were unavailable for one or more individuals; quick clone summary will print IDs without site where necessary.")
+  warning("[01_clonality] Site_label or Site_order metadata were unavailable for one or more individuals; quick clone summary will print IDs without site where necessary.")
 }
 if (any(is.na(mlg_labels))) stop("[01_clonality] Could not map all individuals to MLG.")
 if (any(is.na(mll_labels))) stop("[01_clonality] Could not map all individuals to MLL.")
@@ -271,13 +465,22 @@ if (any(is.na(mll_labels))) stop("[01_clonality] Could not map all individuals t
 bruvo_threshold <- if (!is.na(threshold_col)) unique(stats::na.omit(df_ids[[threshold_col]])) else numeric(0)
 bruvo_algorithm <- if (!is.na(algorithm_col)) unique(stats::na.omit(df_ids[[algorithm_col]])) else character(0)
 
+site_label_levels <- site_lookup %>%
+  arrange(Site_order) %>%
+  pull(Site_label) %>%
+  unique()
+
 clonality_df <- data.frame(
   Individual = adegenet::indNames(gi),
   Site = ifelse(is.na(site_labels) | !nzchar(site_labels), NA_character_, site_labels),
+  Site_label = site_display_labels,
+  Region = regions,
+  Site_order = site_orders,
   MLG = mlg_labels,
   MLL = mll_labels,
   stringsAsFactors = FALSE
-)
+) %>%
+  mutate(Site_label = factor(Site_label, levels = site_label_levels, ordered = TRUE))
 
 calc_R <- function(N, G) ifelse(N > 1, (G - 1) / (N - 1), NA_real_)
 
@@ -298,12 +501,17 @@ overall <- clonality_df %>%
     N_MLL = dplyr::n_distinct(MLL)
   ) %>%
   add_clonality_metrics() %>%
-  mutate(Level = "overall", Site = "ALL") %>%
-  select(Level, Site, everything())
+  mutate(
+    Level = "overall",
+    Site = "ALL",
+    Site_label = "ALL",
+    Region = "ALL",
+    Site_order = 0
+  ) %>%
+  select(Level, Site_label, Site_order, Site, Region, everything())
 
 by_site <- clonality_df %>%
-  mutate(Site = ifelse(is.na(Site) | !nzchar(Site), "SITE_UNAVAILABLE", Site)) %>%
-  group_by(Site) %>%
+  group_by(Site, Site_label, Region, Site_order) %>%
   summarise(
     N_individuals = dplyr::n(),
     N_MLG = dplyr::n_distinct(MLG),
@@ -312,7 +520,8 @@ by_site <- clonality_df %>%
   ) %>%
   add_clonality_metrics() %>%
   mutate(Level = "site") %>%
-  select(Level, Site, everything())
+  arrange(Site_order, Site_label) %>%
+  select(Level, Site_label, Site_order, Site, Region, everything())
 
 clonality_summary <- bind_rows(overall, by_site) %>%
   mutate(
@@ -360,8 +569,7 @@ find_latitude_col <- function(df) {
 
 build_site_clonality_summary <- function(assignments_df, df_ids_tbl = NULL) {
   summary_tbl <- assignments_df %>%
-    mutate(Site = ifelse(is.na(Site) | !nzchar(Site), "SITE_UNAVAILABLE", Site)) %>%
-    group_by(Site) %>%
+    group_by(Site, Site_label, Region, Site_order) %>%
     summarise(
       N_individuals = dplyr::n(),
       N_MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
@@ -372,7 +580,8 @@ build_site_clonality_summary <- function(assignments_df, df_ids_tbl = NULL) {
     mutate(
       Clonality_MLL = 1 - (N_MLL / N_individuals),
       Clonality_MLL_percent = Clonality_MLL * 100
-    )
+    ) %>%
+    arrange(Site_order, Site_label)
   
   if (!is.null(df_ids_tbl)) {
     lat_col <- find_latitude_col(df_ids_tbl)
@@ -399,16 +608,9 @@ build_site_clonality_summary <- function(assignments_df, df_ids_tbl = NULL) {
     summary_tbl$Latitude <- NA_real_
   }
   
-  if ("Latitude" %in% names(summary_tbl) && any(!is.na(summary_tbl$Latitude))) {
-    # Sort south -> north when latitude is available
-    summary_tbl <- summary_tbl %>%
-      arrange(Latitude, Site)
-  } else {
-    summary_tbl <- summary_tbl %>%
-      arrange(Site)
-  }
-  
-  summary_tbl$Site <- factor(summary_tbl$Site, levels = summary_tbl$Site)
+  summary_tbl <- summary_tbl %>%
+    arrange(Site_order, Site_label)
+  summary_tbl$Site_label <- factor(summary_tbl$Site_label, levels = site_label_levels, ordered = TRUE)
   summary_tbl
 }
 
@@ -431,7 +633,7 @@ make_clonality_percent_barplot <- function(summary_tbl, lang = c("fr", "en")) {
     )
   )
   
-  ggplot(summary_tbl, aes(x = Site, y = Clonality_MLL_percent)) +
+  ggplot(summary_tbl, aes(x = Site_label, y = Clonality_MLL_percent)) +
     geom_col(fill = "#2E8B57", width = 0.75) +
     scale_y_continuous(
       limits = c(0, 100),
@@ -443,11 +645,10 @@ make_clonality_percent_barplot <- function(summary_tbl, lang = c("fr", "en")) {
       x = labels$x,
       y = labels$y
     ) +
-    theme_minimal(base_size = 16) +
+    clonality_plot_theme(base_size = 16) +
     theme(
       plot.title = element_text(face = "bold", size = 19),
       plot.subtitle = element_text(size = 18),
-      axis.title = element_text(size = 15),
       axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
       axis.text.y = element_text(size = 16),
       panel.grid.major.x = element_blank(),

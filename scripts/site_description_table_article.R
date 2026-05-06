@@ -1,10 +1,26 @@
 #!/usr/bin/env Rscript
 
 required_packages <- c("dplyr", "readxl", "openxlsx", "stringr", "tidyr", "purrr")
+optional_word_packages <- c("flextable", "officer")
+
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
   stop(
     paste0("Missing required package(s): ", paste(missing_packages, collapse = ", "), ". Please install them before running this script."),
+    call. = FALSE
+  )
+}
+
+word_packages_available <- all(vapply(optional_word_packages, requireNamespace, logical(1), quietly = TRUE))
+missing_word_packages <- optional_word_packages[!vapply(optional_word_packages, requireNamespace, logical(1), quietly = TRUE)]
+
+if (!word_packages_available) {
+  warning(
+    paste0(
+      "Formatted Word table will be skipped because optional package(s) are not installed: ",
+      paste(missing_word_packages, collapse = ", "),
+      ". CSV, XLSX, and diagnostics outputs will still be created."
+    ),
     call. = FALSE
   )
 }
@@ -47,10 +63,11 @@ coerce_numeric <- function(x) {
   suppressWarnings(as.numeric(x_chr))
 }
 
-pick_column <- function(df, patterns, label, required = FALSE) {
+pick_column <- function(df, patterns, label, required = FALSE, exclude = character()) {
   cn <- names(df)
   cn_norm <- normalize_ascii(cn)
-  idx <- which(str_detect(cn_norm, str_c(patterns, collapse = "|")))
+  exclude_norm <- normalize_ascii(exclude)
+  idx <- which(str_detect(cn_norm, str_c(patterns, collapse = "|")) & !(cn_norm %in% exclude_norm))
   if (length(idx) == 0) {
     if (required) warning("Could not detect required column for ", label, call. = FALSE)
     return(NA_character_)
@@ -72,7 +89,7 @@ resolve_project_root <- function() {
   for (cand in candidates) {
     probe <- cand
     for (i in seq_len(8)) {
-      if (dir.exists(file.path(probe, "scripts")) && dir.exists(file.path(probe, "data", "raw"))) return(probe)
+      if (dir.exists(file.path(probe, "scripts")) && dir.exists(file.path(probe, "data"))) return(probe)
       parent <- dirname(probe)
       if (identical(parent, probe)) break
       probe <- parent
@@ -107,10 +124,58 @@ extract_dbh_midpoint <- function(x) {
   midpoint
 }
 
+range_or_na <- function(x, digits = 4) {
+  if (length(x) == 0 || all(is.na(x))) return("NA to NA")
+  paste0(round(min(x, na.rm = TRUE), digits), " to ", round(max(x, na.rm = TRUE), digits))
+}
+
+collapse_or_none <- function(x) {
+  x <- unique(x[!is.na(x) & x != ""])
+  if (length(x) == 0) "None" else paste(sort(x), collapse = ", ")
+}
+
+match_sheet <- function(sheets, target) {
+  idx <- which(normalize_ascii(sheets) == normalize_ascii(target))
+  if (length(idx) == 0) NA_character_ else sheets[idx[1]]
+}
+
+read_sheet_safe <- function(sheet_name) {
+  matched_sheet <- match_sheet(sheets, sheet_name)
+  if (is.na(matched_sheet)) stop("Sheet '", sheet_name, "' not found.", call. = FALSE)
+  read_excel(excel_path, sheet = matched_sheet)
+}
+
+make_lookup <- function(df, from_patterns, to_patterns, lookup_name) {
+  from_col <- pick_column(df, from_patterns, paste0(lookup_name, " original/code"), required = TRUE)
+  to_col <- pick_column(df, to_patterns, paste0(lookup_name, " final/label"), required = TRUE, exclude = from_col)
+  if (is.na(from_col) || is.na(to_col)) {
+    stop("Could not detect required columns in ", lookup_name, ". Detected columns: ", paste(names(df), collapse = ", "), call. = FALSE)
+  }
+  
+  lookup <- df |>
+    transmute(
+      original_code = str_trim(as.character(.data[[from_col]])),
+      converted_code = str_trim(as.character(.data[[to_col]])),
+      lookup_key = normalize_ascii(original_code)
+    ) |>
+    filter(!is.na(original_code) & original_code != "", !is.na(converted_code) & converted_code != "") |>
+    distinct(lookup_key, .keep_all = TRUE)
+  
+  if (nrow(lookup) == 0) stop(lookup_name, " did not contain any usable lookup rows.", call. = FALSE)
+  lookup
+}
+
+convert_codes <- function(codes, lookup) {
+  code_chr <- str_trim(as.character(codes))
+  idx <- match(normalize_ascii(code_chr), lookup$lookup_key)
+  converted <- lookup$converted_code[idx]
+  ifelse(is.na(converted), code_chr, converted)
+}
+
 beech_pattern <- "fagus\\s*grandifolia|^heg$|hetre|h[êe]tre|american\\s*beech"
 
 # -----------------------------
-# Load workbook
+# Load workbook and lookup sheets
 # -----------------------------
 project_root <- resolve_project_root()
 raw_dir <- file.path(project_root, "data", "raw")
@@ -121,10 +186,33 @@ excel_path <- find_raw_workbook(raw_dir)
 sheets <- excel_sheets(excel_path)
 message("Workbook sheets: ", paste(sheets, collapse = ", "))
 
-read_sheet_safe <- function(sheet_name) {
-  if (!(sheet_name %in% sheets)) stop("Sheet '", sheet_name, "' not found.", call. = FALSE)
-  read_excel(excel_path, sheet = sheet_name)
-}
+site_lookup_sheet <- match_sheet(sheets, "site_lookup")
+species_lookup_sheet <- match_sheet(sheets, "species_lookup")
+site_lookup_used <- !is.na(site_lookup_sheet)
+species_lookup_used <- !is.na(species_lookup_sheet)
+
+if (!site_lookup_used) stop("Required sheet 'site_lookup' was not found in the workbook.", call. = FALSE)
+if (!species_lookup_used) stop("Required sheet 'species_lookup' was not found in the workbook.", call. = FALSE)
+
+message("site_lookup sheet detected: ", site_lookup_sheet)
+message("species_lookup sheet detected: ", species_lookup_sheet)
+
+site_lookup_raw <- read_excel(excel_path, sheet = site_lookup_sheet)
+species_lookup_raw <- read_excel(excel_path, sheet = species_lookup_sheet)
+
+site_lookup <- make_lookup(
+  site_lookup_raw,
+  from_patterns = c("original.*site", "old.*site", "original", "old", "site.*code", "code.*site", "^site$", "^code$"),
+  to_patterns = c("final.*site", "site.*label", "label", "new.*site", "article.*site", "converted.*site", "^site_final$"),
+  lookup_name = "site_lookup"
+)
+
+species_lookup <- make_lookup(
+  species_lookup_raw,
+  from_patterns = c("french", "francais", "français", "original", "old", "espece", "species.*code", "code.*species", "^species$", "^code$"),
+  to_patterns = c("english", "anglais", "final", "new", "converted", "article", "^en$", "code_en"),
+  lookup_name = "species_lookup"
+)
 
 arbre_raw <- read_sheet_safe("arbre")
 gaule_raw <- read_sheet_safe("gaule")
@@ -211,18 +299,57 @@ dbh_site <- arbre_inc |>
     .groups = "drop"
   )
 
-species_point <- arbre_inc |>
-  group_by(Site, Point_prisme, species_raw) |>
-  summarise(ba_point = n() * prism_baf, .groups = "drop")
+species_present_by_site <- arbre_inc |>
+  distinct(Site, species_raw)
+
+species_point <- site_points |>
+  inner_join(species_present_by_site, by = "Site") |>
+  left_join(
+    arbre_inc |>
+      count(Site, Point_prisme, species_raw, name = "n_included_species"),
+    by = c("Site", "Point_prisme", "species_raw")
+  ) |>
+  mutate(
+    n_included_species = coalesce(n_included_species, 0L),
+    ba_point = n_included_species * prism_baf
+  )
 
 species_site <- species_point |>
   group_by(Site, species_raw) |>
   summarise(avg_species_ba = mean(ba_point, na.rm = TRUE), .groups = "drop")
 
-dominant_species <- species_site |>
+top_species_by_site <- species_site |>
   group_by(Site) |>
-  filter(avg_species_ba == max(avg_species_ba, na.rm = TRUE)) |>
-  summarise(`Dominant Species` = paste(sort(species_raw), collapse = " / "), .groups = "drop")
+  arrange(desc(avg_species_ba), species_raw, .by_group = TRUE) |>
+  mutate(
+    cutoff_ba = if (n() <= 3) min(avg_species_ba, na.rm = TRUE) else avg_species_ba[3],
+    tied_at_cutoff = n() > 3 & avg_species_ba == cutoff_ba & sum(avg_species_ba == cutoff_ba, na.rm = TRUE) > 1
+  ) |>
+  filter(avg_species_ba >= cutoff_ba) |>
+  ungroup() |>
+  mutate(species_converted = convert_codes(species_raw, species_lookup))
+
+tie_sites <- top_species_by_site |>
+  filter(tied_at_cutoff) |>
+  distinct(Site) |>
+  pull(Site)
+if (length(tie_sites) > 0) {
+  warning(
+    "Tie detected at the top-3 dominant-species cutoff; all tied species were included for site(s): ",
+    paste(sort(tie_sites), collapse = ", "),
+    call. = FALSE
+  )
+}
+
+dominant_species <- top_species_by_site |>
+  group_by(Site) |>
+  summarise(
+    top_3_species_original_codes = paste(species_raw, collapse = ", "),
+    top_3_species_converted_codes = paste(species_converted, collapse = ", "),
+    top_3_species_basal_area_values = paste(round(avg_species_ba, 6), collapse = ", "),
+    `Top 3 Dominant Species` = top_3_species_converted_codes,
+    .groups = "drop"
+  )
 
 # -----------------------------
 # Gaule fixed-radius calculations from R_utilise
@@ -292,7 +419,7 @@ gaule_site <- gaule_subplot |>
   )
 
 # -----------------------------
-# Genetique for sorting/elevation
+# Genetique for sorting/elevation/latitude
 # -----------------------------
 gen_site_col <- pick_column(genetique_raw, site_patterns, "genetique site", required = TRUE)
 gen_lat_col <- pick_column(genetique_raw, lat_patterns, "genetique latitude", required = TRUE)
@@ -312,6 +439,7 @@ latlon_elev <- gen |>
   group_by(Site) |>
   summarise(
     latitude_used_for_sorting = ifelse(all(is.na(latitude)), NA_real_, mean(latitude, na.rm = TRUE)),
+    Latitude = ifelse(all(is.na(latitude)), NA_real_, round(mean(latitude, na.rm = TRUE), 5)),
     Elevation = ifelse(all(is.na(elevation)), NA_real_, mean(elevation, na.rm = TRUE)),
     n_elevation_records = sum(!is.na(elevation)),
     mean_longitude = ifelse(all(is.na(longitude)), NA_real_, mean(longitude, na.rm = TRUE)),
@@ -323,23 +451,45 @@ if (any(!is.na(latlon_elev$mean_longitude) & latlon_elev$mean_longitude > 0)) {
 }
 
 # -----------------------------
+# Lookup diagnostics
+# -----------------------------
+all_site_codes <- unique(c(site_ba$Site, dbh_site$Site, gaule_site$Site, latlon_elev$Site))
+site_conversion_tbl <- tibble(Site = all_site_codes) |>
+  mutate(
+    Site_label = convert_codes(Site, site_lookup),
+    site_missing_from_lookup = !(normalize_ascii(Site) %in% site_lookup$lookup_key)
+  )
+
+missing_site_codes <- site_conversion_tbl |>
+  filter(site_missing_from_lookup) |>
+  pull(Site)
+
+species_codes_in_arbre <- unique(arbre_inc$species_raw)
+missing_species_codes <- species_codes_in_arbre[!(normalize_ascii(species_codes_in_arbre) %in% species_lookup$lookup_key)]
+
+converted_site_count <- sum(!site_conversion_tbl$site_missing_from_lookup)
+converted_species_count <- sum(normalize_ascii(species_codes_in_arbre) %in% species_lookup$lookup_key)
+
+# -----------------------------
 # Final table
 # -----------------------------
 final_tbl <- site_ba |>
   left_join(dbh_site, by = "Site") |>
   left_join(gaule_site |> select(Site, `Beech Sapling Basal Area`), by = "Site") |>
-  left_join(dominant_species, by = "Site") |>
-  left_join(latlon_elev |> select(Site, latitude_used_for_sorting, Elevation), by = "Site") |>
+  left_join(dominant_species |> select(Site, `Top 3 Dominant Species`), by = "Site") |>
+  left_join(latlon_elev |> select(Site, latitude_used_for_sorting, Latitude, Elevation), by = "Site") |>
+  left_join(site_conversion_tbl |> select(Site, Site_label), by = "Site") |>
   arrange(latitude_used_for_sorting) |>
   transmute(
-    Site,
+    Site = Site_label,
+    Latitude,
+    Elevation,
     `Basal Area` = Basal_Area,
     `Beech Basal Area` = Beech_Basal_Area,
     `Mean DBH` = Mean_DBH,
     `Mean Beech DBH` = Mean_Beech_DBH,
     `Beech Sapling Basal Area`,
-    `Dominant Species`,
-    Elevation
+    `Top 3 Dominant Species`
   )
 
 # -----------------------------
@@ -349,14 +499,33 @@ diagnostics_tbl <- site_ba |>
   left_join(gaule_site |>
               select(Site, n_gaule_beech, gaule_radius_values_detected, gaule_subplot_area_ha, beech_sapling_basal_area_by_subplot),
             by = "Site") |>
-  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting), by = "Site") |>
+  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting, Latitude, Elevation), by = "Site") |>
+  left_join(dominant_species |>
+              select(Site, top_3_species_original_codes, top_3_species_converted_codes, top_3_species_basal_area_values),
+            by = "Site") |>
+  left_join(site_conversion_tbl, by = "Site") |>
   mutate(
+    species_codes_missing_from_species_lookup = collapse_or_none(missing_species_codes),
+    site_lookup_used = site_lookup_used,
+    species_lookup_used = species_lookup_used,
     prism_baf_used = prism_baf,
+    R_utilise_values_detected_for_gaule = ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")),
     basal_area_method_used = "Prism BA from included trees (Valeur_prisme==2): per-point n*prism_baf then averaged across points",
     gaule_method_used = "Fixed-radius subplot BA from R_utilise and DBH: subplot BA m²/ha then averaged across points"
   ) |>
-  select(
-    Site,
+  transmute(
+    original_Site_code = Site,
+    converted_Site_label = Site_label,
+    Latitude,
+    Elevation,
+    top_3_species_original_codes,
+    top_3_species_converted_codes,
+    top_3_species_basal_area_values,
+    species_codes_missing_from_species_lookup,
+    site_lookup_used,
+    species_lookup_used,
+    prism_baf_used,
+    R_utilise_values_detected_for_gaule,
     n_prism_points_detected,
     n_included_arbre_total,
     n_included_arbre_beech,
@@ -366,7 +535,6 @@ diagnostics_tbl <- site_ba |>
     beech_sapling_basal_area_by_subplot,
     n_elevation_records,
     latitude_used_for_sorting,
-    prism_baf_used,
     basal_area_method_used,
     gaule_method_used
   ) |>
@@ -378,33 +546,66 @@ diagnostics_tbl <- site_ba |>
 csv_path <- file.path(out_dir, "site_description_table_article.csv")
 xlsx_path <- file.path(out_dir, "site_description_table_article.xlsx")
 diag_path <- file.path(out_dir, "site_description_table_article_diagnostics.csv")
+docx_path <- file.path(out_dir, "site_description_table_article_formatted.docx")
 
 write.csv(final_tbl, csv_path, row.names = FALSE, na = "")
 openxlsx::write.xlsx(final_tbl, xlsx_path, overwrite = TRUE)
 write.csv(diagnostics_tbl, diag_path, row.names = FALSE, na = "")
 
+if (word_packages_available) {
+  formatted_table <- flextable::flextable(final_tbl) |>
+    flextable::theme_booktabs() |>
+    flextable::autofit() |>
+    flextable::align(align = "center", part = "all") |>
+    flextable::align(j = "Top 3 Dominant Species", align = "left", part = "body") |>
+    flextable::bold(part = "header")
+  
+  flextable::save_as_docx(
+    `Site description table` = formatted_table,
+    path = docx_path
+  )
+} else {
+  warning(
+    "Skipping formatted Word table. Install flextable and officer to create: ",
+    docx_path,
+    call. = FALSE
+  )
+}
+
 # -----------------------------
 # Console summary
 # -----------------------------
-range_or_na <- function(x) {
-  if (all(is.na(x))) return("NA to NA")
-  paste0(round(min(x, na.rm = TRUE), 4), " to ", round(max(x, na.rm = TRUE), 4))
-}
-
 message("\nFinal table:")
 print(final_tbl, n = Inf, width = Inf)
 
+message("\nTop 3 dominant species per site:")
+top_species_summary <- dominant_species |>
+  left_join(site_conversion_tbl |> select(Site, Site_label), by = "Site") |>
+  arrange(match(Site_label, final_tbl$Site)) |>
+  transmute(Site = Site_label, top_3_species_converted_codes, top_3_species_basal_area_values)
+print(top_species_summary, n = Inf, width = Inf)
+
 message("\nSummary:")
+message(" - site_lookup sheet detected: ", ifelse(site_lookup_used, site_lookup_sheet, "No"))
+message(" - species_lookup sheet detected: ", ifelse(species_lookup_used, species_lookup_sheet, "No"))
+message(" - number of site codes converted: ", converted_site_count)
+message(" - missing site codes from site_lookup: ", collapse_or_none(missing_site_codes))
+message(" - number of species codes converted: ", converted_species_count)
+message(" - missing species codes from species_lookup: ", collapse_or_none(missing_species_codes))
+message(" - top 3 dominant species per site: ", paste0(top_species_summary$Site, " = ", top_species_summary$top_3_species_converted_codes, collapse = " | "))
+message(" - Latitude range: ", range_or_na(final_tbl$Latitude, digits = 5))
+message(" - Elevation range: ", range_or_na(final_tbl$Elevation))
+message(" - Basal Area range: ", range_or_na(final_tbl$`Basal Area`))
+message(" - Beech Basal Area range: ", range_or_na(final_tbl$`Beech Basal Area`))
+message(" - Beech Sapling Basal Area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
 message(" - prism_baf used = ", prism_baf)
 message(" - R_utilise values detected in gaule = ", ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")))
 message(" - Any missing/invalid R_utilise in beech gaule rows = No (script would stop otherwise)")
-message(" - Basal area range: ", range_or_na(final_tbl$`Basal Area`))
-message(" - Beech basal area range: ", range_or_na(final_tbl$`Beech Basal Area`))
-message(" - Beech sapling basal area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
-message(" - Sites with Beech Basal Area = 0: ", {s <- final_tbl$Site[!is.na(final_tbl$`Beech Basal Area`) & final_tbl$`Beech Basal Area` == 0]; if (length(s)==0) "None" else paste(s, collapse=", ")})
-message(" - Sites with Mean Beech DBH = NA: ", {s <- final_tbl$Site[is.na(final_tbl$`Mean Beech DBH`)]; if (length(s)==0) "None" else paste(s, collapse=", ")})
+message(" - Sites with Beech Basal Area = 0: ", {s <- final_tbl$Site[!is.na(final_tbl$`Beech Basal Area`) & final_tbl$`Beech Basal Area` == 0]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
+message(" - Sites with Mean Beech DBH = NA: ", {s <- final_tbl$Site[is.na(final_tbl$`Mean Beech DBH`)]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
 
 message("\nSaved:")
 message(" - ", csv_path)
 message(" - ", xlsx_path)
 message(" - ", diag_path)
+message(" - ", docx_path, ifelse(word_packages_available, "", " (skipped: install flextable and officer)"))

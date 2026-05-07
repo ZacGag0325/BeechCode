@@ -12,6 +12,7 @@
 # - outputs/tables/clonality_individual_assignments.csv
 # - outputs/tables/clonality_summary_table.csv
 # - outputs/tables/clonality_summary_table.xlsx
+# - outputs/tables/clonality_summary_table.docx
 # - outputs/tables/clonality_summary_table_numeric.csv
 ############################################################
 
@@ -653,6 +654,61 @@ write_article_clonality_summary_xlsx <- function(summary_tbl, path) {
   openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
 }
 
+require_word_export_packages <- function() {
+  required_packages <- c("officer", "flextable")
+  missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing_packages) > 0) {
+    stop(
+      "[01_clonality] Word export requires the following R package(s): ",
+      paste(missing_packages, collapse = ", "),
+      ". Install them with: install.packages(c(",
+      paste(sprintf('"%s"', missing_packages), collapse = ", "),
+      "))"
+    )
+  }
+  invisible(TRUE)
+}
+
+build_article_clonality_word_table <- function(summary_tbl) {
+  summary_tbl %>%
+    transmute(
+      Site = as.character(Site),
+      N = as.integer(N),
+      MLG = as.integer(MLG),
+      R_MLG = as.character(`MLG R`),
+      MLL = as.integer(MLL),
+      R_MLL = as.character(`MLL R`)
+    )
+}
+
+write_article_clonality_summary_docx <- function(summary_tbl, path) {
+  require_word_export_packages()
+  
+  word_tbl <- build_article_clonality_word_table(summary_tbl)
+  table_title <- "Table X. Clonal structure summary by site."
+  table_note <- "N = number of individuals analyzed; MLG = number of multilocus genotypes; MLL = number of multilocus lineages after Bruvo-distance clustering; R_MLG and R_MLL represent clonal richness, calculated as (G − 1)/(N − 1)."
+  
+  ft <- flextable::flextable(word_tbl)
+  ft <- flextable::theme_booktabs(ft)
+  ft <- flextable::bold(ft, part = "header")
+  ft <- flextable::align(ft, align = "center", part = "all")
+  ft <- flextable::align(ft, j = "Site", align = "left", part = "body")
+  ft <- flextable::fontsize(ft, size = 10, part = "all")
+  ft <- flextable::autofit(ft)
+  
+  doc <- officer::read_docx()
+  doc <- officer::body_add_par(doc, table_title, style = "Normal")
+  doc <- officer::body_add_flextable(doc, ft)
+  doc <- officer::body_add_par(doc, table_note, style = "Normal")
+  print(doc, target = path)
+  
+  if (!file.exists(path)) {
+    stop("[01_clonality] Word clonality summary table was not created: ", path)
+  }
+  
+  invisible(path)
+}
+
 print_article_clonality_summary_table <- function(summary_tbl) {
   cat("\n")
   print_separator("=", 72)
@@ -876,10 +932,12 @@ clonality_summary_table <- build_article_clonality_summary_table(
 )
 clonality_summary_table_csv <- file.path(TABLES_DIR, "clonality_summary_table.csv")
 clonality_summary_table_xlsx <- file.path(TABLES_DIR, "clonality_summary_table.xlsx")
+clonality_summary_table_docx <- file.path(TABLES_DIR, "clonality_summary_table.docx")
 clonality_summary_table_numeric_csv <- file.path(TABLES_DIR, "clonality_summary_table_numeric.csv")
 write.csv(clonality_summary_table, clonality_summary_table_csv, row.names = FALSE, na = "NA")
 write.csv(clonality_summary_table_numeric, clonality_summary_table_numeric_csv, row.names = FALSE, na = "NA")
 write_article_clonality_summary_xlsx(clonality_summary_table, clonality_summary_table_xlsx)
+write_article_clonality_summary_docx(clonality_summary_table, clonality_summary_table_docx)
 verify_article_clonality_summary_exports(clonality_summary_table, clonality_summary_table_csv, clonality_summary_table_xlsx)
 print_article_clonality_summary_table(clonality_summary_table)
 
@@ -903,6 +961,7 @@ clonality_plot_files <- save_clonality_percent_plot_dual_language(
 message("[01_clonality] Saved: ", out_file)
 message("[01_clonality] Saved: ", clonality_summary_table_csv)
 message("[01_clonality] Saved: ", clonality_summary_table_xlsx)
+message("[01_clonality] Saved: ", clonality_summary_table_docx)
 message("[01_clonality] Saved: ", clonality_summary_table_numeric_csv)
 message("[01_clonality] Saved: ", assign_file)
 message("[01_clonality] Saved: ", site_clonality_summary_file)

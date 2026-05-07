@@ -255,17 +255,25 @@ join_site_lookup <- function(df, lookup, context = "[01_clonality] clonality dat
   out
 }
 
-clonality_plot_theme <- function(base_size = 16) {
+clonality_plot_theme <- function(base_size = 22) {
   theme_classic(base_size = base_size) +
     theme(
+      plot.title = element_text(size = 26, face = "bold"),
+      plot.subtitle = element_text(size = 22),
+      axis.title = element_text(size = 26, face = "bold"),
+      axis.text = element_text(size = 22),
+      axis.text.x = element_text(size = 22, angle = 45, hjust = 1, vjust = 1),
+      axis.text.y = element_text(size = 22),
+      axis.line = element_line(linewidth = 0.4, color = "black"),
+      axis.ticks = element_line(linewidth = 1.0),
+      axis.ticks.length = grid::unit(0.28, "cm"),
       panel.border = element_blank(),
       plot.background = element_blank(),
       panel.background = element_blank(),
-      axis.line = element_line(linewidth = 0.4),
-      axis.title = element_text(size = 17),
-      axis.text = element_text(size = 16),
-      legend.title = element_text(size = 16),
-      legend.text = element_text(size = 15)
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.title = element_text(size = 22),
+      legend.text = element_text(size = 22)
     )
 }
 
@@ -703,15 +711,7 @@ make_clonality_percent_barplot <- function(summary_tbl, lang = c("fr", "en")) {
       x = labels$x,
       y = labels$y
     ) +
-    clonality_plot_theme(base_size = 16) +
-    theme(
-      plot.title = element_text(face = "bold", size = 19),
-      plot.subtitle = element_text(size = 18),
-      axis.text.x = element_text(size = 16, angle = 45, hjust = 1, vjust = 1),
-      axis.text.y = element_text(size = 16),
-      panel.grid.major.x = element_blank(),
-      panel.grid.minor = element_blank()
-    )
+    clonality_plot_theme()
 }
 
 save_clonality_percent_plot_dual_language <- function(summary_tbl, fig_dir) {

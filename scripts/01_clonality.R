@@ -10,6 +10,9 @@
 # Outputs:
 # - outputs/tables/clonality_summary.csv
 # - outputs/tables/clonality_individual_assignments.csv
+# - outputs/tables/clonality_summary_table.csv
+# - outputs/tables/clonality_summary_table.xlsx
+# - outputs/tables/clonality_summary_table_numeric.csv
 ############################################################
 
 suppressPackageStartupMessages({
@@ -18,6 +21,7 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(ggplot2)
   library(readxl)
+  library(openxlsx)
 })
 
 source("scripts/_load_objects.R")
@@ -40,11 +44,13 @@ normalize_lookup_key <- function(x) {
 
 find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", "raw"), sheet = SITE_LOOKUP_SHEET) {
   if (!dir.exists(raw_dir)) {
-    stop("[01_clonality] Cannot read site_lookup because data/raw does not exist: ", raw_dir)
+    message("[01_clonality] site_lookup unavailable because data/raw does not exist: ", raw_dir)
+    return(NULL)
   }
   excel_files <- list.files(raw_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
   if (length(excel_files) == 0) {
-    stop("[01_clonality] site_lookup is missing: no Excel workbook was found in data/raw.")
+    message("[01_clonality] site_lookup unavailable: no Excel workbook was found in data/raw.")
+    return(NULL)
   }
   
   has_lookup <- vapply(
@@ -58,12 +64,13 @@ find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", 
   lookup_files <- excel_files[has_lookup]
   
   if (length(lookup_files) == 0) {
-    stop(
-      "[01_clonality] site_lookup is missing: none of the Excel workbooks in data/raw contains a '",
+    message(
+      "[01_clonality] site_lookup unavailable: none of the Excel workbooks in data/raw contains a '",
       sheet,
       "' sheet. Checked: ",
       paste(basename(excel_files), collapse = ", ")
     )
+    return(NULL)
   }
   if (length(lookup_files) > 1) {
     message(
@@ -81,6 +88,7 @@ find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", 
 
 load_site_lookup <- function() {
   workbook <- find_site_lookup_workbook()
+  if (is.null(workbook)) return(NULL)
   lookup <- suppressMessages(readxl::read_excel(workbook, sheet = SITE_LOOKUP_SHEET)) %>%
     as.data.frame(stringsAsFactors = FALSE)
   
@@ -193,6 +201,18 @@ join_site_lookup <- function(df, lookup, context = "[01_clonality] clonality dat
     select(-any_of(c("Site_label", "Region", "Site_order", "Numéro_Population_lookup")))
   site_col_local <- resolve_col_ci(out, c("Site", "site"))
   pop_col_local <- resolve_population_col(out)
+  
+  if (is.null(lookup)) {
+    if (is.na(site_col_local)) {
+      stop(context, " must contain a Site column when site_lookup is unavailable.")
+    }
+    out$Site <- normalize_lookup_key(out[[site_col_local]])
+    out$Site_label <- out$Site
+    out$Region <- NA_character_
+    site_order_levels <- unique(out$Site[nzchar(out$Site)])
+    out$Site_order <- match(out$Site, site_order_levels)
+    return(out)
+  }
   
   if (!is.na(site_col_local)) {
     out$.__site_lookup_key <- normalize_lookup_key(out[[site_col_local]])
@@ -531,10 +551,14 @@ if (any(is.na(mll_labels))) stop("[01_clonality] Could not map all individuals t
 bruvo_threshold <- if (!is.na(threshold_col)) unique(stats::na.omit(df_ids[[threshold_col]])) else numeric(0)
 bruvo_algorithm <- if (!is.na(algorithm_col)) unique(stats::na.omit(df_ids[[algorithm_col]])) else character(0)
 
-site_label_levels <- site_lookup %>%
-  arrange(Site_order) %>%
-  pull(Site_label) %>%
-  unique()
+site_label_levels <- if (!is.null(site_lookup)) {
+  site_lookup %>%
+    arrange(Site_order) %>%
+    pull(Site_label) %>%
+    unique()
+} else {
+  unique(site_display_labels[!is.na(site_display_labels) & nzchar(site_display_labels)])
+}
 
 clonality_df <- data.frame(
   Individual = adegenet::indNames(gi),
@@ -558,6 +582,107 @@ add_clonality_metrics <- function(dat) {
       Genotypic_Richness_MLG = N_MLG / N_individuals,
       Genotypic_Richness_MLL = N_MLL / N_individuals
     )
+}
+
+format_three_decimals <- function(x) {
+  out <- ifelse(is.na(x), NA_character_, sprintf("%.3f", round(as.numeric(x), 3)))
+  out
+}
+
+build_article_clonality_summary_table <- function(site_summary_tbl, use_site_lookup_order = TRUE, formatted = TRUE) {
+  out <- site_summary_tbl
+  if (isTRUE(use_site_lookup_order) && "Site_order" %in% names(out) && any(!is.na(out$Site_order))) {
+    out <- out %>% arrange(Site_order, Site_label)
+  } else if ("Latitude" %in% names(out) && any(!is.na(out$Latitude))) {
+    out <- out %>% arrange(Latitude, Site_label)
+  } else if ("Site_order" %in% names(out) && any(!is.na(out$Site_order))) {
+    out <- out %>% arrange(Site_order, Site_label)
+  }
+  
+  numeric_tbl <- out %>%
+    transmute(
+      Site = as.character(Site_label),
+      N = as.integer(N_individuals),
+      MLG = as.integer(N_MLG),
+      `MLG R` = round(Clonal_Richness_MLG, 3),
+      MLL = as.integer(N_MLL),
+      `MLL R` = round(Clonal_Richness_MLL, 3)
+    )
+  
+  if (!isTRUE(formatted)) return(numeric_tbl)
+  
+  numeric_tbl %>%
+    mutate(
+      `MLG R` = format_three_decimals(`MLG R`),
+      `MLL R` = format_three_decimals(`MLL R`)
+    )
+}
+
+write_article_clonality_summary_xlsx <- function(summary_tbl, path) {
+  wb <- openxlsx::createWorkbook()
+  openxlsx::addWorksheet(wb, "Clonality summary")
+  openxlsx::writeData(wb, "Clonality summary", summary_tbl)
+  header_style <- openxlsx::createStyle(
+    textDecoration = "bold",
+    halign = "center",
+    valign = "center",
+    border = "bottom",
+    fgFill = "#D9EAD3"
+  )
+  body_style <- openxlsx::createStyle(halign = "center", valign = "center")
+  openxlsx::addStyle(
+    wb,
+    "Clonality summary",
+    header_style,
+    rows = 1,
+    cols = seq_len(ncol(summary_tbl)),
+    gridExpand = TRUE
+  )
+  if (nrow(summary_tbl) > 0) {
+    openxlsx::addStyle(
+      wb,
+      "Clonality summary",
+      body_style,
+      rows = 2:(nrow(summary_tbl) + 1),
+      cols = seq_len(ncol(summary_tbl)),
+      gridExpand = TRUE
+    )
+  }
+  openxlsx::freezePane(wb, "Clonality summary", firstRow = TRUE)
+  openxlsx::setColWidths(wb, "Clonality summary", cols = seq_len(ncol(summary_tbl)), widths = "auto")
+  openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
+}
+
+print_article_clonality_summary_table <- function(summary_tbl) {
+  cat("\n")
+  print_separator("=", 72)
+  cat("ARTICLE/THESIS-READY CLONALITY SUMMARY TABLE\n")
+  print_separator("=", 72)
+  utils::write.table(summary_tbl, row.names = FALSE, quote = FALSE, sep = "\t", na = "NA")
+  cat("\nCopy-paste table:\n")
+  utils::write.table(summary_tbl, row.names = FALSE, quote = FALSE, sep = "\t", na = "NA")
+  print_separator("=", 72)
+  invisible(summary_tbl)
+}
+
+verify_article_clonality_summary_exports <- function(summary_tbl, csv_path, xlsx_path) {
+  csv_tbl <- utils::read.csv(csv_path, stringsAsFactors = FALSE, check.names = FALSE, colClasses = "character")
+  xlsx_tbl <- openxlsx::read.xlsx(xlsx_path, colNames = TRUE, detectDates = FALSE)
+  xlsx_tbl <- as.data.frame(lapply(xlsx_tbl, as.character), stringsAsFactors = FALSE, check.names = FALSE)
+  names(xlsx_tbl) <- names(summary_tbl)
+  
+  expected_tbl <- as.data.frame(lapply(summary_tbl, as.character), stringsAsFactors = FALSE, check.names = FALSE)
+  names(expected_tbl) <- names(summary_tbl)
+  
+  if (!identical(csv_tbl, expected_tbl)) {
+    stop("[01_clonality] CSV clonality summary table does not match the printed article-ready table.")
+  }
+  if (!identical(xlsx_tbl, expected_tbl)) {
+    stop("[01_clonality] XLSX clonality summary table does not match the printed article-ready table.")
+  }
+  
+  message("[01_clonality] Verified CSV and XLSX clonality summary tables match the printed article-ready table.")
+  invisible(TRUE)
 }
 
 overall <- clonality_df %>%
@@ -603,8 +728,11 @@ if (length(bruvo_algorithm) > 0) {
   clonality_summary$Bruvo_algorithm <- bruvo_algorithm[1]
 }
 
+dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
+
 out_file <- file.path(TABLES_DIR, "clonality_summary.csv")
 write.csv(clonality_summary, out_file, row.names = FALSE)
+
 
 if (length(bruvo_threshold) > 0) {
   clonality_df$Bruvo_MLL_threshold <- bruvo_threshold[1]
@@ -736,13 +864,36 @@ save_clonality_percent_plot_dual_language <- function(summary_tbl, fig_dir) {
 
 site_clonality_summary <- build_site_clonality_summary(clonality_df, df_ids_tbl = df_ids)
 
+clonality_summary_table_numeric <- build_article_clonality_summary_table(
+  site_clonality_summary,
+  use_site_lookup_order = !is.null(site_lookup),
+  formatted = FALSE
+)
+clonality_summary_table <- build_article_clonality_summary_table(
+  site_clonality_summary,
+  use_site_lookup_order = !is.null(site_lookup),
+  formatted = TRUE
+)
+clonality_summary_table_csv <- file.path(TABLES_DIR, "clonality_summary_table.csv")
+clonality_summary_table_xlsx <- file.path(TABLES_DIR, "clonality_summary_table.xlsx")
+clonality_summary_table_numeric_csv <- file.path(TABLES_DIR, "clonality_summary_table_numeric.csv")
+write.csv(clonality_summary_table, clonality_summary_table_csv, row.names = FALSE, na = "NA")
+write.csv(clonality_summary_table_numeric, clonality_summary_table_numeric_csv, row.names = FALSE, na = "NA")
+write_article_clonality_summary_xlsx(clonality_summary_table, clonality_summary_table_xlsx)
+verify_article_clonality_summary_exports(clonality_summary_table, clonality_summary_table_csv, clonality_summary_table_xlsx)
+print_article_clonality_summary_table(clonality_summary_table)
+
 cat("\n[01_clonality] Tableau résumé utilisé pour le barplot de clonalité (%) par site:\n")
 print(site_clonality_summary)
 
 site_clonality_summary_file <- file.path(TABLES_DIR, "clonality_percent_per_site_summary.csv")
 write.csv(site_clonality_summary, site_clonality_summary_file, row.names = FALSE)
 
-validate_clonality_plot_site_labels(site_clonality_summary, site_lookup)
+if (!is.null(site_lookup)) {
+  validate_clonality_plot_site_labels(site_clonality_summary, site_lookup)
+} else {
+  message("[01_clonality] Skipping site_lookup plot-order validation because site_lookup is unavailable.")
+}
 
 clonality_plot_files <- save_clonality_percent_plot_dual_language(
   summary_tbl = site_clonality_summary,
@@ -750,6 +901,9 @@ clonality_plot_files <- save_clonality_percent_plot_dual_language(
 )
 
 message("[01_clonality] Saved: ", out_file)
+message("[01_clonality] Saved: ", clonality_summary_table_csv)
+message("[01_clonality] Saved: ", clonality_summary_table_xlsx)
+message("[01_clonality] Saved: ", clonality_summary_table_numeric_csv)
 message("[01_clonality] Saved: ", assign_file)
 message("[01_clonality] Saved: ", site_clonality_summary_file)
 message("[01_clonality] Saved: ", clonality_plot_files$fr_png)

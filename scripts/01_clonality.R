@@ -953,19 +953,28 @@ if (!is.null(site_lookup)) {
   message("[01_clonality] Skipping site_lookup plot-order validation because site_lookup is unavailable.")
 }
 
+clonality_plot_files <- list(
+  fr_png = NA_character_,
+  fr_pdf = NA_character_,
+  en_png = NA_character_,
+  en_pdf = NA_character_
+)
 clonality_plot_files <- save_clonality_percent_plot_dual_language(
   summary_tbl = site_clonality_summary,
   fig_dir = FIGURES_DIR
 )
 
-message("[01_clonality] Saved: ", out_file)
-message("[01_clonality] Saved: ", clonality_summary_table_csv)
-message("[01_clonality] Saved: ", clonality_summary_table_xlsx)
-message("[01_clonality] Saved: ", clonality_summary_table_docx)
-message("[01_clonality] Saved: ", clonality_summary_table_numeric_csv)
-message("[01_clonality] Saved: ", assign_file)
-message("[01_clonality] Saved: ", site_clonality_summary_file)
-message("[01_clonality] Saved: ", clonality_plot_files$fr_png)
-message("[01_clonality] Saved: ", clonality_plot_files$fr_pdf)
-message("[01_clonality] Saved: ", clonality_plot_files$en_png)
-message("[01_clonality] Saved: ", clonality_plot_files$en_pdf)
+saved_output_files <- c(
+  out_file,
+  clonality_summary_table_csv,
+  clonality_summary_table_xlsx,
+  clonality_summary_table_docx,
+  clonality_summary_table_numeric_csv,
+  assign_file,
+  site_clonality_summary_file,
+  unname(unlist(clonality_plot_files, use.names = FALSE))
+)
+saved_output_files <- saved_output_files[!is.na(saved_output_files) & nzchar(saved_output_files)]
+for (saved_output_file in saved_output_files) {
+  message("[01_clonality] Saved: ", saved_output_file)
+}

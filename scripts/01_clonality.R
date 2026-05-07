@@ -654,19 +654,24 @@ write_article_clonality_summary_xlsx <- function(summary_tbl, path) {
   openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
 }
 
-require_word_export_packages <- function() {
+check_word_export_packages <- function() {
   required_packages <- c("officer", "flextable")
   missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing_packages) > 0) {
-    stop(
-      "[01_clonality] Word export requires the following R package(s): ",
-      paste(missing_packages, collapse = ", "),
-      ". Install them with: install.packages(c(",
+    install_cmd <- paste0(
+      "install.packages(c(",
       paste(sprintf('"%s"', missing_packages), collapse = ", "),
       "))"
     )
+    message(
+      "[01_clonality] Skipping Word (.docx) export because the following R package(s) are missing: ",
+      paste(missing_packages, collapse = ", "),
+      ". To enable Word export, run: ",
+      install_cmd
+    )
+    return(FALSE)
   }
-  invisible(TRUE)
+  TRUE
 }
 
 build_article_clonality_word_table <- function(summary_tbl) {
@@ -682,7 +687,9 @@ build_article_clonality_word_table <- function(summary_tbl) {
 }
 
 write_article_clonality_summary_docx <- function(summary_tbl, path) {
-  require_word_export_packages()
+  if (!check_word_export_packages()) {
+    return(NA_character_)
+  }
   
   word_tbl <- build_article_clonality_word_table(summary_tbl)
   table_title <- "Table X. Clonal structure summary by site."
@@ -937,7 +944,10 @@ clonality_summary_table_numeric_csv <- file.path(TABLES_DIR, "clonality_summary_
 write.csv(clonality_summary_table, clonality_summary_table_csv, row.names = FALSE, na = "NA")
 write.csv(clonality_summary_table_numeric, clonality_summary_table_numeric_csv, row.names = FALSE, na = "NA")
 write_article_clonality_summary_xlsx(clonality_summary_table, clonality_summary_table_xlsx)
-write_article_clonality_summary_docx(clonality_summary_table, clonality_summary_table_docx)
+clonality_summary_table_docx_written <- write_article_clonality_summary_docx(
+  clonality_summary_table,
+  clonality_summary_table_docx
+)
 verify_article_clonality_summary_exports(clonality_summary_table, clonality_summary_table_csv, clonality_summary_table_xlsx)
 print_article_clonality_summary_table(clonality_summary_table)
 
@@ -968,7 +978,7 @@ saved_output_files <- c(
   out_file,
   clonality_summary_table_csv,
   clonality_summary_table_xlsx,
-  clonality_summary_table_docx,
+  clonality_summary_table_docx_written,
   clonality_summary_table_numeric_csv,
   assign_file,
   site_clonality_summary_file,

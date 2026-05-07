@@ -116,13 +116,71 @@ load_site_lookup <- function() {
     dup_sites <- unique(lookup$Site[duplicated(lookup$Site)])
     stop("[01_clonality] site_lookup$Site contains duplicate site codes: ", paste(dup_sites, collapse = ", "))
   }
+  if (anyDuplicated(lookup$Site_label)) {
+    dup_labels <- unique(lookup$Site_label[duplicated(lookup$Site_label)])
+    stop("[01_clonality] site_lookup$Site_label contains duplicate display labels: ", paste(dup_labels, collapse = ", "))
+  }
+  if (anyDuplicated(lookup$Site_order)) {
+    dup_orders <- unique(lookup$Site_order[duplicated(lookup$Site_order)])
+    stop("[01_clonality] site_lookup$Site_order contains duplicate ordering values: ", paste(dup_orders, collapse = ", "))
+  }
   pop_nonblank <- nzchar(lookup$Numéro_Population)
   if (anyDuplicated(lookup$Numéro_Population[pop_nonblank])) {
     dup_pops <- unique(lookup$Numéro_Population[pop_nonblank][duplicated(lookup$Numéro_Population[pop_nonblank])])
     stop("[01_clonality] site_lookup$Numéro_Population contains duplicate non-blank population numbers: ", paste(dup_pops, collapse = ", "))
   }
   
-  lookup
+  lookup %>%
+    arrange(Site_order, Site_label)
+}
+
+validate_clonality_plot_site_labels <- function(summary_tbl, lookup) {
+  ordered_lookup <- lookup %>%
+    arrange(Site_order, Site_label)
+  expected_labels <- as.character(ordered_lookup$Site_label)
+  expected_orders <- ordered_lookup$Site_order
+  plot_tbl <- summary_tbl %>%
+    arrange(Site_order, Site_label)
+  plot_labels <- as.character(plot_tbl$Site_label)
+  plot_orders <- plot_tbl$Site_order
+  
+  if (any(is.na(plot_labels) | !nzchar(plot_labels))) {
+    stop("[01_clonality] Clonality plot Site_label values contain missing or blank display labels.")
+  }
+  if (anyDuplicated(plot_labels)) {
+    dup_labels <- unique(plot_labels[duplicated(plot_labels)])
+    stop("[01_clonality] Clonality plot Site_label values are duplicated: ", paste(dup_labels, collapse = ", "))
+  }
+  if (any(is.na(plot_orders))) {
+    stop("[01_clonality] Clonality plot Site_order values contain missing ordering values.")
+  }
+  if (anyDuplicated(plot_orders)) {
+    dup_orders <- unique(plot_orders[duplicated(plot_orders)])
+    stop("[01_clonality] Clonality plot Site_order values are duplicated: ", paste(dup_orders, collapse = ", "))
+  }
+  if (is.unsorted(plot_orders, strictly = TRUE)) {
+    stop("[01_clonality] Clonality plot Site_label values are not ordered by strictly increasing Site_order.")
+  }
+  
+  missing_labels <- setdiff(expected_labels, plot_labels)
+  extra_labels <- setdiff(plot_labels, expected_labels)
+  if (length(missing_labels) > 0) {
+    stop("[01_clonality] Clonality plot is missing Site_label values from site_lookup: ", paste(missing_labels, collapse = ", "))
+  }
+  if (length(extra_labels) > 0) {
+    stop("[01_clonality] Clonality plot contains Site_label values not found in site_lookup: ", paste(extra_labels, collapse = ", "))
+  }
+  if (!identical(plot_labels, expected_labels) || !identical(as.numeric(plot_orders), as.numeric(expected_orders))) {
+    stop(
+      "[01_clonality] Clonality plot Site_label order does not match site_lookup$Site_order. Expected: ",
+      paste(expected_labels, collapse = ", "),
+      "; got: ",
+      paste(plot_labels, collapse = ", ")
+    )
+  }
+  
+  message("[01_clonality] Final clonality plot site order: ", paste(plot_labels, collapse = ", "))
+  invisible(plot_labels)
 }
 
 resolve_population_col <- function(df) {
@@ -556,7 +614,7 @@ print_quick_clone_summary(clonality_df, site_available = site_available)
 # Clonality percentage barplots by site (FR + EN) for presentation
 # -----------------------------------------------------------------------------
 # Objective:
-# - x axis: Site
+# - x axis: Site_label display labels from site_lookup, ordered by Site_order
 # - y axis: Clonality (%) based on MLL clonality proportion
 # - robust behavior even when some sites have variable sample sizes
 
@@ -683,6 +741,8 @@ print(site_clonality_summary)
 
 site_clonality_summary_file <- file.path(TABLES_DIR, "clonality_percent_per_site_summary.csv")
 write.csv(site_clonality_summary, site_clonality_summary_file, row.names = FALSE)
+
+validate_clonality_plot_site_labels(site_clonality_summary, site_lookup)
 
 clonality_plot_files <- save_clonality_percent_plot_dual_language(
   summary_tbl = site_clonality_summary,

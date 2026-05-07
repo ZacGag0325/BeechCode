@@ -119,6 +119,35 @@ range_or_na <- function(x, digits = 4) {
   paste0(round(min(x, na.rm = TRUE), digits), " to ", round(max(x, na.rm = TRUE), digits))
 }
 
+sd_if_possible <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) NA_real_ else stats::sd(x)
+}
+
+format_mean_sd <- function(mean_value, sd_value, digits = 1) {
+  ifelse(
+    is.na(mean_value),
+    NA_character_,
+    paste0(
+      formatC(round(mean_value, digits), format = "f", digits = digits),
+      " (",
+      ifelse(is.na(sd_value), "NA", formatC(round(sd_value, digits), format = "f", digits = digits)),
+      ")"
+    )
+  )
+}
+
+collapse_site_labels <- function(site_codes, site_conversion_tbl = NULL) {
+  site_codes <- unique(site_codes[!is.na(site_codes) & site_codes != ""])
+  if (length(site_codes) == 0) return("None")
+  if (!is.null(site_conversion_tbl)) {
+    idx <- match(site_codes, site_conversion_tbl$Site)
+    labels <- site_conversion_tbl$Site_label[idx]
+    site_codes <- ifelse(is.na(labels), site_codes, labels)
+  }
+  paste(sort(unique(site_codes)), collapse = ", ")
+}
+
 collapse_or_none <- function(x) {
   x <- unique(x[!is.na(x) & x != ""])
   if (length(x) == 0) "None" else paste(sort(x), collapse = ", ")
@@ -382,17 +411,26 @@ site_ba <- point_diag |>
     n_included_arbre_total = sum(n_included_total, na.rm = TRUE),
     n_included_arbre_beech = sum(n_included_beech, na.rm = TRUE),
     Basal_Area = mean(total_basal_area_by_point, na.rm = TRUE),
+    basal_area_sd = sd_if_possible(total_basal_area_by_point),
     Beech_Basal_Area = mean(beech_basal_area_by_point, na.rm = TRUE),
+    beech_basal_area_sd = sd_if_possible(beech_basal_area_by_point),
     .groups = "drop"
   )
 
 dbh_site <- arbre_inc |>
   group_by(Site) |>
   summarise(
+    n_dbh = sum(!is.na(dbh_cm)),
     Mean_DBH = ifelse(all(is.na(dbh_cm)), NA_real_, mean(dbh_cm, na.rm = TRUE)),
+    sd_dbh = sd_if_possible(dbh_cm),
+    n_beech_dbh = sum(str_detect(species_norm, beech_pattern) & !is.na(dbh_cm)),
     Mean_Beech_DBH = {
       b <- dbh_cm[str_detect(species_norm, beech_pattern)]
       if (length(b) == 0 || all(is.na(b))) NA_real_ else mean(b, na.rm = TRUE)
+    },
+    sd_beech_dbh = {
+      b <- dbh_cm[str_detect(species_norm, beech_pattern)]
+      sd_if_possible(b)
     },
     .groups = "drop"
   )
@@ -511,7 +549,9 @@ gaule_site <- gaule_subplot |>
   group_by(Site) |>
   summarise(
     n_gaule_beech = sum(n_gaule_beech, na.rm = TRUE),
+    n_gaule_subplots = sum(!is.na(beech_sapling_basal_area_by_subplot)),
     `Beech Sapling Basal Area` = mean(beech_sapling_basal_area_by_subplot, na.rm = TRUE),
+    beech_sapling_basal_area_sd = sd_if_possible(beech_sapling_basal_area_by_subplot),
     gaule_radius_values_detected = paste(sort(unique(gaule_radius_values_detected)), collapse = " / "),
     gaule_subplot_area_ha = paste(round(sort(unique(gaule_subplot_area_ha)), 8), collapse = " / "),
     beech_sapling_basal_area_by_subplot = paste0(Point_prisme, ":", round(beech_sapling_basal_area_by_subplot, 6), collapse = " | "),
@@ -541,6 +581,7 @@ latlon_elev <- gen |>
     latitude_used_for_sorting = ifelse(all(is.na(latitude)), NA_real_, mean(latitude, na.rm = TRUE)),
     Latitude = ifelse(all(is.na(latitude)), NA_real_, round(mean(latitude, na.rm = TRUE), 5)),
     Elevation = ifelse(all(is.na(elevation)), NA_real_, mean(elevation, na.rm = TRUE)),
+    elevation_sd = sd_if_possible(elevation),
     n_elevation_records = sum(!is.na(elevation)),
     mean_longitude = ifelse(all(is.na(longitude)), NA_real_, mean(longitude, na.rm = TRUE)),
     .groups = "drop"
@@ -575,20 +616,20 @@ converted_species_count <- sum(normalize_ascii(species_codes_in_arbre) %in% spec
 # -----------------------------
 final_tbl <- site_ba |>
   left_join(dbh_site, by = "Site") |>
-  left_join(gaule_site |> select(Site, `Beech Sapling Basal Area`), by = "Site") |>
+  left_join(gaule_site |> select(Site, `Beech Sapling Basal Area`, beech_sapling_basal_area_sd), by = "Site") |>
   left_join(dominant_species |> select(Site, `Top 3 Dominant Species`), by = "Site") |>
-  left_join(latlon_elev |> select(Site, latitude_used_for_sorting, Latitude, Elevation), by = "Site") |>
+  left_join(latlon_elev |> select(Site, latitude_used_for_sorting, Latitude, Elevation, elevation_sd), by = "Site") |>
   left_join(site_conversion_tbl |> select(Site, Site_label), by = "Site") |>
   arrange(latitude_used_for_sorting) |>
   transmute(
     Site = Site_label,
     Latitude,
-    Elevation,
-    `Basal Area` = Basal_Area,
-    `Beech Basal Area` = Beech_Basal_Area,
-    `Mean DBH` = Mean_DBH,
-    `Mean Beech DBH` = Mean_Beech_DBH,
-    `Beech Sapling Basal Area`,
+    Elevation = format_mean_sd(Elevation, elevation_sd, digits = 1),
+    `Basal Area` = format_mean_sd(Basal_Area, basal_area_sd, digits = 1),
+    `Beech Basal Area` = format_mean_sd(Beech_Basal_Area, beech_basal_area_sd, digits = 1),
+    `Mean DBH` = format_mean_sd(Mean_DBH, sd_dbh, digits = 1),
+    `Mean Beech DBH` = format_mean_sd(Mean_Beech_DBH, sd_beech_dbh, digits = 1),
+    `Beech Sapling Basal Area` = format_mean_sd(`Beech Sapling Basal Area`, beech_sapling_basal_area_sd, digits = 1),
     `Top 3 Dominant Species`
   )
 
@@ -596,10 +637,14 @@ final_tbl <- site_ba |>
 # Diagnostics
 # -----------------------------
 diagnostics_tbl <- site_ba |>
+  left_join(dbh_site, by = "Site") |>
   left_join(gaule_site |>
-              select(Site, n_gaule_beech, gaule_radius_values_detected, gaule_subplot_area_ha, beech_sapling_basal_area_by_subplot),
+              select(Site, n_gaule_beech, n_gaule_subplots, `Beech Sapling Basal Area`,
+                     beech_sapling_basal_area_sd, gaule_radius_values_detected,
+                     gaule_subplot_area_ha, beech_sapling_basal_area_by_subplot),
             by = "Site") |>
-  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting, Latitude, Elevation), by = "Site") |>
+  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting, Latitude,
+                                  Elevation, elevation_sd), by = "Site") |>
   left_join(dominant_species |>
               select(Site, top_3_species_original_codes, top_3_species_converted_codes, top_3_species_basal_area_values),
             by = "Site") |>
@@ -617,7 +662,18 @@ diagnostics_tbl <- site_ba |>
     original_Site_code = Site,
     converted_Site_label = Site_label,
     Latitude,
-    Elevation,
+    elevation_mean = Elevation,
+    elevation_sd,
+    basal_area_mean = Basal_Area,
+    basal_area_sd,
+    beech_basal_area_mean = Beech_Basal_Area,
+    beech_basal_area_sd,
+    mean_dbh = Mean_DBH,
+    sd_dbh,
+    mean_beech_dbh = Mean_Beech_DBH,
+    sd_beech_dbh,
+    beech_sapling_basal_area_mean = `Beech Sapling Basal Area`,
+    beech_sapling_basal_area_sd,
     top_3_species_original_codes,
     top_3_species_converted_codes,
     top_3_species_basal_area_values,
@@ -629,7 +685,10 @@ diagnostics_tbl <- site_ba |>
     n_prism_points_detected,
     n_included_arbre_total,
     n_included_arbre_beech,
+    n_dbh,
+    n_beech_dbh,
     n_gaule_beech,
+    n_gaule_subplots,
     gaule_radius_values_detected,
     gaule_subplot_area_ha,
     beech_sapling_basal_area_by_subplot,
@@ -717,16 +776,27 @@ message(" - missing site codes from site_lookup: ", collapse_or_none(missing_sit
 message(" - number of species codes converted: ", converted_species_count)
 message(" - missing species codes from species_lookup: ", collapse_or_none(missing_species_codes))
 message(" - top 3 dominant species per site: ", paste0(top_species_summary$Site, " = ", top_species_summary$top_3_species_converted_codes, collapse = " | "))
+message(" - columns now including SD: Elevation; Basal Area; Beech Basal Area; Mean DBH; Mean Beech DBH; Beech Sapling Basal Area")
+message(" - SD display convention: mean (SD); SD is shown as NA when fewer than 2 non-missing observations are available.")
+message(" - sites where elevation SD could not be calculated because n < 2: ", collapse_site_labels(latlon_elev$Site[latlon_elev$n_elevation_records < 2], site_conversion_tbl))
+message(" - sites where basal area SD could not be calculated because n < 2 prism points: ", collapse_site_labels(site_ba$Site[site_ba$n_prism_points_detected < 2], site_conversion_tbl))
+message(" - sites where beech basal area SD could not be calculated because n < 2 prism points: ", collapse_site_labels(site_ba$Site[site_ba$n_prism_points_detected < 2], site_conversion_tbl))
+message(" - sites where DBH SD could not be calculated because n < 2 included trees: ", collapse_site_labels(dbh_site$Site[dbh_site$n_dbh < 2], site_conversion_tbl))
+message(" - sites where beech DBH SD could not be calculated because n < 2 included beech trees: ", collapse_site_labels(dbh_site$Site[dbh_site$n_beech_dbh < 2], site_conversion_tbl))
+message(" - sites where beech sapling basal area SD could not be calculated because n < 2 gaule subplots: ", collapse_site_labels(gaule_site$Site[gaule_site$n_gaule_subplots < 2], site_conversion_tbl))
 message(" - Latitude range: ", range_or_na(final_tbl$Latitude, digits = 5))
-message(" - Elevation range: ", range_or_na(final_tbl$Elevation))
-message(" - Basal Area range: ", range_or_na(final_tbl$`Basal Area`))
-message(" - Beech Basal Area range: ", range_or_na(final_tbl$`Beech Basal Area`))
-message(" - Beech Sapling Basal Area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
+message(" - Elevation mean range: ", range_or_na(diagnostics_tbl$elevation_mean))
+message(" - Basal Area mean range: ", range_or_na(diagnostics_tbl$basal_area_mean))
+message(" - Basal Area SD range: ", range_or_na(diagnostics_tbl$basal_area_sd))
+message(" - Beech Basal Area mean range: ", range_or_na(diagnostics_tbl$beech_basal_area_mean))
+message(" - Beech Basal Area SD range: ", range_or_na(diagnostics_tbl$beech_basal_area_sd))
+message(" - Beech Sapling Basal Area mean range: ", range_or_na(diagnostics_tbl$beech_sapling_basal_area_mean))
+message(" - Beech Sapling Basal Area SD range: ", range_or_na(diagnostics_tbl$beech_sapling_basal_area_sd))
 message(" - prism_baf used = ", prism_baf)
 message(" - R_utilise values detected in gaule = ", ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")))
 message(" - Any missing/invalid R_utilise in beech gaule rows = No (script would stop otherwise)")
-message(" - Sites with Beech Basal Area = 0: ", {s <- final_tbl$Site[!is.na(final_tbl$`Beech Basal Area`) & final_tbl$`Beech Basal Area` == 0]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
-message(" - Sites with Mean Beech DBH = NA: ", {s <- final_tbl$Site[is.na(final_tbl$`Mean Beech DBH`)]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
+message(" - Sites with Beech Basal Area mean = 0: ", {s <- diagnostics_tbl$converted_Site_label[!is.na(diagnostics_tbl$beech_basal_area_mean) & diagnostics_tbl$beech_basal_area_mean == 0]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
+message(" - Sites with Mean Beech DBH = NA: ", {s <- diagnostics_tbl$converted_Site_label[is.na(diagnostics_tbl$mean_beech_dbh)]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
 
 message("\nSaved:")
 message(" - ", csv_path)

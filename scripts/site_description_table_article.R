@@ -1,7 +1,9 @@
 #!/usr/bin/env Rscript
 
 required_packages <- c("dplyr", "readxl", "openxlsx", "stringr", "tidyr", "purrr")
-optional_word_packages <- c("flextable", "officer")
+optional_flextable_package <- "flextable"
+required_docx_package <- "officer"
+word_export_packages <- c(optional_flextable_package, required_docx_package)
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
@@ -11,8 +13,37 @@ if (length(missing_packages) > 0) {
   )
 }
 
-word_packages_available <- all(vapply(optional_word_packages, requireNamespace, logical(1), quietly = TRUE))
-missing_word_packages <- optional_word_packages[!vapply(optional_word_packages, requireNamespace, logical(1), quietly = TRUE)]
+try_install_packages <- function(packages, purpose) {
+  missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) == 0) return(invisible(TRUE))
+  
+  message(
+    "Missing package(s) for ", purpose, ": ",
+    paste(missing, collapse = ", "),
+    ". Attempting to install from CRAN."
+  )
+  
+  repos <- getOption("repos")
+  if (is.null(repos) || length(repos) == 0 || identical(unname(repos["CRAN"]), "@CRAN@")) {
+    repos <- c(CRAN = "https://cloud.r-project.org")
+  }
+  
+  tryCatch(
+    {
+      install.packages(missing, repos = repos, dependencies = c("Depends", "Imports", "LinkingTo"))
+      invisible(TRUE)
+    },
+    error = function(e) {
+      message("Automatic installation failed for ", purpose, ": ", conditionMessage(e))
+      invisible(FALSE)
+    }
+  )
+}
+
+try_install_packages(word_export_packages, "formatted Word export")
+flextable_available <- requireNamespace(optional_flextable_package, quietly = TRUE)
+officer_available <- requireNamespace(required_docx_package, quietly = TRUE)
+missing_word_packages <- word_export_packages[!vapply(word_export_packages, requireNamespace, logical(1), quietly = TRUE)]
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -506,130 +537,3 @@ final_tbl <- site_ba |>
     `Beech Sapling Basal Area`,
     `Top 3 Dominant Species`
   )
-
-# -----------------------------
-# Diagnostics
-# -----------------------------
-diagnostics_tbl <- site_ba |>
-  left_join(gaule_site |>
-              select(Site, n_gaule_beech, gaule_radius_values_detected, gaule_subplot_area_ha, beech_sapling_basal_area_by_subplot),
-            by = "Site") |>
-  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting, Latitude, Elevation), by = "Site") |>
-  left_join(dominant_species |>
-              select(Site, top_3_species_original_codes, top_3_species_converted_codes, top_3_species_basal_area_values),
-            by = "Site") |>
-  left_join(site_conversion_tbl, by = "Site") |>
-  mutate(
-    species_codes_missing_from_species_lookup = collapse_or_none(missing_species_codes),
-    site_lookup_used = site_lookup_used,
-    species_lookup_used = species_lookup_used,
-    prism_baf_used = prism_baf,
-    R_utilise_values_detected_for_gaule = ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")),
-    basal_area_method_used = "Prism BA from included trees (Valeur_prisme==2): per-point n*prism_baf then averaged across points",
-    gaule_method_used = "Fixed-radius subplot BA from R_utilise and DBH: subplot BA m²/ha then averaged across points"
-  ) |>
-  transmute(
-    original_Site_code = Site,
-    converted_Site_label = Site_label,
-    Latitude,
-    Elevation,
-    top_3_species_original_codes,
-    top_3_species_converted_codes,
-    top_3_species_basal_area_values,
-    species_codes_missing_from_species_lookup,
-    site_lookup_used,
-    species_lookup_used,
-    prism_baf_used,
-    R_utilise_values_detected_for_gaule,
-    n_prism_points_detected,
-    n_included_arbre_total,
-    n_included_arbre_beech,
-    n_gaule_beech,
-    gaule_radius_values_detected,
-    gaule_subplot_area_ha,
-    beech_sapling_basal_area_by_subplot,
-    n_elevation_records,
-    latitude_used_for_sorting,
-    basal_area_method_used,
-    gaule_method_used
-  ) |>
-  arrange(latitude_used_for_sorting)
-
-# -----------------------------
-# Save outputs
-# -----------------------------
-csv_path <- file.path(out_dir, "site_description_table_article.csv")
-xlsx_path <- file.path(out_dir, "site_description_table_article.xlsx")
-diag_path <- file.path(out_dir, "site_description_table_article_diagnostics.csv")
-docx_path <- file.path(out_dir, "site_description_table_article_formatted.docx")
-
-write.csv(final_tbl, csv_path, row.names = FALSE, na = "")
-openxlsx::write.xlsx(final_tbl, xlsx_path, overwrite = TRUE)
-write.csv(diagnostics_tbl, diag_path, row.names = FALSE, na = "")
-
-if (word_packages_available) {
-  formatted_table <- flextable::flextable(final_tbl) |>
-    flextable::theme_booktabs() |>
-    flextable::autofit() |>
-    flextable::align(align = "center", part = "all") |>
-    flextable::align(j = "Top 3 Dominant Species", align = "left", part = "body") |>
-    flextable::bold(part = "header")
-  
-  flextable::save_as_docx(
-    `Site description table` = formatted_table,
-    path = docx_path
-  )
-} else {
-  message(
-    "Skipping formatted Word table because optional package(s) are not installed: ",
-    paste(missing_word_packages, collapse = ", "),
-    ". Install flextable and officer to create: ",
-    docx_path
-  )
-}
-
-# -----------------------------
-# Console summary
-# -----------------------------
-message("\nFinal table:")
-print(final_tbl, n = Inf, width = Inf)
-
-message("\nTop 3 dominant species per site:")
-top_species_summary <- dominant_species |>
-  left_join(site_conversion_tbl |> select(Site, Site_label), by = "Site") |>
-  arrange(match(Site_label, final_tbl$Site)) |>
-  transmute(Site = Site_label, top_3_species_converted_codes, top_3_species_basal_area_values)
-print(top_species_summary, n = Inf, width = Inf)
-
-message("\nSummary:")
-message(" - site_lookup sheet detected: ", ifelse(site_lookup_used, site_lookup_sheet, "No"))
-message(" - species_lookup sheet detected: ", ifelse(species_lookup_used, species_lookup_sheet, "No"))
-message(" - number of site codes converted: ", converted_site_count)
-message(" - missing site codes from site_lookup: ", collapse_or_none(missing_site_codes))
-message(" - number of species codes converted: ", converted_species_count)
-message(" - missing species codes from species_lookup: ", collapse_or_none(missing_species_codes))
-message(" - top 3 dominant species per site: ", paste0(top_species_summary$Site, " = ", top_species_summary$top_3_species_converted_codes, collapse = " | "))
-message(" - Latitude range: ", range_or_na(final_tbl$Latitude, digits = 5))
-message(" - Elevation range: ", range_or_na(final_tbl$Elevation))
-message(" - Basal Area range: ", range_or_na(final_tbl$`Basal Area`))
-message(" - Beech Basal Area range: ", range_or_na(final_tbl$`Beech Basal Area`))
-message(" - Beech Sapling Basal Area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
-message(" - prism_baf used = ", prism_baf)
-message(" - R_utilise values detected in gaule = ", ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")))
-message(" - Any missing/invalid R_utilise in beech gaule rows = No (script would stop otherwise)")
-message(" - Sites with Beech Basal Area = 0: ", {s <- final_tbl$Site[!is.na(final_tbl$`Beech Basal Area`) & final_tbl$`Beech Basal Area` == 0]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
-message(" - Sites with Mean Beech DBH = NA: ", {s <- final_tbl$Site[is.na(final_tbl$`Mean Beech DBH`)]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
-
-message("\nSaved:")
-message(" - ", csv_path)
-message(" - ", xlsx_path)
-message(" - ", diag_path)
-message(
-  " - ",
-  docx_path,
-  ifelse(
-    word_packages_available,
-    "",
-    paste0(" (skipped: missing ", paste(missing_word_packages, collapse = ", "), ")")
-  )
-)

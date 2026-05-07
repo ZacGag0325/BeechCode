@@ -14,17 +14,6 @@ if (length(missing_packages) > 0) {
 word_packages_available <- all(vapply(optional_word_packages, requireNamespace, logical(1), quietly = TRUE))
 missing_word_packages <- optional_word_packages[!vapply(optional_word_packages, requireNamespace, logical(1), quietly = TRUE)]
 
-if (!word_packages_available) {
-  warning(
-    paste0(
-      "Formatted Word table will be skipped because optional package(s) are not installed: ",
-      paste(missing_word_packages, collapse = ", "),
-      ". CSV, XLSX, and diagnostics outputs will still be created."
-    ),
-    call. = FALSE
-  )
-}
-
 suppressPackageStartupMessages({
   library(dplyr)
   library(readxl)
@@ -145,9 +134,33 @@ read_sheet_safe <- function(sheet_name) {
   read_excel(excel_path, sheet = matched_sheet)
 }
 
+find_preferred_column <- function(df, candidates) {
+  cn <- names(df)
+  cn_norm <- normalize_ascii(cn)
+  candidate_norm <- normalize_ascii(candidates)
+  idx <- match(candidate_norm, cn_norm, nomatch = 0)
+  idx <- idx[idx > 0]
+  if (length(idx) == 0) NA_character_ else cn[idx[1]]
+}
+
 make_lookup <- function(df, from_patterns, to_patterns, lookup_name) {
-  from_col <- pick_column(df, from_patterns, paste0(lookup_name, " original/code"), required = TRUE)
-  to_col <- pick_column(df, to_patterns, paste0(lookup_name, " final/label"), required = TRUE, exclude = from_col)
+  if (identical(lookup_name, "species_lookup")) {
+    from_col <- find_preferred_column(df, c("species_code_fr", "code_fr", "espece_fr", "species_fr"))
+    to_col <- find_preferred_column(df, c("species_code_en", "code_en", "espece_en", "species_en"))
+  } else if (identical(lookup_name, "site_lookup")) {
+    from_col <- find_preferred_column(df, c("site_code", "original_site_code", "site_code_original", "original_site", "old_site_code"))
+    to_col <- find_preferred_column(df, c("site_label", "final_site_label", "site_final", "final_site", "new_site_label"))
+  } else {
+    from_col <- NA_character_
+    to_col <- NA_character_
+  }
+  
+  if (is.na(from_col)) {
+    from_col <- pick_column(df, from_patterns, paste0(lookup_name, " original/code"), required = TRUE)
+  }
+  if (is.na(to_col)) {
+    to_col <- pick_column(df, to_patterns, paste0(lookup_name, " final/label"), required = TRUE, exclude = from_col)
+  }
   if (is.na(from_col) || is.na(to_col)) {
     stop("Could not detect required columns in ", lookup_name, ". Detected columns: ", paste(names(df), collapse = ", "), call. = FALSE)
   }
@@ -303,7 +316,7 @@ species_present_by_site <- arbre_inc |>
   distinct(Site, species_raw)
 
 species_point <- site_points |>
-  inner_join(species_present_by_site, by = "Site") |>
+  inner_join(species_present_by_site, by = "Site", relationship = "many-to-many") |>
   left_join(
     arbre_inc |>
       count(Site, Point_prisme, species_raw, name = "n_included_species"),
@@ -318,26 +331,28 @@ species_site <- species_point |>
   group_by(Site, species_raw) |>
   summarise(avg_species_ba = mean(ba_point, na.rm = TRUE), .groups = "drop")
 
-top_species_by_site <- species_site |>
+top_species_ranked <- species_site |>
   group_by(Site) |>
   arrange(desc(avg_species_ba), species_raw, .by_group = TRUE) |>
   mutate(
+    species_order = row_number(),
     cutoff_ba = if (n() <= 3) min(avg_species_ba, na.rm = TRUE) else avg_species_ba[3],
     tied_at_cutoff = n() > 3 & avg_species_ba == cutoff_ba & sum(avg_species_ba == cutoff_ba, na.rm = TRUE) > 1
   ) |>
-  filter(avg_species_ba >= cutoff_ba) |>
   ungroup() |>
   mutate(species_converted = convert_codes(species_raw, species_lookup))
 
-tie_sites <- top_species_by_site |>
+top_species_by_site <- top_species_ranked |>
+  filter(species_order <= 3)
+
+tie_sites <- top_species_ranked |>
   filter(tied_at_cutoff) |>
   distinct(Site) |>
   pull(Site)
 if (length(tie_sites) > 0) {
-  warning(
-    "Tie detected at the top-3 dominant-species cutoff; all tied species were included for site(s): ",
-    paste(sort(tie_sites), collapse = ", "),
-    call. = FALSE
+  message(
+    "Tie detected at the top-3 dominant-species cutoff. The final table keeps exactly 3 species; tied species were ordered alphabetically for site(s): ",
+    paste(sort(tie_sites), collapse = ", ")
   )
 }
 
@@ -565,10 +580,11 @@ if (word_packages_available) {
     path = docx_path
   )
 } else {
-  warning(
-    "Skipping formatted Word table. Install flextable and officer to create: ",
-    docx_path,
-    call. = FALSE
+  message(
+    "Skipping formatted Word table because optional package(s) are not installed: ",
+    paste(missing_word_packages, collapse = ", "),
+    ". Install flextable and officer to create: ",
+    docx_path
   )
 }
 
@@ -608,4 +624,12 @@ message("\nSaved:")
 message(" - ", csv_path)
 message(" - ", xlsx_path)
 message(" - ", diag_path)
-message(" - ", docx_path, ifelse(word_packages_available, "", " (skipped: install flextable and officer)"))
+message(
+  " - ",
+  docx_path,
+  ifelse(
+    word_packages_available,
+    "",
+    paste0(" (skipped: missing ", paste(missing_word_packages, collapse = ", "), ")")
+  )
+)

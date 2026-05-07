@@ -2,8 +2,7 @@
 
 required_packages <- c("dplyr", "readxl", "openxlsx", "stringr", "tidyr", "purrr")
 optional_flextable_package <- "flextable"
-required_docx_package <- "officer"
-word_export_packages <- c(optional_flextable_package, required_docx_package)
+optional_officer_package <- "officer"
 
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages) > 0) {
@@ -13,37 +12,8 @@ if (length(missing_packages) > 0) {
   )
 }
 
-try_install_packages <- function(packages, purpose) {
-  missing <- packages[!vapply(packages, requireNamespace, logical(1), quietly = TRUE)]
-  if (length(missing) == 0) return(invisible(TRUE))
-  
-  message(
-    "Missing package(s) for ", purpose, ": ",
-    paste(missing, collapse = ", "),
-    ". Attempting to install from CRAN."
-  )
-  
-  repos <- getOption("repos")
-  if (is.null(repos) || length(repos) == 0 || identical(unname(repos["CRAN"]), "@CRAN@")) {
-    repos <- c(CRAN = "https://cloud.r-project.org")
-  }
-  
-  tryCatch(
-    {
-      install.packages(missing, repos = repos, dependencies = c("Depends", "Imports", "LinkingTo"))
-      invisible(TRUE)
-    },
-    error = function(e) {
-      message("Automatic installation failed for ", purpose, ": ", conditionMessage(e))
-      invisible(FALSE)
-    }
-  )
-}
-
-try_install_packages(word_export_packages, "formatted Word export")
 flextable_available <- requireNamespace(optional_flextable_package, quietly = TRUE)
-officer_available <- requireNamespace(required_docx_package, quietly = TRUE)
-missing_word_packages <- word_export_packages[!vapply(word_export_packages, requireNamespace, logical(1), quietly = TRUE)]
+officer_available <- requireNamespace(optional_officer_package, quietly = TRUE)
 
 suppressPackageStartupMessages({
   library(dplyr)
@@ -214,6 +184,90 @@ convert_codes <- function(codes, lookup) {
   idx <- match(normalize_ascii(code_chr), lookup$lookup_key)
   converted <- lookup$converted_code[idx]
   ifelse(is.na(converted), code_chr, converted)
+}
+
+xml_escape <- function(x) {
+  x <- ifelse(is.na(x), "", as.character(x))
+  x <- str_replace_all(x, "&", "&amp;")
+  x <- str_replace_all(x, "<", "&lt;")
+  x <- str_replace_all(x, ">", "&gt;")
+  x <- str_replace_all(x, '"', "&quot;")
+  x <- str_replace_all(x, "'", "&apos;")
+  x
+}
+
+word_cell_xml <- function(value, bold = FALSE) {
+  text <- xml_escape(value)
+  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
+  paste0(
+    "<w:tc>",
+    "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>",
+    "<w:p><w:r>", bold_xml, "<w:t>", text, "</w:t></w:r></w:p>",
+    "</w:tc>"
+  )
+}
+
+write_basic_docx_table <- function(df, path, title = "Site description table") {
+  tmp_dir <- tempfile("site_description_docx_")
+  dir.create(file.path(tmp_dir, "_rels"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(tmp_dir, "word", "_rels"), recursive = TRUE, showWarnings = FALSE)
+  
+  rows <- apply(df, 1, function(row) {
+    paste0("<w:tr>", paste(vapply(row, word_cell_xml, character(1)), collapse = ""), "</w:tr>")
+  })
+  header <- paste0("<w:tr>", paste(vapply(names(df), word_cell_xml, character(1), bold = TRUE), collapse = ""), "</w:tr>")
+  
+  document_xml <- paste0(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+    '<w:body>',
+    '<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>', xml_escape(title), '</w:t></w:r></w:p>',
+    '<w:tbl>',
+    '<w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/>',
+    '<w:tblBorders>',
+    '<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '</w:tblBorders></w:tblPr>',
+    header,
+    paste(rows, collapse = ""),
+    '</w:tbl>',
+    '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/>',
+    '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
+    '</w:body></w:document>'
+  )
+  
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+    '<Default Extension="xml" ContentType="application/xml"/>',
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
+    '</Types>'
+  ), file.path(tmp_dir, "[Content_Types].xml"), useBytes = TRUE)
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>',
+    '</Relationships>'
+  ), file.path(tmp_dir, "_rels", ".rels"), useBytes = TRUE)
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+  ), file.path(tmp_dir, "word", "_rels", "document.xml.rels"), useBytes = TRUE)
+  writeLines(document_xml, file.path(tmp_dir, "word", "document.xml"), useBytes = TRUE)
+  
+  old_wd <- getwd()
+  on.exit(setwd(old_wd), add = TRUE)
+  setwd(tmp_dir)
+  if (file.exists(path)) unlink(path)
+  utils::zip(zipfile = path, files = list.files(tmp_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE), flags = "-q")
+  if (!file.exists(path)) stop("Failed to create Word document at: ", path, call. = FALSE)
+  invisible(path)
 }
 
 beech_pattern <- "fagus\\s*grandifolia|^heg$|hetre|h[êe]tre|american\\s*beech"
@@ -537,3 +591,145 @@ final_tbl <- site_ba |>
     `Beech Sapling Basal Area`,
     `Top 3 Dominant Species`
   )
+
+# -----------------------------
+# Diagnostics
+# -----------------------------
+diagnostics_tbl <- site_ba |>
+  left_join(gaule_site |>
+              select(Site, n_gaule_beech, gaule_radius_values_detected, gaule_subplot_area_ha, beech_sapling_basal_area_by_subplot),
+            by = "Site") |>
+  left_join(latlon_elev |> select(Site, n_elevation_records, latitude_used_for_sorting, Latitude, Elevation), by = "Site") |>
+  left_join(dominant_species |>
+              select(Site, top_3_species_original_codes, top_3_species_converted_codes, top_3_species_basal_area_values),
+            by = "Site") |>
+  left_join(site_conversion_tbl, by = "Site") |>
+  mutate(
+    species_codes_missing_from_species_lookup = collapse_or_none(missing_species_codes),
+    site_lookup_used = site_lookup_used,
+    species_lookup_used = species_lookup_used,
+    prism_baf_used = prism_baf,
+    R_utilise_values_detected_for_gaule = ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")),
+    basal_area_method_used = "Prism BA from included trees (Valeur_prisme==2): per-point n*prism_baf then averaged across points",
+    gaule_method_used = "Fixed-radius subplot BA from R_utilise and DBH: subplot BA m²/ha then averaged across points"
+  ) |>
+  transmute(
+    original_Site_code = Site,
+    converted_Site_label = Site_label,
+    Latitude,
+    Elevation,
+    top_3_species_original_codes,
+    top_3_species_converted_codes,
+    top_3_species_basal_area_values,
+    species_codes_missing_from_species_lookup,
+    site_lookup_used,
+    species_lookup_used,
+    prism_baf_used,
+    R_utilise_values_detected_for_gaule,
+    n_prism_points_detected,
+    n_included_arbre_total,
+    n_included_arbre_beech,
+    n_gaule_beech,
+    gaule_radius_values_detected,
+    gaule_subplot_area_ha,
+    beech_sapling_basal_area_by_subplot,
+    n_elevation_records,
+    latitude_used_for_sorting,
+    basal_area_method_used,
+    gaule_method_used
+  ) |>
+  arrange(latitude_used_for_sorting)
+
+# -----------------------------
+# Save outputs
+# -----------------------------
+csv_path <- file.path(out_dir, "site_description_table_article.csv")
+xlsx_path <- file.path(out_dir, "site_description_table_article.xlsx")
+diag_path <- file.path(out_dir, "site_description_table_article_diagnostics.csv")
+docx_path <- file.path(out_dir, "site_description_table_article_formatted.docx")
+
+write.csv(final_tbl, csv_path, row.names = FALSE, na = "")
+openxlsx::write.xlsx(final_tbl, xlsx_path, overwrite = TRUE)
+write.csv(diagnostics_tbl, diag_path, row.names = FALSE, na = "")
+
+docx_status <- tryCatch(
+  {
+    if (officer_available && flextable_available) {
+      formatted_table <- flextable::flextable(final_tbl) |>
+        flextable::theme_booktabs() |>
+        flextable::autofit() |>
+        flextable::align(align = "center", part = "all") |>
+        flextable::align(j = "Top 3 Dominant Species", align = "left", part = "body") |>
+        flextable::bold(part = "header")
+      
+      flextable::save_as_docx(
+        `Site description table` = formatted_table,
+        path = docx_path
+      )
+      "created with flextable"
+    } else if (officer_available) {
+      message(
+        "flextable is not available/loadable, so the script is creating a Word table with officer instead. ",
+        "If you want flextable styling, restart R and run install.packages(\"flextable\") once before sourcing this script."
+      )
+      doc <- officer::read_docx()
+      doc <- officer::body_add_par(doc, "Site description table", style = "heading 1")
+      doc <- officer::body_add_table(doc, value = as.data.frame(final_tbl), style = "table_template")
+      print(doc, target = docx_path)
+      "created with officer fallback"
+    } else {
+      message(
+        "Neither flextable nor officer is loadable, so the script is creating a basic Word-compatible .docx file without extra packages."
+      )
+      write_basic_docx_table(final_tbl, docx_path, title = "Site description table")
+      "created with built-in docx fallback"
+    }
+  },
+  error = function(e) {
+    message(
+      "Package-based Word export failed: ",
+      conditionMessage(e),
+      ". Creating a basic Word-compatible .docx file without extra packages instead."
+    )
+    write_basic_docx_table(final_tbl, docx_path, title = "Site description table")
+    "created with built-in docx fallback after package export failed"
+  }
+)
+
+# -----------------------------
+# Console summary
+# -----------------------------
+message("\nFinal table:")
+print(final_tbl, n = Inf, width = Inf)
+
+message("\nTop 3 dominant species per site:")
+top_species_summary <- dominant_species |>
+  left_join(site_conversion_tbl |> select(Site, Site_label), by = "Site") |>
+  arrange(match(Site_label, final_tbl$Site)) |>
+  transmute(Site = Site_label, top_3_species_converted_codes, top_3_species_basal_area_values)
+print(top_species_summary, n = Inf, width = Inf)
+
+message("\nSummary:")
+message(" - site_lookup sheet detected: ", ifelse(site_lookup_used, site_lookup_sheet, "No"))
+message(" - species_lookup sheet detected: ", ifelse(species_lookup_used, species_lookup_sheet, "No"))
+message(" - number of site codes converted: ", converted_site_count)
+message(" - missing site codes from site_lookup: ", collapse_or_none(missing_site_codes))
+message(" - number of species codes converted: ", converted_species_count)
+message(" - missing species codes from species_lookup: ", collapse_or_none(missing_species_codes))
+message(" - top 3 dominant species per site: ", paste0(top_species_summary$Site, " = ", top_species_summary$top_3_species_converted_codes, collapse = " | "))
+message(" - Latitude range: ", range_or_na(final_tbl$Latitude, digits = 5))
+message(" - Elevation range: ", range_or_na(final_tbl$Elevation))
+message(" - Basal Area range: ", range_or_na(final_tbl$`Basal Area`))
+message(" - Beech Basal Area range: ", range_or_na(final_tbl$`Beech Basal Area`))
+message(" - Beech Sapling Basal Area range: ", range_or_na(final_tbl$`Beech Sapling Basal Area`))
+message(" - prism_baf used = ", prism_baf)
+message(" - R_utilise values detected in gaule = ", ifelse(length(r_values) == 0, "None", paste(round(r_values, 4), collapse = ", ")))
+message(" - Any missing/invalid R_utilise in beech gaule rows = No (script would stop otherwise)")
+message(" - Sites with Beech Basal Area = 0: ", {s <- final_tbl$Site[!is.na(final_tbl$`Beech Basal Area`) & final_tbl$`Beech Basal Area` == 0]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
+message(" - Sites with Mean Beech DBH = NA: ", {s <- final_tbl$Site[is.na(final_tbl$`Mean Beech DBH`)]; if (length(s) == 0) "None" else paste(s, collapse = ", ")})
+
+message("\nSaved:")
+message(" - ", csv_path)
+message(" - ", xlsx_path)
+message(" - ", diag_path)
+message(" - ", docx_path, " (", docx_status, ")")

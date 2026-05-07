@@ -654,24 +654,109 @@ write_article_clonality_summary_xlsx <- function(summary_tbl, path) {
   openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
 }
 
-check_word_export_packages <- function() {
-  required_packages <- c("officer", "flextable")
-  missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
-  if (length(missing_packages) > 0) {
-    install_cmd <- paste0(
-      "install.packages(c(",
-      paste(sprintf('"%s"', missing_packages), collapse = ", "),
-      "))"
-    )
-    message(
-      "[01_clonality] Skipping Word (.docx) export because the following R package(s) are missing: ",
-      paste(missing_packages, collapse = ", "),
-      ". To enable Word export, run: ",
-      install_cmd
-    )
-    return(FALSE)
-  }
-  TRUE
+word_export_package_status <- function() {
+  list(
+    officer_available = requireNamespace("officer", quietly = TRUE),
+    flextable_available = requireNamespace("flextable", quietly = TRUE)
+  )
+}
+
+xml_escape_word <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- gsub("&", "&amp;", x, fixed = TRUE)
+  x <- gsub("<", "&lt;", x, fixed = TRUE)
+  x <- gsub(">", "&gt;", x, fixed = TRUE)
+  x <- gsub('"', "&quot;", x, fixed = TRUE)
+  x <- gsub("'", "&apos;", x, fixed = TRUE)
+  x
+}
+
+word_cell_xml <- function(value, bold = FALSE) {
+  text <- xml_escape_word(value)
+  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
+  paste0(
+    "<w:tc>",
+    "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>",
+    "<w:p><w:r>", bold_xml, "<w:t>", text, "</w:t></w:r></w:p>",
+    "</w:tc>"
+  )
+}
+
+word_paragraph_xml <- function(value, bold = FALSE) {
+  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
+  paste0("<w:p><w:r>", bold_xml, "<w:t>", xml_escape_word(value), "</w:t></w:r></w:p>")
+}
+
+write_basic_docx_table <- function(df, path, title, note = NULL) {
+  tmp_dir <- tempfile("clonality_docx_")
+  dir.create(file.path(tmp_dir, "_rels"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(tmp_dir, "word", "_rels"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  
+  df <- as.data.frame(lapply(df, as.character), stringsAsFactors = FALSE, check.names = FALSE)
+  rows <- apply(df, 1, function(row) {
+    paste0("<w:tr>", paste(vapply(row, word_cell_xml, character(1)), collapse = ""), "</w:tr>")
+  })
+  header <- paste0("<w:tr>", paste(vapply(names(df), word_cell_xml, character(1), bold = TRUE), collapse = ""), "</w:tr>")
+  note_xml <- if (!is.null(note) && nzchar(note)) word_paragraph_xml(note) else ""
+  
+  document_xml <- paste0(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+    '<w:body>',
+    word_paragraph_xml(title, bold = TRUE),
+    '<w:tbl>',
+    '<w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/>',
+    '<w:tblBorders>',
+    '<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '</w:tblBorders></w:tblPr>',
+    header,
+    paste(rows, collapse = ""),
+    '</w:tbl>',
+    note_xml,
+    '<w:sectPr><w:pgSz w:w="12240" w:h="15840"/>',
+    '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
+    '</w:body></w:document>'
+  )
+  
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+    '<Default Extension="xml" ContentType="application/xml"/>',
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
+    '</Types>'
+  ), file.path(tmp_dir, "[Content_Types].xml"), useBytes = TRUE)
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>',
+    '</Relationships>'
+  ), file.path(tmp_dir, "_rels", ".rels"), useBytes = TRUE)
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+  ), file.path(tmp_dir, "word", "_rels", "document.xml.rels"), useBytes = TRUE)
+  writeLines(document_xml, file.path(tmp_dir, "word", "document.xml"), useBytes = TRUE)
+  
+  old_wd <- getwd()
+  on.exit(setwd(old_wd), add = TRUE)
+  setwd(tmp_dir)
+  if (file.exists(path)) unlink(path)
+  utils::zip(
+    zipfile = path,
+    files = list.files(tmp_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE),
+    flags = "-q"
+  )
+  if (!file.exists(path)) stop("Failed to create Word document at: ", path, call. = FALSE)
+  invisible(path)
 }
 
 build_article_clonality_word_table <- function(summary_tbl) {
@@ -687,32 +772,68 @@ build_article_clonality_word_table <- function(summary_tbl) {
 }
 
 write_article_clonality_summary_docx <- function(summary_tbl, path) {
-  if (!check_word_export_packages()) {
-    return(NA_character_)
-  }
-  
   word_tbl <- build_article_clonality_word_table(summary_tbl)
   table_title <- "Table X. Clonal structure summary by site."
   table_note <- "N = number of individuals analyzed; MLG = number of multilocus genotypes; MLL = number of multilocus lineages after Bruvo-distance clustering; R_MLG and R_MLL represent clonal richness, calculated as (G − 1)/(N − 1)."
+  pkg_status <- word_export_package_status()
   
-  ft <- flextable::flextable(word_tbl)
-  ft <- flextable::theme_booktabs(ft)
-  ft <- flextable::bold(ft, part = "header")
-  ft <- flextable::align(ft, align = "center", part = "all")
-  ft <- flextable::align(ft, j = "Site", align = "left", part = "body")
-  ft <- flextable::fontsize(ft, size = 10, part = "all")
-  ft <- flextable::autofit(ft)
-  
-  doc <- officer::read_docx()
-  doc <- officer::body_add_par(doc, table_title, style = "Normal")
-  doc <- officer::body_add_flextable(doc, ft)
-  doc <- officer::body_add_par(doc, table_note, style = "Normal")
-  print(doc, target = path)
+  docx_status <- tryCatch(
+    {
+      if (pkg_status$officer_available && pkg_status$flextable_available) {
+        ft <- flextable::flextable(word_tbl) |>
+          flextable::theme_booktabs() |>
+          flextable::autofit() |>
+          flextable::align(align = "center", part = "all") |>
+          flextable::align(j = "Site", align = "left", part = "body") |>
+          flextable::bold(part = "header")
+        
+        doc <- officer::read_docx()
+        doc <- officer::body_add_par(doc, table_title, style = "heading 1")
+        doc <- officer::body_add_flextable(doc, ft)
+        doc <- officer::body_add_par(doc, table_note, style = "Normal")
+        print(doc, target = path)
+        "created with flextable"
+      } else if (pkg_status$officer_available) {
+        message(
+          "[01_clonality] flextable is not available/loadable, so the script is creating the Word table with officer instead. ",
+          "If you want flextable styling, restart R and run install.packages(\"flextable\") once before sourcing this script."
+        )
+        doc <- officer::read_docx()
+        doc <- officer::body_add_par(doc, table_title, style = "heading 1")
+        doc <- officer::body_add_table(doc, value = as.data.frame(word_tbl), style = "table_template")
+        doc <- officer::body_add_par(doc, table_note, style = "Normal")
+        print(doc, target = path)
+        "created with officer fallback"
+      } else {
+        message(
+          "[01_clonality] Neither flextable nor officer is loadable, so the script is creating a basic Word-compatible .docx file without extra packages. ",
+          "For package-based Word export, run install.packages(c(\"officer\", \"flextable\"))."
+        )
+        write_basic_docx_table(word_tbl, path, title = table_title, note = table_note)
+        "created with built-in docx fallback"
+      }
+    },
+    error = function(e) {
+      message(
+        "[01_clonality] Package-based Word export failed: ",
+        conditionMessage(e),
+        ". Creating a basic Word-compatible .docx file without extra packages instead."
+      )
+      write_basic_docx_table(word_tbl, path, title = table_title, note = table_note)
+      "created with built-in docx fallback after package export failed"
+    }
+  )
   
   if (!file.exists(path)) {
-    stop("[01_clonality] Word clonality summary table was not created: ", path)
+    stop(
+      "[01_clonality] Word clonality summary table was not created: ",
+      path,
+      ". If package-based export is needed, install packages with install.packages(c(\"officer\", \"flextable\")).",
+      call. = FALSE
+    )
   }
   
+  message("[01_clonality] Saved Word clonality summary table: ", path, " (", docx_status, ")")
   invisible(path)
 }
 

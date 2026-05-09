@@ -671,11 +671,11 @@ compute_mlg_mll_from_gi <- function(gobj, threshold = BRUVO_MLL_THRESHOLD, algor
   )
 }
 
-add_site_labels_for_clonality <- function(assignments_df, df_ids_tbl) {
+add_site_labels_for_clonality <- function(assignments_df, df_ids_tbl, gobj) {
   if (!all(c("Individual", "Site") %in% names(assignments_df))) {
     stop("[hwe_sensitivity] Internal clonality assignments are missing Individual or Site columns.")
   }
-  aligned_ids <- align_df_ids_to_genind(gi, df_ids_tbl, context = "[hwe_sensitivity] clonality metadata")
+  aligned_ids <- align_df_ids_to_genind(gobj, df_ids_tbl, context = "[hwe_sensitivity] clonality metadata")
   meta_tbl <- data.frame(
     Individual = aligned_ids$ind_id,
     Site = aligned_ids$Site,
@@ -698,6 +698,16 @@ add_site_labels_for_clonality <- function(assignments_df, df_ids_tbl) {
   out$Site <- ifelse(is.na(out$Site) | !nzchar(out$Site), as.character(assignments_df$Site), as.character(out$Site))
   out$Site_label <- ifelse(is.na(out$Site_label) | !nzchar(as.character(out$Site_label)), out$Site, as.character(out$Site_label))
   out$Site_order <- suppressWarnings(as.numeric(out$Site_order))
+  out <- out %>%
+    distinct(Individual, .keep_all = TRUE)
+  
+  if (any(is.na(out$Site) | !nzchar(as.character(out$Site)))) {
+    stop("[hwe_sensitivity] Clonality individual table contains missing Site values.")
+  }
+  if (nrow(out) != nrow(assignments_df)) {
+    stop("[hwe_sensitivity] Clonality individual table must contain exactly one row per retained individual.")
+  }
+  
   out
 }
 
@@ -721,8 +731,32 @@ make_repeated_group_signature <- function(repeated_df, clone_col) {
 }
 
 summarise_clonality_by_site <- function(assignments_df, dataset_label) {
+  required_cols <- c("Individual", "Site", "MLG", "MLL")
+  if (!all(required_cols %in% names(assignments_df))) {
+    stop("[hwe_sensitivity] Clonality site summary requires individual-level columns: ", paste(required_cols, collapse = ", "))
+  }
+  if (anyDuplicated(assignments_df$Individual)) {
+    dup_ids <- unique(as.character(assignments_df$Individual[duplicated(assignments_df$Individual)]))
+    stop("[hwe_sensitivity] Clonality assignments must have one row per retained individual. Duplicates: ", paste(head(dup_ids, 10), collapse = ", "))
+  }
+  if (any(is.na(assignments_df$Site) | !nzchar(as.character(assignments_df$Site)))) {
+    stop("[hwe_sensitivity] Cannot summarise clonality by site because at least one individual has a missing Site.")
+  }
+  
+  site_meta <- assignments_df %>%
+    group_by(Site) %>%
+    summarise(
+      Site_label = dplyr::first(na.omit(as.character(Site_label))),
+      Site_order = suppressWarnings(min(as.numeric(Site_order), na.rm = TRUE)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Site_label = ifelse(is.na(Site_label) | !nzchar(Site_label), as.character(Site), Site_label),
+      Site_order = ifelse(is.infinite(Site_order), NA_real_, Site_order)
+    )
+  
   assignments_df %>%
-    group_by(Site, Site_label, Site_order) %>%
+    group_by(Site) %>%
     summarise(
       Dataset = dataset_label,
       N = dplyr::n(),
@@ -732,6 +766,7 @@ summarise_clonality_by_site <- function(assignments_df, dataset_label) {
       repeated_MLL_groups = sum(table(MLL) > 1),
       .groups = "drop"
     ) %>%
+    left_join(site_meta, by = "Site") %>%
     mutate(
       R_MLG = calc_clonal_richness(N, MLG),
       R_MLL = calc_clonal_richness(N, MLL)
@@ -773,10 +808,10 @@ build_clonality_sensitivity <- function(full_gobj, reduced_gobj, df_ids_tbl) {
   message("[hwe_sensitivity] Bruvo clustering algorithm: ", BRUVO_ALGORITHM)
   
   full_assign <- compute_mlg_mll_from_gi(full_gobj) %>%
-    add_site_labels_for_clonality(df_ids_tbl) %>%
+    add_site_labels_for_clonality(df_ids_tbl, full_gobj) %>%
     mutate(Dataset = "FULL")
   reduced_assign <- compute_mlg_mll_from_gi(reduced_gobj) %>%
-    add_site_labels_for_clonality(df_ids_tbl) %>%
+    add_site_labels_for_clonality(df_ids_tbl, reduced_gobj) %>%
     mutate(Dataset = "REDUCED")
   
   if (!identical(full_assign$Individual, reduced_assign$Individual)) {
@@ -785,6 +820,7 @@ build_clonality_sensitivity <- function(full_gobj, reduced_gobj, df_ids_tbl) {
   
   full_site <- summarise_clonality_by_site(full_assign, "FULL")
   reduced_site <- summarise_clonality_by_site(reduced_assign, "REDUCED")
+  unique_sites <- sort(unique(c(as.character(full_assign$Site), as.character(reduced_assign$Site))))
   
   comparison <- full_site %>%
     select(Site, Site_label, Site_order, N_full = N, MLG_full = MLG, R_MLG_full = R_MLG, MLL_full = MLL, R_MLL_full = R_MLL) %>%
@@ -825,6 +861,27 @@ build_clonality_sensitivity <- function(full_gobj, reduced_gobj, df_ids_tbl) {
       delta_R_MLL,
       interpretation
     )
+  
+  if (nrow(comparison) > length(unique_sites)) {
+    stop(
+      "[hwe_sensitivity] Final clonality comparison has more rows (", nrow(comparison),
+      ") than the number of unique sites (", length(unique_sites), "). Do not group by individuals, MLGs, MLLs, row names, column names, or pairwise comparisons."
+    )
+  }
+  if (nrow(comparison) != length(unique_sites)) {
+    stop(
+      "[hwe_sensitivity] Final clonality comparison must have exactly one row per site, but has ",
+      nrow(comparison), " rows for ", length(unique_sites), " unique sites."
+    )
+  }
+  duplicate_sites <- comparison$Site[duplicated(comparison$Site)]
+  if (length(duplicate_sites) > 0) {
+    stop("[hwe_sensitivity] Final clonality comparison contains duplicated site rows: ", paste(unique(duplicate_sites), collapse = ", "))
+  }
+  
+  cat("\n[hwe_sensitivity] Final site-level clonality comparison table:\n")
+  print(comparison)
+  cat("[hwe_sensitivity] Final site-level clonality comparison row count: ", nrow(comparison), "\n", sep = "")
   
   full_mll_repeated <- make_repeated_clone_table(full_assign, "MLL")
   reduced_mll_repeated <- make_repeated_clone_table(reduced_assign, "MLL")
@@ -1125,7 +1182,7 @@ message("[hwe_sensitivity] Saved: ", file.path(TABLES_DIR, "hwe_sensitivity_clon
 write_clonality_docx(
   clonality_sensitivity$comparison,
   clonality_sensitivity$overall,
-  file.path(WORD_DIR, "hwe_sensitivity_clonality_comparison.docx")
+  file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.docx")
 )
 write_csv_msg(clonality_sensitivity$overall, file.path(TABLES_DIR, "hwe_sensitivity_clonality_overall_summary.csv"))
 write_csv_msg(clonality_sensitivity$assignments, file.path(TABLES_DIR, "hwe_sensitivity_clonality_individual_assignments_long.csv"))
@@ -1246,7 +1303,7 @@ cat("Main clonality conclusion robust? ", if (!overall_changed && length(meaning
 cat("Primary outputs:\n")
 cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.csv"), "\n", sep = "")
 cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"), "\n", sep = "")
-cat("  - ", file.path(WORD_DIR, "hwe_sensitivity_clonality_comparison.docx"), "\n", sep = "")
+cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.docx"), "\n", sep = "")
 cat("============================================================\n\n")
 
 message("[hwe_sensitivity] Completed reduced-loci sensitivity branch successfully.")

@@ -360,7 +360,7 @@ pick_pattern_column_base <- function(df, patterns, label, required = FALSE, excl
 }
 
 find_dbh_col <- function(df) {
-  find_preferred_column_ci_norm(df, c("dbh", "DBH", "dbh_cm", "DBH_cm", "dhp", "DHP", "dhp_cm", "DHP_cm"))
+  find_preferred_column_ci_norm(df, c("dbh", "DBH", "dbh_cm", "DBH_cm", "dhp", "DHP", "dhp_cm", "DHP_cm", "dhp_tige", "Dhp_tige", "DHP_tige", "dhp_tige_cm", "Dhp_tige_cm", "DHP_tige_cm"))
 }
 
 find_individual_id_col <- function(df) {
@@ -544,6 +544,7 @@ match_retained_dbh_from_source <- function(retained_tbl, source_tbl, source_name
   dbh[matched] <- best$source_tbl$DBH_cm[best$idx[matched]]
   list(dbh = dbh, matched = matched, source = paste0(source_name, " via ", best$method))
 }
+
 get_raw_dbh_for_retained <- function(retained_tbl) {
   workbook <- find_raw_workbook_for_clonality()
   sheets <- readxl::excel_sheets(workbook)
@@ -924,6 +925,7 @@ format_one_decimal <- function(x) {
   out <- ifelse(is.na(x), NA_character_, sprintf("%.1f", round(as.numeric(x), 1)))
   out
 }
+
 build_article_clonality_summary_table <- function(site_summary_tbl, use_site_lookup_order = TRUE, formatted = TRUE) {
   out <- site_summary_tbl
   if (isTRUE(use_site_lookup_order) && "Site_order" %in% names(out) && any(!is.na(out$Site_order))) {

@@ -19,6 +19,7 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(tidyr)
   library(ggplot2)
+  library(rlang)
 })
 
 source("scripts/_load_objects.R")
@@ -30,13 +31,16 @@ suspect_null_loci <- c("EJV8T_A_0", "ERHBI_A_0", "FCM5", "FG5")
 analysis_suffix <- "noSuspectLoci"
 AMOVA_PERMUTATIONS <- 999
 HWE_MONTE_CARLO_REPS <- 9999L
+BRUVO_MLL_THRESHOLD <- 0.09
+BRUVO_ALGORITHM <- "farthest_neighbor"
 
 SENS_TABLES_DIR <- file.path(TABLES_DIR, analysis_suffix)
 SENS_FIGURES_DIR <- file.path(FIGURES_DIR, analysis_suffix)
 SENS_MATRICES_DIR <- file.path(MATRICES_DIR, analysis_suffix)
 COMPARISON_DIR <- file.path(TABLES_DIR, "comparisons")
+WORD_DIR <- file.path(OUTPUT_DIR, "word")
 
-for (d in c(SENS_TABLES_DIR, SENS_FIGURES_DIR, SENS_MATRICES_DIR, COMPARISON_DIR)) {
+for (d in c(SENS_TABLES_DIR, SENS_FIGURES_DIR, SENS_MATRICES_DIR, COMPARISON_DIR, WORD_DIR)) {
   dir.create(d, recursive = TRUE, showWarnings = FALSE)
 }
 
@@ -614,12 +618,374 @@ compare_two_dataset_table <- function(df, by_cols, value_cols) {
   wide
 }
 
+
+# ------------------------------------------------------------------
+# Clonality sensitivity helpers (full gi vs gi with suspect loci removed)
+# ------------------------------------------------------------------
+calc_clonal_richness <- function(N, G) {
+  ifelse(!is.na(N) & !is.na(G) & N > 1, (G - 1) / (N - 1), NA_real_)
+}
+
+compute_mlg_mll_from_gi <- function(gobj, threshold = BRUVO_MLL_THRESHOLD, algorithm = BRUVO_ALGORITHM) {
+  if (!inherits(gobj, "genind")) {
+    stop("[hwe_sensitivity] Clonality input must be a genind object.")
+  }
+  if (adegenet::nInd(gobj) < 1) {
+    stop("[hwe_sensitivity] Clonality input contains no individuals.")
+  }
+  if (adegenet::nLoc(gobj) < 2) {
+    stop("[hwe_sensitivity] Bruvo MLL clustering requires at least two loci.")
+  }
+  
+  gc_mlg <- poppr::as.genclone(gobj)
+  mlg_raw <- tryCatch(
+    poppr::mlg.vector(gc_mlg),
+    error = function(e) as.integer(factor(poppr::mlg(gc_mlg)))
+  )
+  mlg_labels <- paste0("MLG_", as.integer(factor(mlg_raw)))
+  
+  replen <- rep(2, adegenet::nLoc(gobj))
+  names(replen) <- adegenet::locNames(gobj)
+  
+  gc_mll <- gc_mlg
+  poppr::mlg.filter(
+    gc_mll,
+    distance = poppr::bruvo.dist,
+    replen = replen,
+    algorithm = algorithm
+  ) <- threshold
+  
+  mll_raw <- poppr::mll(gc_mll)
+  mll_labels <- paste0("MLL_", as.integer(factor(mll_raw)))
+  
+  if (length(mlg_labels) != adegenet::nInd(gobj) || length(mll_labels) != adegenet::nInd(gobj)) {
+    stop("[hwe_sensitivity] MLG/MLL assignment length does not match the number of genind individuals.")
+  }
+  
+  data.frame(
+    Individual = adegenet::indNames(gobj),
+    Site = as.character(adegenet::pop(gobj)),
+    MLG = mlg_labels,
+    MLL = mll_labels,
+    stringsAsFactors = FALSE
+  )
+}
+
+add_site_labels_for_clonality <- function(assignments_df, df_ids_tbl) {
+  if (!all(c("Individual", "Site") %in% names(assignments_df))) {
+    stop("[hwe_sensitivity] Internal clonality assignments are missing Individual or Site columns.")
+  }
+  aligned_ids <- align_df_ids_to_genind(gi, df_ids_tbl, context = "[hwe_sensitivity] clonality metadata")
+  meta_tbl <- data.frame(
+    Individual = aligned_ids$ind_id,
+    Site = aligned_ids$Site,
+    stringsAsFactors = FALSE
+  )
+  
+  optional_cols <- intersect(c("Site_label", "Region", "Site_order"), names(aligned_ids))
+  if (length(optional_cols) > 0) {
+    meta_tbl <- cbind(meta_tbl, aligned_ids[, optional_cols, drop = FALSE])
+  }
+  
+  out <- assignments_df %>%
+    select(Individual, MLG, MLL) %>%
+    left_join(meta_tbl, by = "Individual")
+  
+  if (!"Site_label" %in% names(out)) out$Site_label <- out$Site
+  if (!"Site_order" %in% names(out)) out$Site_order <- seq_len(nrow(out))
+  if (!"Region" %in% names(out)) out$Region <- NA_character_
+  
+  out$Site <- ifelse(is.na(out$Site) | !nzchar(out$Site), as.character(assignments_df$Site), as.character(out$Site))
+  out$Site_label <- ifelse(is.na(out$Site_label) | !nzchar(as.character(out$Site_label)), out$Site, as.character(out$Site_label))
+  out$Site_order <- suppressWarnings(as.numeric(out$Site_order))
+  out
+}
+
+make_repeated_clone_table <- function(assignments_df, clone_col) {
+  clone_sym <- rlang::sym(clone_col)
+  assignments_df %>%
+    filter(!is.na(!!clone_sym)) %>%
+    group_by(!!clone_sym) %>%
+    mutate(Group_Size = dplyr::n()) %>%
+    ungroup() %>%
+    filter(Group_Size > 1) %>%
+    arrange(!!clone_sym, Individual)
+}
+
+make_repeated_group_signature <- function(repeated_df, clone_col) {
+  if (nrow(repeated_df) == 0) return(character(0))
+  split(repeated_df$Individual, repeated_df[[clone_col]]) %>%
+    lapply(function(x) paste(sort(unique(as.character(x))), collapse = "|")) %>%
+    unlist(use.names = FALSE) %>%
+    sort()
+}
+
+summarise_clonality_by_site <- function(assignments_df, dataset_label) {
+  assignments_df %>%
+    group_by(Site, Site_label, Site_order) %>%
+    summarise(
+      Dataset = dataset_label,
+      N = dplyr::n(),
+      MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
+      MLL = dplyr::n_distinct(MLL, na.rm = TRUE),
+      repeated_MLG_groups = sum(table(MLG) > 1),
+      repeated_MLL_groups = sum(table(MLL) > 1),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      R_MLG = calc_clonal_richness(N, MLG),
+      R_MLL = calc_clonal_richness(N, MLL)
+    ) %>%
+    arrange(Site_order, Site_label)
+}
+
+summarise_clonality_overall <- function(assignments_df, dataset_label, repeated_mll_same_as_full = NA) {
+  repeated_mlg <- make_repeated_clone_table(assignments_df, "MLG")
+  repeated_mll <- make_repeated_clone_table(assignments_df, "MLL")
+  repeated_mll_sites <- sort(unique(as.character(repeated_mll$Site_label)))
+  repeated_mll_inds <- sort(unique(as.character(repeated_mll$Individual)))
+  N <- nrow(assignments_df)
+  total_MLG <- dplyr::n_distinct(assignments_df$MLG, na.rm = TRUE)
+  total_MLL <- dplyr::n_distinct(assignments_df$MLL, na.rm = TRUE)
+  
+  data.frame(
+    Dataset = dataset_label,
+    total_N = N,
+    total_MLG = total_MLG,
+    total_MLL = total_MLL,
+    R_MLG = calc_clonal_richness(N, total_MLG),
+    R_MLL = calc_clonal_richness(N, total_MLL),
+    total_repeated_MLGs = dplyr::n_distinct(repeated_mlg$MLG, na.rm = TRUE),
+    total_repeated_MLLs = dplyr::n_distinct(repeated_mll$MLL, na.rm = TRUE),
+    total_MLG_clone_copies = N - total_MLG,
+    total_MLL_clone_copies = N - total_MLL,
+    repeated_MLL_individuals = if (length(repeated_mll_inds) == 0) "none" else paste(repeated_mll_inds, collapse = ";"),
+    repeated_MLL_sites = if (length(repeated_mll_sites) == 0) "none" else paste(repeated_mll_sites, collapse = ";"),
+    same_individuals_sites_in_repeated_MLLs_as_full = as.character(repeated_mll_same_as_full),
+    stringsAsFactors = FALSE
+  )
+}
+
+build_clonality_sensitivity <- function(full_gobj, reduced_gobj, df_ids_tbl) {
+  message("[hwe_sensitivity] Recomputing full-loci MLGs and Bruvo MLLs from gi for clonality sensitivity.")
+  message("[hwe_sensitivity] Recomputing reduced-loci MLGs and Bruvo MLLs after removing suspect loci.")
+  message("[hwe_sensitivity] Bruvo MLL threshold: ", BRUVO_MLL_THRESHOLD)
+  message("[hwe_sensitivity] Bruvo clustering algorithm: ", BRUVO_ALGORITHM)
+  
+  full_assign <- compute_mlg_mll_from_gi(full_gobj) %>%
+    add_site_labels_for_clonality(df_ids_tbl) %>%
+    mutate(Dataset = "FULL")
+  reduced_assign <- compute_mlg_mll_from_gi(reduced_gobj) %>%
+    add_site_labels_for_clonality(df_ids_tbl) %>%
+    mutate(Dataset = "REDUCED")
+  
+  if (!identical(full_assign$Individual, reduced_assign$Individual)) {
+    stop("[hwe_sensitivity] Full and reduced clonality assignments are not in the same individual order.")
+  }
+  
+  full_site <- summarise_clonality_by_site(full_assign, "FULL")
+  reduced_site <- summarise_clonality_by_site(reduced_assign, "REDUCED")
+  
+  comparison <- full_site %>%
+    select(Site, Site_label, Site_order, N_full = N, MLG_full = MLG, R_MLG_full = R_MLG, MLL_full = MLL, R_MLL_full = R_MLL) %>%
+    full_join(
+      reduced_site %>%
+        select(Site, N_reduced = N, MLG_reduced = MLG, R_MLG_reduced = R_MLG, MLL_reduced = MLL, R_MLL_reduced = R_MLL),
+      by = "Site"
+    ) %>%
+    mutate(
+      delta_MLG = MLG_reduced - MLG_full,
+      delta_MLL = MLL_reduced - MLL_full,
+      delta_R_MLG = R_MLG_reduced - R_MLG_full,
+      delta_R_MLL = R_MLL_reduced - R_MLL_full,
+      interpretation = dplyr::case_when(
+        is.na(delta_MLG) | is.na(delta_MLL) ~ "Could not compare this site because one dataset is missing site-level values.",
+        delta_MLG == 0 & delta_MLL == 0 & abs(delta_R_MLG) < 1e-12 & abs(delta_R_MLL) < 1e-12 ~ "No meaningful clonality change after removing HWE-deviating loci.",
+        delta_MLL != 0 | abs(delta_R_MLL) >= 0.01 ~ "Meaningful clonality change: Bruvo-based MLL count or R_MLL changed.",
+        delta_MLG != 0 | abs(delta_R_MLG) >= 0.01 ~ "Minor clonality change: exact MLG count or R_MLG changed, but MLL conclusion is stable.",
+        TRUE ~ "Very small numerical change only; clonality conclusion is stable."
+      )
+    ) %>%
+    arrange(Site_order, Site_label) %>%
+    transmute(
+      Site = as.character(Site_label),
+      N_full,
+      MLG_full,
+      R_MLG_full,
+      MLL_full,
+      R_MLL_full,
+      N_reduced,
+      MLG_reduced,
+      R_MLG_reduced,
+      MLL_reduced,
+      R_MLL_reduced,
+      delta_MLG,
+      delta_MLL,
+      delta_R_MLG,
+      delta_R_MLL,
+      interpretation
+    )
+  
+  full_mll_repeated <- make_repeated_clone_table(full_assign, "MLL")
+  reduced_mll_repeated <- make_repeated_clone_table(reduced_assign, "MLL")
+  same_repeated_mll_individuals <- identical(
+    sort(unique(as.character(full_mll_repeated$Individual))),
+    sort(unique(as.character(reduced_mll_repeated$Individual)))
+  )
+  same_repeated_mll_sites <- identical(
+    sort(unique(as.character(full_mll_repeated$Site_label))),
+    sort(unique(as.character(reduced_mll_repeated$Site_label)))
+  )
+  same_repeated_mll_groups <- identical(
+    make_repeated_group_signature(full_mll_repeated, "MLL"),
+    make_repeated_group_signature(reduced_mll_repeated, "MLL")
+  )
+  same_individuals_sites <- same_repeated_mll_individuals && same_repeated_mll_sites
+  
+  overall <- bind_rows(
+    summarise_clonality_overall(full_assign, "FULL", repeated_mll_same_as_full = TRUE),
+    summarise_clonality_overall(reduced_assign, "REDUCED", repeated_mll_same_as_full = same_individuals_sites)
+  )
+  overall$same_repeated_MLL_group_memberships_as_full <- as.character(c(TRUE, same_repeated_mll_groups))
+  
+  changed_sites <- comparison %>%
+    filter(
+      !is.na(delta_MLG) & !is.na(delta_MLL) &
+        (delta_MLG != 0 | delta_MLL != 0 | abs(delta_R_MLG) >= 0.01 | abs(delta_R_MLL) >= 0.01)
+    ) %>%
+    pull(Site)
+  
+  list(
+    comparison = comparison,
+    overall = overall,
+    assignments = bind_rows(full_assign, reduced_assign),
+    repeated_MLG = bind_rows(
+      make_repeated_clone_table(full_assign, "MLG") %>% mutate(Dataset = "FULL"),
+      make_repeated_clone_table(reduced_assign, "MLG") %>% mutate(Dataset = "REDUCED")
+    ),
+    repeated_MLL = bind_rows(
+      full_mll_repeated %>% mutate(Dataset = "FULL"),
+      reduced_mll_repeated %>% mutate(Dataset = "REDUCED")
+    ),
+    changed_sites = changed_sites,
+    same_repeated_mll_individuals = same_repeated_mll_individuals,
+    same_repeated_mll_sites = same_repeated_mll_sites,
+    same_repeated_mll_groups = same_repeated_mll_groups
+  )
+}
+
+xml_escape_word <- function(x) {
+  x <- as.character(x)
+  x[is.na(x)] <- ""
+  x <- gsub("&", "&amp;", x, fixed = TRUE)
+  x <- gsub("<", "&lt;", x, fixed = TRUE)
+  x <- gsub(">", "&gt;", x, fixed = TRUE)
+  x <- gsub('"', "&quot;", x, fixed = TRUE)
+  x <- gsub("'", "&apos;", x, fixed = TRUE)
+  x
+}
+
+word_cell_xml <- function(value, bold = FALSE) {
+  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
+  paste0(
+    "<w:tc>",
+    "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>",
+    "<w:p><w:r>", bold_xml, "<w:t>", xml_escape_word(value), "</w:t></w:r></w:p>",
+    "</w:tc>"
+  )
+}
+
+word_paragraph_xml <- function(value, bold = FALSE) {
+  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
+  paste0("<w:p><w:r>", bold_xml, "<w:t>", xml_escape_word(value), "</w:t></w:r></w:p>")
+}
+
+word_table_xml <- function(df) {
+  df <- as.data.frame(lapply(df, as.character), stringsAsFactors = FALSE, check.names = FALSE)
+  header <- paste0("<w:tr>", paste(vapply(names(df), word_cell_xml, character(1), bold = TRUE), collapse = ""), "</w:tr>")
+  rows <- apply(df, 1, function(row) paste0("<w:tr>", paste(vapply(row, word_cell_xml, character(1)), collapse = ""), "</w:tr>"))
+  paste0(
+    "<w:tbl>",
+    "<w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"0\" w:type=\"auto\"/>",
+    "<w:tblBorders>",
+    "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
+    "</w:tblBorders></w:tblPr>",
+    header,
+    paste(rows, collapse = ""),
+    "</w:tbl>"
+  )
+}
+
+write_clonality_docx <- function(comparison_tbl, overall_tbl, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  tmp_dir <- tempfile("hwe_clonality_docx_")
+  dir.create(file.path(tmp_dir, "_rels"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(tmp_dir, "word", "_rels"), recursive = TRUE, showWarnings = FALSE)
+  
+  document_xml <- paste0(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+    '<w:body>',
+    word_paragraph_xml("HWE sensitivity clonality comparison", bold = TRUE),
+    word_paragraph_xml("Site-level FULL vs REDUCED comparison", bold = TRUE),
+    word_table_xml(comparison_tbl),
+    word_paragraph_xml("Overall summary", bold = TRUE),
+    word_table_xml(overall_tbl),
+    '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/>',
+    '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
+    '</w:body></w:document>'
+  )
+  
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+    '<Default Extension="xml" ContentType="application/xml"/>',
+    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
+    '</Types>'
+  ), file.path(tmp_dir, "[Content_Types].xml"), useBytes = TRUE)
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>',
+    '</Relationships>'
+  ), file.path(tmp_dir, "_rels", ".rels"), useBytes = TRUE)
+  writeLines(c(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+  ), file.path(tmp_dir, "word", "_rels", "document.xml.rels"), useBytes = TRUE)
+  writeLines(document_xml, file.path(tmp_dir, "word", "document.xml"), useBytes = TRUE)
+  
+  old_wd <- getwd()
+  on.exit(setwd(old_wd), add = TRUE)
+  setwd(tmp_dir)
+  if (file.exists(path)) unlink(path)
+  utils::zip(
+    zipfile = path,
+    files = list.files(tmp_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE),
+    flags = "-q"
+  )
+  if (!file.exists(path)) stop("[hwe_sensitivity] Failed to create Word document at: ", path)
+  message("[hwe_sensitivity] Saved: ", path)
+  invisible(path)
+}
+
 # ------------------------------------------------------------------
 # Build reduced object and manifest
 # ------------------------------------------------------------------
 full_gi <- gi_mll
 reduced_info <- make_reduced_genind(full_gi, suspect_null_loci)
 reduced_gi <- reduced_info$reduced
+
+full_clonality_gi <- gi
+reduced_clonality_info <- make_reduced_genind(full_clonality_gi, suspect_null_loci)
+reduced_clonality_gi <- reduced_clonality_info$reduced
 
 locus_manifest <- data.frame(
   dataset = c("FULL", "REDUCED"),
@@ -634,6 +1000,19 @@ locus_manifest <- data.frame(
 )
 
 write_csv_msg(locus_manifest, file.path(SENS_TABLES_DIR, paste0("locus_manifest_", analysis_suffix, ".csv")))
+
+clonality_locus_manifest <- data.frame(
+  dataset = c("FULL_CLONALITY_GI", "REDUCED_CLONALITY_GI"),
+  n_loci = c(adegenet::nLoc(full_clonality_gi), adegenet::nLoc(reduced_clonality_gi)),
+  loci = c(
+    paste(adegenet::locNames(full_clonality_gi), collapse = ";"),
+    paste(adegenet::locNames(reduced_clonality_gi), collapse = ";")
+  ),
+  removed_loci = c("", paste(reduced_clonality_info$found, collapse = ";")),
+  requested_but_not_found = c("", paste(reduced_clonality_info$missing, collapse = ";")),
+  stringsAsFactors = FALSE
+)
+write_csv_msg(clonality_locus_manifest, file.path(SENS_TABLES_DIR, paste0("locus_manifest_clonality_", analysis_suffix, ".csv")))
 
 # ------------------------------------------------------------------
 # Run parallel full/reduced analyses
@@ -710,6 +1089,8 @@ red_pca <- run_pca_bundle(reduced_gi, "REDUCED")
 full_dapc <- run_dapc_bundle(full_gi, "FULL")
 red_dapc <- run_dapc_bundle(reduced_gi, "REDUCED")
 
+clonality_sensitivity <- build_clonality_sensitivity(full_clonality_gi, reduced_clonality_gi, df_ids)
+
 # ------------------------------------------------------------------
 # Write reduced-only outputs requested for direct comparison with main outputs
 # ------------------------------------------------------------------
@@ -723,6 +1104,32 @@ write_csv_msg(red_amova$rand, file.path(SENS_TABLES_DIR, paste0("amova_randtest_
 write_csv_msg(red_hwe, file.path(SENS_TABLES_DIR, paste0("hwe_by_site_by_locus_", analysis_suffix, ".csv")))
 write_csv_msg(red_pca$variance, file.path(SENS_TABLES_DIR, paste0("pca_variance_", analysis_suffix, ".csv")))
 write_csv_msg(red_dapc$eig, file.path(SENS_TABLES_DIR, paste0("dapc_eigenvalues_", analysis_suffix, ".csv")))
+
+clonality_output <- list(
+  site_comparison = clonality_sensitivity$comparison,
+  overall_summary = clonality_sensitivity$overall,
+  individual_assignments = clonality_sensitivity$assignments,
+  repeated_MLGs = clonality_sensitivity$repeated_MLG,
+  repeated_MLLs = clonality_sensitivity$repeated_MLL,
+  settings = list(
+    suspect_loci_requested = suspect_null_loci,
+    suspect_loci_removed_for_clonality = reduced_clonality_info$found,
+    suspect_loci_not_found_for_clonality = reduced_clonality_info$missing,
+    bruvo_mll_threshold = BRUVO_MLL_THRESHOLD,
+    bruvo_algorithm = BRUVO_ALGORITHM
+  )
+)
+write_csv_msg(clonality_sensitivity$comparison, file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.csv"))
+saveRDS(clonality_output, file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"))
+message("[hwe_sensitivity] Saved: ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"))
+write_clonality_docx(
+  clonality_sensitivity$comparison,
+  clonality_sensitivity$overall,
+  file.path(WORD_DIR, "hwe_sensitivity_clonality_comparison.docx")
+)
+write_csv_msg(clonality_sensitivity$overall, file.path(TABLES_DIR, "hwe_sensitivity_clonality_overall_summary.csv"))
+write_csv_msg(clonality_sensitivity$assignments, file.path(TABLES_DIR, "hwe_sensitivity_clonality_individual_assignments_long.csv"))
+write_csv_msg(clonality_sensitivity$repeated_MLL, file.path(TABLES_DIR, "hwe_sensitivity_clonality_repeated_MLLs_long.csv"))
 
 write.csv(red_diff$fst_mat, file.path(SENS_MATRICES_DIR, paste0("pairwise_fst_", analysis_suffix, ".csv")))
 write.csv(red_diff$jost_mat, file.path(SENS_MATRICES_DIR, paste0("pairwise_jostD_", analysis_suffix, ".csv")))
@@ -813,5 +1220,33 @@ delta_plot <- ggplot(delta_tbl, aes(metric, delta, fill = metric)) +
   labs(title = "Sensitivity deltas (REDUCED - FULL)", x = NULL, y = "Delta")
 
 ggsave(file.path(SENS_FIGURES_DIR, "full_vs_noSuspectLoci_metric_deltas.pdf"), delta_plot, width = 8, height = 4.5)
+
+meaningful_site_changes <- clonality_sensitivity$changed_sites
+overall_full <- clonality_sensitivity$overall[clonality_sensitivity$overall$Dataset == "FULL", , drop = FALSE]
+overall_reduced <- clonality_sensitivity$overall[clonality_sensitivity$overall$Dataset == "REDUCED", , drop = FALSE]
+overall_changed <- !identical(overall_full$total_MLG, overall_reduced$total_MLG) ||
+  !identical(overall_full$total_MLL, overall_reduced$total_MLL) ||
+  !isTRUE(all.equal(overall_full$R_MLG, overall_reduced$R_MLG, tolerance = 1e-12)) ||
+  !isTRUE(all.equal(overall_full$R_MLL, overall_reduced$R_MLL, tolerance = 1e-12)) ||
+  !isTRUE(clonality_sensitivity$same_repeated_mll_individuals) ||
+  !isTRUE(clonality_sensitivity$same_repeated_mll_sites)
+
+cat("\n")
+cat("============================================================\n")
+cat("HWE SENSITIVITY CLONALITY RESULT\n")
+cat("============================================================\n")
+cat("Removed loci: ", if (length(reduced_clonality_info$found) > 0) paste(reduced_clonality_info$found, collapse = ", ") else "none", "\n", sep = "")
+cat("Bruvo MLL threshold: ", BRUVO_MLL_THRESHOLD, "\n", sep = "")
+cat("Bruvo clustering algorithm: ", BRUVO_ALGORITHM, "\n", sep = "")
+cat("Did clonality change after removing HWE-deviating loci? ", if (overall_changed) "YES" else "NO", "\n", sep = "")
+cat("Sites changed: ", if (length(meaningful_site_changes) > 0) paste(meaningful_site_changes, collapse = ", ") else "none", "\n", sep = "")
+cat("Same individuals in repeated MLLs? ", if (clonality_sensitivity$same_repeated_mll_individuals) "YES" else "NO", "\n", sep = "")
+cat("Same sites in repeated MLLs? ", if (clonality_sensitivity$same_repeated_mll_sites) "YES" else "NO", "\n", sep = "")
+cat("Main clonality conclusion robust? ", if (!overall_changed && length(meaningful_site_changes) == 0) "YES" else "CHECK SITE-LEVEL CHANGES", "\n", sep = "")
+cat("Primary outputs:\n")
+cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.csv"), "\n", sep = "")
+cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"), "\n", sep = "")
+cat("  - ", file.path(WORD_DIR, "hwe_sensitivity_clonality_comparison.docx"), "\n", sep = "")
+cat("============================================================\n\n")
 
 message("[hwe_sensitivity] Completed reduced-loci sensitivity branch successfully.")

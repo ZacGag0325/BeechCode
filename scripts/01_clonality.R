@@ -34,6 +34,8 @@ DEFAULT_BRUVO_ALGORITHM <- "farthest_neighbor"
 
 SITE_LOOKUP_REQUIRED_COLUMNS <- c("Site", "Site_label", "Region", "Site_order", "Numéro_Population")
 SITE_LOOKUP_SHEET <- "site_lookup"
+GENETIC_SHEET_CANDIDATES <- c("genetique", "génétique", "genetic", "genetics")
+ARBRE_SHEET_CANDIDATES <- c("arbre", "trees")
 
 normalize_lookup_key <- function(x) {
   x <- trimws(as.character(x))
@@ -296,6 +298,308 @@ clonality_plot_theme <- function(base_size = 22) {
       legend.title = element_text(size = 22),
       legend.text = element_text(size = 22)
     )
+}
+
+
+normalize_ascii_key <- function(x) {
+  x <- iconv(as.character(x), from = "", to = "ASCII//TRANSLIT")
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x[is.na(x)] <- ""
+  x
+}
+
+compact_match_key <- function(...) {
+  parts <- list(...)
+  raw <- do.call(paste, c(lapply(parts, as.character), sep = "_"))
+  key <- toupper(gsub("[^A-Za-z0-9]+", "", raw))
+  key[is.na(key)] <- ""
+  key
+}
+
+coerce_numeric_clonality <- function(x) {
+  if (is.numeric(x)) return(x)
+  x_chr <- as.character(x)
+  x_chr <- gsub(",", ".", x_chr, fixed = TRUE)
+  x_chr <- gsub("[^0-9.\\-]+", "", x_chr)
+  suppressWarnings(as.numeric(x_chr))
+}
+
+normalize_tree_number <- function(x) {
+  x_chr <- trimws(as.character(x))
+  x_chr[x_chr %in% c("", "NA", "NaN", "NULL")] <- NA_character_
+  x_num <- suppressWarnings(as.numeric(gsub(",", ".", x_chr, fixed = TRUE)))
+  x_chr <- ifelse(!is.na(x_num) & abs(x_num - round(x_num)) < .Machine$double.eps^0.5, as.character(as.integer(round(x_num))), x_chr)
+  x_chr
+}
+
+find_preferred_column_ci_norm <- function(df, candidates) {
+  cn <- names(df)
+  cn_norm <- normalize_ascii_key(cn)
+  candidate_norm <- normalize_ascii_key(candidates)
+  idx <- match(candidate_norm, cn_norm, nomatch = 0)
+  idx <- idx[idx > 0]
+  if (length(idx) == 0) NA_character_ else cn[idx[1]]
+}
+
+pick_pattern_column_base <- function(df, patterns, label, required = FALSE, exclude = character()) {
+  cn <- names(df)
+  cn_norm <- normalize_ascii_key(cn)
+  exclude_norm <- normalize_ascii_key(exclude)
+  idx <- which(grepl(paste(patterns, collapse = "|"), cn_norm) & !(cn_norm %in% exclude_norm))
+  if (length(idx) == 0) {
+    if (required) warning("[01_clonality] Could not detect required column for ", label, call. = FALSE)
+    return(NA_character_)
+  }
+  if (length(idx) > 1) {
+    message("[01_clonality] Multiple matches for ", label, ": ", paste(cn[idx], collapse = ", "), ". Using: ", cn[idx[1]])
+  }
+  cn[idx[1]]
+}
+
+find_dbh_col <- function(df) {
+  find_preferred_column_ci_norm(df, c("dbh", "DBH", "dbh_cm", "DBH_cm", "dhp", "DHP", "dhp_cm", "DHP_cm"))
+}
+
+find_individual_id_col <- function(df) {
+  find_preferred_column_ci_norm(
+    df,
+    c(
+      DF_IDS_ID_CHOICES,
+      "individual_id", "Individual_ID", "individu", "Individu", "id_individu", "ID_Individu",
+      "sample_id", "Sample_ID", "sample_name", "Sample_Name", "echantillon", "échantillon",
+      "id_echantillon", "id_échantillon", "identifiant", "genetic_id", "Genetic_ID"
+    )
+  )
+}
+
+find_tree_number_col <- function(df) {
+  find_preferred_column_ci_norm(
+    df,
+    c(
+      "tree", "Tree", "tree_id", "Tree_ID", "tree_number", "Tree_Number", "tree_no", "Tree_No",
+      "arbre", "Arbre", "no_arbre", "No_Arbre", "numero_arbre", "Numéro_Arbre",
+      "numero_tree", "num_tree", "no_tree", "id_arbre", "id_tige", "stem", "stem_id",
+      "numero_individu", "num_individu", "no_individu", "id_individu",
+      "sample_number", "sample_no", "numero", "num", "no"
+    )
+  )
+}
+
+derive_tree_number_from_individual_id <- function(individual_id, site = NULL) {
+  x <- trimws(as.character(individual_id))
+  if (!is.null(site)) {
+    site_chr <- trimws(as.character(site))
+    for (i in seq_along(x)) {
+      if (is.na(x[i]) || is.na(site_chr[i]) || !nzchar(site_chr[i])) next
+      site_regex <- gsub("([][{}()+*^$|\\.?])", "\\\\\\1", site_chr[i])
+      x[i] <- sub(paste0("^", site_regex, "[_\\-. ]*"), "", x[i], ignore.case = TRUE)
+    }
+  }
+  out <- sub(".*?([0-9]+)[^0-9]*$", "\\1", x)
+  unchanged <- out == x
+  unchanged[is.na(unchanged)] <- TRUE
+  out[unchanged | is.na(x) | !grepl("[0-9]", x)] <- NA_character_
+  normalize_tree_number(out)
+}
+
+find_raw_workbook_for_clonality <- function(raw_dir = file.path(PROJECT_ROOT, "data", "raw")) {
+  if (!dir.exists(raw_dir)) stop("[01_clonality] Directory not found while searching for DBH workbook: ", raw_dir, call. = FALSE)
+  files <- list.files(raw_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(files) == 0) stop("[01_clonality] No Excel file found in data/raw for DBH matching.", call. = FALSE)
+  preferred_idx <- which(grepl("donnee|modifie|west|summer|copie", normalize_ascii_key(basename(files))))
+  chosen <- if (length(preferred_idx) > 0) files[preferred_idx[1]] else files[1]
+  message("[01_clonality] Excel files found in data/raw for DBH matching:")
+  message(paste0(" - ", basename(files), collapse = "\n"))
+  message("[01_clonality] Selected workbook for DBH matching: ", basename(chosen))
+  chosen
+}
+
+match_sheet_clonality <- function(sheets, target) {
+  idx <- which(normalize_ascii_key(sheets) == normalize_ascii_key(target))
+  if (length(idx) == 0) NA_character_ else sheets[idx[1]]
+}
+
+make_retained_identity_table <- function(clonality_assignments, df_ids_tbl) {
+  df_ids_cols_local <- resolve_df_ids_columns(df_ids_tbl, context = "[01_clonality]", require = TRUE)
+  id_key_local <- normalize_id(df_ids_tbl[[df_ids_cols_local$id_col]])
+  tree_col <- find_tree_number_col(df_ids_tbl)
+  tree_map <- if (!is.na(tree_col)) setNames(as.character(df_ids_tbl[[tree_col]]), id_key_local) else NULL
+  retained_key <- normalize_id(clonality_assignments$Individual)
+  retained_tree <- if (!is.null(tree_map)) normalize_tree_number(tree_map[retained_key]) else rep(NA_character_, nrow(clonality_assignments))
+  missing_tree <- is.na(retained_tree) | !nzchar(retained_tree)
+  if (any(missing_tree)) {
+    retained_tree[missing_tree] <- derive_tree_number_from_individual_id(
+      clonality_assignments$Individual[missing_tree],
+      clonality_assignments$Site[missing_tree]
+    )
+  }
+  data.frame(
+    Individual = as.character(clonality_assignments$Individual),
+    Site = as.character(clonality_assignments$Site),
+    Site_label = as.character(clonality_assignments$Site_label),
+    Tree_Number = retained_tree,
+    stringsAsFactors = FALSE
+  )
+}
+
+get_metadata_dbh_for_retained <- function(retained_tbl, metadata_tbl, source_name) {
+  dbh_col <- find_dbh_col(metadata_tbl)
+  if (is.na(dbh_col)) return(NULL)
+  cols <- resolve_df_ids_columns(metadata_tbl, context = paste0("[01_clonality] ", source_name), require = FALSE)
+  if (is.na(cols$id_col)) {
+    message("[01_clonality] ", source_name, " contains DBH column '", dbh_col, "' but no recognized individual ID column; skipping this DBH source.")
+    return(NULL)
+  }
+  key <- normalize_id(metadata_tbl[[cols$id_col]])
+  if (anyDuplicated(key)) {
+    dup_ids <- unique(as.character(metadata_tbl[[cols$id_col]])[duplicated(key)])
+    stop("[01_clonality] ", source_name, " has duplicate individual IDs while matching DBH. Examples: ", paste(head(dup_ids, 10), collapse = ", "), call. = FALSE)
+  }
+  idx <- match(normalize_id(retained_tbl$Individual), key)
+  if (any(is.na(idx))) {
+    missing_ids <- retained_tbl$Individual[is.na(idx)]
+    stop("[01_clonality] ", source_name, " has a DBH column but could not be aligned to all retained individuals. Missing examples: ", paste(head(missing_ids, 10), collapse = ", "), call. = FALSE)
+  }
+  list(
+    dbh = coerce_numeric_clonality(metadata_tbl[[dbh_col]][idx]),
+    matched = rep(TRUE, nrow(retained_tbl)),
+    source = paste0(source_name, "$", dbh_col)
+  )
+}
+
+make_raw_dbh_source_table <- function(raw_df, sheet_name) {
+  dbh_col <- find_dbh_col(raw_df)
+  if (is.na(dbh_col)) return(NULL)
+  id_col <- find_individual_id_col(raw_df)
+  site_col <- resolve_col_ci(raw_df, c("Site", "site", "pop", "population"))
+  if (is.na(site_col)) {
+    site_col <- pick_pattern_column_base(raw_df, c("^site$", "site_?id", "id_?site", "placette", "parcelle", "plot", "station", "localite", "location"), paste0(sheet_name, " site"))
+  }
+  tree_col <- find_tree_number_col(raw_df)
+  source_id <- if (!is.na(id_col)) as.character(raw_df[[id_col]]) else rep(NA_character_, nrow(raw_df))
+  source_site <- if (!is.na(site_col)) normalize_lookup_key(raw_df[[site_col]]) else rep(NA_character_, nrow(raw_df))
+  source_tree <- if (!is.na(tree_col)) normalize_tree_number(raw_df[[tree_col]]) else rep(NA_character_, nrow(raw_df))
+  missing_tree <- is.na(source_tree) | !nzchar(source_tree)
+  if (any(missing_tree) && !is.na(id_col)) {
+    source_tree[missing_tree] <- derive_tree_number_from_individual_id(source_id[missing_tree], source_site[missing_tree])
+  }
+  data.frame(
+    Source_ID = source_id,
+    Site = source_site,
+    Tree_Number = source_tree,
+    DBH_cm = coerce_numeric_clonality(raw_df[[dbh_col]]),
+    stringsAsFactors = FALSE
+  )
+}
+
+match_retained_dbh_from_source <- function(retained_tbl, source_tbl, source_name) {
+  attempts <- list()
+  if (any(!is.na(source_tbl$Source_ID) & nzchar(source_tbl$Source_ID))) {
+    attempts[["individual ID"]] <- list(
+      retained_key = compact_match_key(retained_tbl$Individual),
+      source_key = compact_match_key(source_tbl$Source_ID)
+    )
+  }
+  if (any(!is.na(retained_tbl$Site) & nzchar(retained_tbl$Site)) && any(!is.na(source_tbl$Site) & nzchar(source_tbl$Site)) && any(!is.na(retained_tbl$Tree_Number) & nzchar(retained_tbl$Tree_Number)) && any(!is.na(source_tbl$Tree_Number) & nzchar(source_tbl$Tree_Number))) {
+    attempts[["site + tree number"]] <- list(
+      retained_key = compact_match_key(retained_tbl$Site, retained_tbl$Tree_Number),
+      source_key = compact_match_key(source_tbl$Site, source_tbl$Tree_Number)
+    )
+  }
+  if (length(attempts) == 0) return(NULL)
+  best <- NULL
+  for (method in names(attempts)) {
+    retained_key <- attempts[[method]]$retained_key
+    source_key <- attempts[[method]]$source_key
+    usable_source <- nzchar(source_key)
+    source_key_use <- source_key[usable_source]
+    source_tbl_use <- source_tbl[usable_source, , drop = FALSE]
+    if (anyDuplicated(source_key_use)) next
+    idx <- match(retained_key, source_key_use)
+    n_match <- sum(!is.na(idx))
+    candidate <- list(idx = idx, source_tbl = source_tbl_use, n_match = n_match, method = method)
+    if (is.null(best) || candidate$n_match > best$n_match) best <- candidate
+  }
+  if (is.null(best) || best$n_match == 0) return(NULL)
+  dbh <- rep(NA_real_, nrow(retained_tbl))
+  matched <- !is.na(best$idx)
+  dbh[matched] <- best$source_tbl$DBH_cm[best$idx[matched]]
+  list(dbh = dbh, matched = matched, source = paste0(source_name, " via ", best$method))
+}
+
+get_raw_dbh_for_retained <- function(retained_tbl) {
+  workbook <- find_raw_workbook_for_clonality()
+  sheets <- readxl::excel_sheets(workbook)
+  message("[01_clonality] Workbook sheets available for DBH matching: ", paste(sheets, collapse = ", "))
+  preferred_sheets <- c(GENETIC_SHEET_CANDIDATES, ARBRE_SHEET_CANDIDATES)
+  best <- NULL
+  for (target in preferred_sheets) {
+    sheet <- match_sheet_clonality(sheets, target)
+    if (is.na(sheet)) next
+    raw_df <- suppressMessages(readxl::read_excel(workbook, sheet = sheet)) %>% as.data.frame(stringsAsFactors = FALSE)
+    source_tbl <- make_raw_dbh_source_table(raw_df, sheet)
+    if (is.null(source_tbl)) next
+    matched <- match_retained_dbh_from_source(retained_tbl, source_tbl, paste0(basename(workbook), "::", sheet))
+    if (!is.null(matched) && normalize_ascii_key(sheet) %in% normalize_ascii_key(GENETIC_SHEET_CANDIDATES)) {
+      matched$source <- paste0(matched$source, " [genetic sheet DBH]")
+    }
+    if (is.null(matched)) next
+    if (is.null(best) || sum(matched$matched) > sum(best$matched)) best <- matched
+    if (all(matched$matched)) break
+  }
+  best
+}
+
+attach_dbh_to_clonality_assignments <- function(clonality_assignments, df_ids_tbl, meta_tbl = NULL) {
+  retained_tbl <- make_retained_identity_table(clonality_assignments, df_ids_tbl)
+  dbh_match <- get_metadata_dbh_for_retained(retained_tbl, df_ids_tbl, "df_ids")
+  if (is.null(dbh_match) && !is.null(meta_tbl) && is.data.frame(meta_tbl)) {
+    dbh_match <- get_metadata_dbh_for_retained(retained_tbl, meta_tbl, "meta")
+  }
+  if (is.null(dbh_match)) {
+    message("[01_clonality] No DBH column detected in genetic metadata; attempting DBH matching from the raw Excel workbook.")
+    dbh_match <- get_raw_dbh_for_retained(retained_tbl)
+  }
+  if (is.null(dbh_match)) {
+    stop("[01_clonality] Could not match DBH for retained sampled stems. No usable DBH source was found in df_ids, meta, or the raw Excel genetique/arbre sheets.", call. = FALSE)
+  }
+  unmatched <- retained_tbl$Individual[!dbh_match$matched]
+  if (length(unmatched) > 0) {
+    stop(
+      "[01_clonality] DBH source '", dbh_match$source, "' could not be matched to all retained sampled stems. ",
+      "Unmatched count: ", length(unmatched), ". Examples: ", paste(head(unmatched, 10), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  n_with_dbh <- sum(!is.na(dbh_match$dbh))
+  n_missing_dbh <- sum(is.na(dbh_match$dbh))
+  message("[01_clonality] DBH source used for retained sampled stems: ", dbh_match$source)
+  message("[01_clonality] Retained individuals with DBH values matched: ", n_with_dbh, " / ", nrow(retained_tbl))
+  message("[01_clonality] Retained individuals missing DBH values: ", n_missing_dbh)
+  if (n_with_dbh == 0) {
+    stop("[01_clonality] DBH was matched structurally, but all retained sampled stems have missing/non-numeric DBH values.", call. = FALSE)
+  }
+  clonality_assignments$DBH_cm <- dbh_match$dbh
+  clonality_assignments
+}
+
+validate_article_clonality_summary_table <- function(summary_tbl, site_summary_tbl) {
+  if (anyDuplicated(as.character(summary_tbl$Site))) {
+    dup_sites <- unique(as.character(summary_tbl$Site)[duplicated(as.character(summary_tbl$Site))])
+    stop("[01_clonality] Final article-ready clonality table has duplicated sites: ", paste(dup_sites, collapse = ", "), call. = FALSE)
+  }
+  n_unique_sites <- dplyr::n_distinct(as.character(site_summary_tbl$Site_label))
+  if (nrow(summary_tbl) > n_unique_sites) {
+    stop(
+      "[01_clonality] Final article-ready clonality table has more rows (", nrow(summary_tbl),
+      ") than the number of unique sites (", n_unique_sites, ").",
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
 }
 
 site_lookup <- load_site_lookup()
@@ -573,6 +877,8 @@ clonality_df <- data.frame(
 ) %>%
   mutate(Site_label = factor(Site_label, levels = site_label_levels, ordered = TRUE))
 
+clonality_df <- attach_dbh_to_clonality_assignments(clonality_df, df_ids, meta_tbl = meta)
+
 calc_R <- function(N, G) ifelse(N > 1, (G - 1) / (N - 1), NA_real_)
 
 add_clonality_metrics <- function(dat) {
@@ -590,6 +896,11 @@ format_three_decimals <- function(x) {
   out
 }
 
+format_one_decimal <- function(x) {
+  out <- ifelse(is.na(x), NA_character_, sprintf("%.1f", round(as.numeric(x), 1)))
+  out
+}
+
 build_article_clonality_summary_table <- function(site_summary_tbl, use_site_lookup_order = TRUE, formatted = TRUE) {
   out <- site_summary_tbl
   if (isTRUE(use_site_lookup_order) && "Site_order" %in% names(out) && any(!is.na(out$Site_order))) {
@@ -604,18 +915,20 @@ build_article_clonality_summary_table <- function(site_summary_tbl, use_site_loo
     transmute(
       Site = as.character(Site_label),
       N = as.integer(N_individuals),
+      `Mean DBH (cm)` = round(Mean_DBH_cm, 1),
       MLG = as.integer(N_MLG),
-      `MLG R` = round(Clonal_Richness_MLG, 3),
+      R_MLG = round(Clonal_Richness_MLG, 3),
       MLL = as.integer(N_MLL),
-      `MLL R` = round(Clonal_Richness_MLL, 3)
+      R_MLL = round(Clonal_Richness_MLL, 3)
     )
   
   if (!isTRUE(formatted)) return(numeric_tbl)
   
   numeric_tbl %>%
     mutate(
-      `MLG R` = format_three_decimals(`MLG R`),
-      `MLL R` = format_three_decimals(`MLL R`)
+      `Mean DBH (cm)` = format_one_decimal(`Mean DBH (cm)`),
+      R_MLG = format_three_decimals(R_MLG),
+      R_MLL = format_three_decimals(R_MLL)
     )
 }
 
@@ -764,17 +1077,24 @@ build_article_clonality_word_table <- function(summary_tbl) {
     transmute(
       Site = as.character(Site),
       N = as.integer(N),
+      `Mean DBH (cm)` = as.character(`Mean DBH (cm)`),
       MLG = as.integer(MLG),
-      R_MLG = as.character(`MLG R`),
+      R_MLG = as.character(R_MLG),
       MLL = as.integer(MLL),
-      R_MLL = as.character(`MLL R`)
+      R_MLL = as.character(R_MLL)
     )
 }
 
 write_article_clonality_summary_docx <- function(summary_tbl, path) {
   word_tbl <- build_article_clonality_word_table(summary_tbl)
+  required_word_cols <- c("Site", "N", "Mean DBH (cm)", "MLG", "R_MLG", "MLL", "R_MLL")
+  missing_word_cols <- setdiff(required_word_cols, names(word_tbl))
+  if (length(missing_word_cols) > 0) {
+    stop("[01_clonality] Word clonality table is missing required column(s): ", paste(missing_word_cols, collapse = ", "), call. = FALSE)
+  }
+  message("[01_clonality] Word clonality summary table columns: ", paste(names(word_tbl), collapse = ", "))
   table_title <- "Table X. Clonal structure summary by site."
-  table_note <- "N = number of individuals analyzed; MLG = number of multilocus genotypes; MLL = number of multilocus lineages after Bruvo-distance clustering; R_MLG and R_MLL represent clonal richness, calculated as (G − 1)/(N − 1)."
+  table_note <- "N = number of individuals analyzed; Mean DBH (cm) = mean diameter at breast height of the retained sampled stems from the genetic/clonality dataset; MLG = number of multilocus genotypes; MLL = number of multilocus lineages after Bruvo-distance clustering; R_MLG and R_MLL represent clonal richness, calculated as (G − 1)/(N − 1)."
   pkg_status <- word_export_package_status()
   
   docx_status <- tryCatch(
@@ -872,6 +1192,7 @@ verify_article_clonality_summary_exports <- function(summary_tbl, csv_path, xlsx
 overall <- clonality_df %>%
   summarise(
     N_individuals = dplyr::n(),
+    Mean_DBH_cm = ifelse(all(is.na(DBH_cm)), NA_real_, mean(DBH_cm, na.rm = TRUE)),
     N_MLG = dplyr::n_distinct(MLG),
     N_MLL = dplyr::n_distinct(MLL)
   ) %>%
@@ -889,6 +1210,7 @@ by_site <- clonality_df %>%
   group_by(Site, Site_label, Region, Site_order) %>%
   summarise(
     N_individuals = dplyr::n(),
+    Mean_DBH_cm = ifelse(all(is.na(DBH_cm)), NA_real_, mean(DBH_cm, na.rm = TRUE)),
     N_MLG = dplyr::n_distinct(MLG),
     N_MLL = dplyr::n_distinct(MLL),
     .groups = "drop"
@@ -950,6 +1272,7 @@ build_site_clonality_summary <- function(assignments_df, df_ids_tbl = NULL) {
     group_by(Site, Site_label, Region, Site_order) %>%
     summarise(
       N_individuals = dplyr::n(),
+      Mean_DBH_cm = ifelse(all(is.na(DBH_cm)), NA_real_, mean(DBH_cm, na.rm = TRUE)),
       N_MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
       N_MLL = dplyr::n_distinct(MLL, na.rm = TRUE),
       .groups = "drop"
@@ -1058,6 +1381,8 @@ clonality_summary_table <- build_article_clonality_summary_table(
   use_site_lookup_order = !is.null(site_lookup),
   formatted = TRUE
 )
+validate_article_clonality_summary_table(clonality_summary_table, site_clonality_summary)
+validate_article_clonality_summary_table(clonality_summary_table_numeric, site_clonality_summary)
 clonality_summary_table_csv <- file.path(TABLES_DIR, "clonality_summary_table.csv")
 clonality_summary_table_xlsx <- file.path(TABLES_DIR, "clonality_summary_table.xlsx")
 clonality_summary_table_docx <- file.path(TABLES_DIR, "clonality_summary_table.docx")

@@ -34,8 +34,7 @@ DEFAULT_BRUVO_ALGORITHM <- "farthest_neighbor"
 
 SITE_LOOKUP_REQUIRED_COLUMNS <- c("Site", "Site_label", "Region", "Site_order", "Numéro_Population")
 SITE_LOOKUP_SHEET <- "site_lookup"
-GENETIC_SHEET_CANDIDATES <- c("genetique", "génétique", "genetic", "genetics")
-ARBRE_SHEET_CANDIDATES <- c("arbre", "trees")
+GENETIC_DBH_SHEET <- "genetique"
 
 normalize_lookup_key <- function(x) {
   x <- trimws(as.character(x))
@@ -308,6 +307,7 @@ normalize_ascii_key <- function(x) {
   x <- gsub("_+", "_", x)
   x <- gsub("^_|_$", "", x)
   x[is.na(x)] <- ""
+  x
 }
 
 compact_match_key <- function(...) {
@@ -420,7 +420,7 @@ derive_tree_number_from_individual_id <- function(individual_id, site = NULL) {
 }
 
 RAW_GENETIC_DBH_WORKBOOK <- file.path(PROJECT_ROOT, "data", "raw", "donnees_modifiees_west_summer2024 copie.xlsx")
-RAW_GENETIC_DBH_SHEET <- "genetique"
+RAW_GENETIC_DBH_SHEET <- GENETIC_DBH_SHEET
 RAW_GENETIC_DBH_COLUMN <- "Dhp_tige"
 
 find_raw_workbook_for_clonality <- function() {
@@ -435,9 +435,12 @@ find_raw_workbook_for_clonality <- function() {
   RAW_GENETIC_DBH_WORKBOOK
 }
 
-match_sheet_clonality <- function(sheets, target) {
-  idx <- which(normalize_ascii_key(sheets) == normalize_ascii_key(target))
-  if (length(idx) == 0) NA_character_ else sheets[idx[1]]
+match_genetique_sheet_clonality <- function(sheets) {
+  exact_idx <- which(sheets == RAW_GENETIC_DBH_SHEET)
+  if (length(exact_idx) > 0) return(sheets[exact_idx[1]])
+  normalized_idx <- which(normalize_ascii_key(sheets) == normalize_ascii_key(RAW_GENETIC_DBH_SHEET))
+  if (length(normalized_idx) > 0) return(sheets[normalized_idx[1]])
+  NA_character_
 }
 
 find_genetic_site_code_col <- function(raw_df) {
@@ -502,11 +505,10 @@ make_retained_identity_table <- function(clonality_assignments, df_ids_tbl) {
 load_genetique_dbh_source_table <- function() {
   workbook <- find_raw_workbook_for_clonality()
   sheets <- readxl::excel_sheets(workbook)
-  sheet <- match_sheet_clonality(sheets, RAW_GENETIC_DBH_SHEET)
+  sheet <- match_genetique_sheet_clonality(sheets)
   if (is.na(sheet)) {
     stop(
-      "[01_clonality] Required sheet '", RAW_GENETIC_DBH_SHEET,
-      "' was not found in ", workbook,
+      "[01_clonality] Required DBH sheet 'genetique' was not found in ", workbook,
       ". Available sheets: ", paste(sheets, collapse = ", "),
       call. = FALSE
     )
@@ -515,9 +517,7 @@ load_genetique_dbh_source_table <- function() {
     as.data.frame(stringsAsFactors = FALSE)
   if (!(RAW_GENETIC_DBH_COLUMN %in% names(raw_df))) {
     stop(
-      "[01_clonality] Required DBH column '", RAW_GENETIC_DBH_COLUMN,
-      "' was not found in the '", sheet,
-      "' sheet of ", workbook,
+      "[01_clonality] Required DBH column 'Dhp_tige' was not found in the 'genetique' sheet of ", workbook,
       ". Available columns: ", paste(names(raw_df), collapse = ", "),
       call. = FALSE
     )

@@ -318,6 +318,19 @@ compact_match_key <- function(...) {
   key
 }
 
+normalize_exact_genetic_id <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x[is.na(x) | x %in% c("", "NA", "N/A", "NaN", "NULL", "null", "na")] <- NA_character_
+  x
+}
+
+looks_like_retained_genetic_id <- function(x) {
+  x <- normalize_exact_genetic_id(x)
+  !is.na(x) & grepl("^[0-9]{2}\\.[0-9]{3,5}\\.[A-Za-z][0-9]+$", x)
+}
+
 coerce_numeric_clonality <- function(x) {
   if (is.numeric(x)) return(as.numeric(x))
   x_chr <- trimws(as.character(x))
@@ -529,166 +542,159 @@ load_genetique_dbh_source_table <- function() {
     )
   }
   site_col <- find_genetic_site_code_col(raw_df)
-  id_col <- find_individual_id_col(raw_df)
-  tree_col <- find_tree_number_col(raw_df)
   message("DBH source: genetique$Dhp_tige")
   message("[01_clonality] Genetic sheet site column used for DBH matching: genetique$", site_col)
-  if (is.na(id_col)) {
-    message("[01_clonality] Individual/sample ID column used for DBH matching: <none detected; fallback keys will be tried>")
-  } else {
-    message("[01_clonality] Individual/sample ID column used for DBH matching: genetique$", id_col)
-  }
   message("[01_clonality] Rows in genetic sheet: ", nrow(raw_df))
-  if (is.na(tree_col)) {
-    message("[01_clonality] No tree/stem number column detected in genetique for fallback DBH matching.")
-  } else {
-    message("[01_clonality] genetique tree/stem number column used for fallback DBH matching: ", tree_col)
-  }
-  data.frame(
-    Source_ID = if (!is.na(id_col)) as.character(raw_df[[id_col]]) else rep(NA_character_, nrow(raw_df)),
-    Original_Site_Code = normalize_lookup_key(raw_df[[site_col]]),
-    Tree_Number = if (!is.na(tree_col)) normalize_tree_number(raw_df[[tree_col]]) else rep(NA_character_, nrow(raw_df)),
-    Dhp_tige = coerce_numeric_clonality(raw_df[[RAW_GENETIC_DBH_COLUMN]]),
-    stringsAsFactors = FALSE
+  list(
+    raw_df = raw_df,
+    site_col = site_col,
+    site = normalize_lookup_key(raw_df[[site_col]]),
+    dbh = coerce_numeric_clonality(raw_df[[RAW_GENETIC_DBH_COLUMN]])
   )
 }
 
-match_retained_dbh_from_genetique <- function(retained_tbl, source_tbl) {
-  make_candidate <- function(method, retained_key, source_key, require_site_agreement = TRUE) {
-    retained_key[is.na(retained_key)] <- ""
-    source_key[is.na(source_key)] <- ""
-    usable_source <- nzchar(source_key)
-    source_key_use <- source_key[usable_source]
-    source_tbl_use <- source_tbl[usable_source, , drop = FALSE]
-    if (anyDuplicated(source_key_use)) {
-      dup_keys <- unique(source_key_use[duplicated(source_key_use)])
-      message(
-        "[01_clonality] Skipping DBH matching method '", method,
-        "' because genetique has duplicate matching keys. Example duplicate key(s): ",
-        paste(head(dup_keys, 5), collapse = ", ")
-      )
-      return(NULL)
-    }
-    idx <- match(retained_key, source_key_use)
-    dbh <- rep(NA_real_, nrow(retained_tbl))
-    source_site <- rep(NA_character_, nrow(retained_tbl))
-    source_row <- rep(NA_integer_, nrow(retained_tbl))
-    key_matched <- !is.na(idx)
-    if (any(key_matched)) {
-      dbh[key_matched] <- source_tbl_use$Dhp_tige[idx[key_matched]]
-      source_site[key_matched] <- source_tbl_use$Original_Site_Code[idx[key_matched]]
-      source_row[key_matched] <- which(usable_source)[idx[key_matched]]
-    }
-    if (isTRUE(require_site_agreement)) {
-      site_ok <- is.na(source_site) | !nzchar(source_site) | source_site == retained_tbl$Site
-      if (any(!site_ok)) {
-        dbh[!site_ok] <- NA_real_
-        source_site[!site_ok] <- NA_character_
-        source_row[!site_ok] <- NA_integer_
-      }
-    }
-    list(
-      dbh = dbh,
-      source_site = source_site,
-      source_row = source_row,
-      matched = !is.na(dbh),
-      n_key_matched = sum(key_matched),
-      n_with_dbh = sum(!is.na(dbh)),
-      method = method
+build_genetique_id_candidate_report <- function(raw_df, retained_tbl) {
+  retained_ids <- normalize_exact_genetic_id(retained_tbl$Individual)
+  retained_ids <- retained_ids[!is.na(retained_ids)]
+  candidate_cols <- setdiff(names(raw_df), RAW_GENETIC_DBH_COLUMN)
+  report <- lapply(candidate_cols, function(col) {
+    values <- normalize_exact_genetic_id(raw_df[[col]])
+    non_missing_values <- values[!is.na(values)]
+    exact_matches <- sum(retained_ids %in% non_missing_values)
+    matched_values <- non_missing_values[non_missing_values %in% retained_ids]
+    data.frame(
+      candidate_column = col,
+      n_non_missing = length(non_missing_values),
+      n_values_looking_like_retained_ids = sum(looks_like_retained_genetic_id(raw_df[[col]]), na.rm = TRUE),
+      n_exact_retained_id_matches = exact_matches,
+      match_rate = exact_matches / nrow(retained_tbl),
+      n_duplicate_matched_ids = sum(duplicated(matched_values)),
+      stringsAsFactors = FALSE
     )
+  })
+  report <- bind_rows(report) %>%
+    arrange(desc(n_exact_retained_id_matches), desc(n_values_looking_like_retained_ids), candidate_column)
+  report
+}
+
+select_genetique_individual_id_column <- function(source_obj, retained_tbl, min_match_rate = 0.95) {
+  report <- build_genetique_id_candidate_report(source_obj$raw_df, retained_tbl)
+  cat("\n[01_clonality] Candidate genetique individual/sample ID column exact-match report:\n")
+  print(dplyr::as_tibble(report), n = Inf)
+  if (nrow(report) == 0) {
+    stop("[01_clonality] No candidate individual/sample ID columns were available in genetique.", call. = FALSE)
   }
-  
-  attempts <- list()
-  if (any(!is.na(source_tbl$Source_ID) & nzchar(source_tbl$Source_ID))) {
-    attempts[["original site code + individual/sample ID"]] <- list(
-      retained_key = compact_match_key(retained_tbl$Site, retained_tbl$Individual),
-      source_key = compact_match_key(source_tbl$Original_Site_Code, source_tbl$Source_ID),
-      require_site_agreement = TRUE
-    )
-    attempts[["individual/sample ID with site verification"]] <- list(
-      retained_key = compact_match_key(retained_tbl$Individual),
-      source_key = compact_match_key(source_tbl$Source_ID),
-      require_site_agreement = TRUE
-    )
-  }
-  if (
-    any(!is.na(retained_tbl$Site) & nzchar(retained_tbl$Site)) &&
-    any(!is.na(source_tbl$Original_Site_Code) & nzchar(source_tbl$Original_Site_Code)) &&
-    any(!is.na(retained_tbl$Tree_Number) & nzchar(retained_tbl$Tree_Number)) &&
-    any(!is.na(source_tbl$Tree_Number) & nzchar(source_tbl$Tree_Number))
-  ) {
-    attempts[["original site code + tree/stem number"]] <- list(
-      retained_key = compact_match_key(retained_tbl$Site, retained_tbl$Tree_Number),
-      source_key = compact_match_key(source_tbl$Original_Site_Code, source_tbl$Tree_Number),
-      require_site_agreement = TRUE
-    )
-  }
-  
-  candidates <- list()
-  for (method in names(attempts)) {
-    candidate <- make_candidate(
-      method = method,
-      retained_key = attempts[[method]]$retained_key,
-      source_key = attempts[[method]]$source_key,
-      require_site_agreement = attempts[[method]]$require_site_agreement
-    )
-    if (!is.null(candidate)) candidates[[method]] <- candidate
-  }
-  
-  if (nrow(retained_tbl) == nrow(source_tbl)) {
-    row_order_ids_match <- all(compact_match_key(retained_tbl$Individual) == compact_match_key(source_tbl$Source_ID))
-    row_order_sites_match <- all(normalize_lookup_key(retained_tbl$Site) == normalize_lookup_key(source_tbl$Original_Site_Code))
-    if (isTRUE(row_order_ids_match) && isTRUE(row_order_sites_match)) {
-      warning(
-        "[01_clonality] Using row-order DBH matching only after verifying that retained IDs and original site codes match genetique row-by-row.",
-        call. = FALSE
-      )
-      preview <- data.frame(
-        retained_individual = head(retained_tbl$Individual, 6),
-        retained_site = head(retained_tbl$Site, 6),
-        genetique_id = head(source_tbl$Source_ID, 6),
-        genetique_site = head(source_tbl$Original_Site_Code, 6),
-        Dhp_tige = head(source_tbl$Dhp_tige, 6),
-        stringsAsFactors = FALSE
-      )
-      print(preview)
-      candidates[["verified row order"]] <- list(
-        dbh = source_tbl$Dhp_tige,
-        source_site = source_tbl$Original_Site_Code,
-        source_row = seq_len(nrow(source_tbl)),
-        matched = !is.na(source_tbl$Dhp_tige),
-        n_key_matched = nrow(source_tbl),
-        n_with_dbh = sum(!is.na(source_tbl$Dhp_tige)),
-        method = "verified row order"
-      )
-    } else if (nrow(source_tbl) == nrow(retained_tbl)) {
-      message(
-        "[01_clonality] Row-order DBH fallback was not used because retained/genetique row-order verification failed ",
-        "(IDs match: ", row_order_ids_match, "; sites match: ", row_order_sites_match, ")."
-      )
-    }
-  }
-  
-  if (length(candidates) == 0) {
+  best <- report[1, , drop = FALSE]
+  message(
+    "[01_clonality] Individual/sample ID column used for DBH matching: genetique$",
+    best$candidate_column,
+    " (", best$n_exact_retained_id_matches, "/", nrow(retained_tbl),
+    " exact retained-ID matches; match rate = ", sprintf("%.1f%%", 100 * best$match_rate), ")"
+  )
+  if (is.na(best$match_rate) || best$match_rate < min_match_rate) {
+    top_report <- utils::capture.output(print(head(report, 10), row.names = FALSE))
     stop(
-      "[01_clonality] Could not build a non-duplicating DBH match from genetique. Need a usable individual/sample ID or original site code + tree/stem number.",
+      "[01_clonality] No exact individual/sample ID column in genetique matched at least ",
+      sprintf("%.0f%%", 100 * min_match_rate),
+      " of retained clonality IDs. Best candidate was '", best$candidate_column,
+      "' with ", best$n_exact_retained_id_matches, "/", nrow(retained_tbl),
+      " matches (", sprintf("%.1f%%", 100 * best$match_rate), ").\n",
+      "Top candidate columns and match counts:\n",
+      paste(top_report, collapse = "\n"),
+      "\nRefusing to fall back to site + Id_tige because that can match the wrong stems and produced the LGG all-1 cm failure.",
       call. = FALSE
     )
   }
-  best_name <- names(candidates)[which.max(vapply(candidates, function(x) x$n_with_dbh, numeric(1)))]
-  best <- candidates[[best_name]]
-  if (is.null(best) || best$n_with_dbh == 0) {
-    stop("[01_clonality] No retained sampled stems matched a Dhp_tige value in genetique.", call. = FALSE)
+  if (best$n_duplicate_matched_ids > 0) {
+    values <- normalize_exact_genetic_id(source_obj$raw_df[[best$candidate_column]])
+    retained_ids <- normalize_exact_genetic_id(retained_tbl$Individual)
+    matched_values <- values[!is.na(values) & values %in% retained_ids]
+    dup_ids <- unique(matched_values[duplicated(matched_values)])
+    stop(
+      "[01_clonality] The selected genetique ID column '", best$candidate_column,
+      "' contains duplicated retained individual IDs, so DBH cannot be joined one-to-one. Example duplicate ID(s): ",
+      paste(head(dup_ids, 10), collapse = ", "),
+      call. = FALSE
+    )
   }
-  best
+  best$candidate_column
+}
+
+match_retained_dbh_from_genetique <- function(retained_tbl, source_obj) {
+  id_col <- select_genetique_individual_id_column(source_obj, retained_tbl, min_match_rate = 0.95)
+  source_ids <- normalize_exact_genetic_id(source_obj$raw_df[[id_col]])
+  retained_ids <- normalize_exact_genetic_id(retained_tbl$Individual)
+  
+  source_use <- data.frame(
+    matched_genetique_ID = source_ids,
+    Original_Site_Code = source_obj$site,
+    Dhp_tige = source_obj$dbh,
+    source_row = seq_len(nrow(source_obj$raw_df)),
+    stringsAsFactors = FALSE
+  ) %>%
+    filter(!is.na(matched_genetique_ID), nzchar(matched_genetique_ID))
+  
+  source_retained <- source_use[source_use$matched_genetique_ID %in% retained_ids, , drop = FALSE]
+  if (anyDuplicated(source_retained$matched_genetique_ID)) {
+    dup_ids <- unique(source_retained$matched_genetique_ID[duplicated(source_retained$matched_genetique_ID)])
+    stop(
+      "[01_clonality] The selected genetique ID column '", id_col,
+      "' is not unique for retained clonality IDs. Example duplicate ID(s): ",
+      paste(head(dup_ids, 10), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  idx <- match(retained_ids, source_use$matched_genetique_ID)
+  joined_retained_tbl <- retained_tbl %>%
+    mutate(
+      retained_individual_ID = retained_ids,
+      matched_genetique_ID = ifelse(!is.na(idx), source_use$matched_genetique_ID[idx], NA_character_),
+      DBH_original_site_code = ifelse(!is.na(idx), source_use$Original_Site_Code[idx], NA_character_),
+      DBH_source_row = ifelse(!is.na(idx), source_use$source_row[idx], NA_integer_),
+      Dhp_tige = ifelse(!is.na(idx), source_use$Dhp_tige[idx], NA_real_)
+    )
+  
+  if (nrow(joined_retained_tbl) > nrow(retained_tbl)) {
+    stop(
+      "[01_clonality] DBH join created more rows than the retained clonality table (",
+      nrow(joined_retained_tbl), " > ", nrow(retained_tbl), ").",
+      call. = FALSE
+    )
+  }
+  if (nrow(joined_retained_tbl) < nrow(retained_tbl)) {
+    stop(
+      "[01_clonality] DBH join dropped retained individuals (",
+      nrow(joined_retained_tbl), " < ", nrow(retained_tbl), ").",
+      call. = FALSE
+    )
+  }
+  if (sum(!is.na(joined_retained_tbl$Dhp_tige)) == 0) {
+    stop("[01_clonality] No DBH values are matched from genetique$Dhp_tige for retained sampled stems.", call. = FALSE)
+  }
+  
+  site_mismatch <- joined_retained_tbl %>%
+    filter(!is.na(DBH_original_site_code), nzchar(DBH_original_site_code), DBH_original_site_code != Site)
+  if (nrow(site_mismatch) > 0) {
+    stop(
+      "[01_clonality] Exact individual ID DBH matching found site mismatches between retained metadata and genetique. Examples:\n",
+      paste(utils::capture.output(print(head(site_mismatch %>% select(Individual, Site, DBH_original_site_code, matched_genetique_ID), 10), row.names = FALSE)), collapse = "\n"),
+      call. = FALSE
+    )
+  }
+  
+  list(
+    joined_retained_tbl = joined_retained_tbl,
+    id_col = id_col,
+    method = paste0("exact retained individual ID via genetique$", id_col)
+  )
 }
 
 
-print_retained_dbh_summary_by_original_site <- function(retained_tbl, dbh_match) {
-  dbh_tbl <- retained_tbl %>%
+print_retained_dbh_summary_by_original_site <- function(joined_retained_tbl) {
+  dbh_tbl <- joined_retained_tbl %>%
     mutate(
-      Site_original = ifelse(!is.na(dbh_match$source_site) & nzchar(dbh_match$source_site), dbh_match$source_site, Site),
-      Dhp_tige = dbh_match$dbh
+      Site_original = ifelse(!is.na(DBH_original_site_code) & nzchar(DBH_original_site_code), DBH_original_site_code, Site)
     )
   summary_tbl <- dbh_tbl %>%
     group_by(Site_original) %>%
@@ -703,13 +709,33 @@ print_retained_dbh_summary_by_original_site <- function(retained_tbl, dbh_match)
     ) %>%
     arrange(Site_original)
   cat("\n[01_clonality] DBH audit table by original 3-letter site code BEFORE applying site_lookup:\n")
-  print(summary_tbl, n = Inf)
-  if ("LGG" %in% summary_tbl$Site_original) {
-    cat("\n[01_clonality] DBH audit row for LGG:\n")
-    print(summary_tbl %>% filter(Site_original == "LGG"), n = Inf)
+  print(dplyr::as_tibble(summary_tbl), n = Inf)
+  
+  lgg_rows <- dbh_tbl %>%
+    filter(Site_original == "LGG") %>%
+    select(Individual, Site_original, matched_genetique_ID, Dhp_tige)
+  if (nrow(lgg_rows) > 0) {
+    cat("\n[01_clonality] Full retained individual DBH rows for LGG:\n")
+    print(dplyr::as_tibble(lgg_rows), n = Inf)
+    lgg_values <- lgg_rows$Dhp_tige[!is.na(lgg_rows$Dhp_tige)]
+    cat("\n[01_clonality] LGG matched Dhp_tige values:\n")
+    print(lgg_values)
+    lgg_mean <- if (length(lgg_values) == 0) NA_real_ else mean(lgg_values)
+    cat("[01_clonality] Calculated LGG mean Dhp_tige: ", lgg_mean, "\n", sep = "")
+    lgg_summary <- summary_tbl %>% filter(Site_original == "LGG")
+    if (nrow(lgg_summary) == 1 && lgg_summary$N_with_DBH >= 20 && !is.na(lgg_summary$max_Dhp_tige) && lgg_summary$max_Dhp_tige == 1) {
+      stop(
+        "LGG DBH matching failed: all matched Dhp_tige values are 1, but manual inspection indicates LGG contains values > 1.",
+        call. = FALSE
+      )
+    }
+    if (!is.na(lgg_mean) && abs(lgg_mean - 2.48) <= 0.10) {
+      message("LGG DBH validation passed.")
+    }
   } else {
     warning("[01_clonality] DBH audit table does not contain original site code LGG.", call. = FALSE)
   }
+  
   suspicious_site_means <- summary_tbl %>%
     filter(!is.na(mean_Dhp_tige), abs(mean_Dhp_tige - 1.0) < .Machine$double.eps^0.5)
   if (nrow(suspicious_site_means) > 0) {
@@ -739,37 +765,15 @@ attach_dbh_to_clonality_assignments <- function(clonality_assignments, df_ids_tb
     stop("[01_clonality] Retained-stem table unexpectedly changed row count while being built.", call. = FALSE)
   }
   message("[01_clonality] Number of retained stems used in clonality: ", nrow(retained_tbl))
-  source_tbl <- load_genetique_dbh_source_table()
-  dbh_match <- match_retained_dbh_from_genetique(retained_tbl, source_tbl)
-  joined_retained_tbl <- retained_tbl %>%
-    mutate(
-      DBH_source_row = dbh_match$source_row,
-      DBH_original_site_code = dbh_match$source_site,
-      Dhp_tige = dbh_match$dbh
-    )
+  source_obj <- load_genetique_dbh_source_table()
+  dbh_match <- match_retained_dbh_from_genetique(retained_tbl, source_obj)
+  joined_retained_tbl <- dbh_match$joined_retained_tbl
+  message("[01_clonality] DBH matching method used: ", dbh_match$method)
   message("[01_clonality] Number of rows after joining DBH to retained stems: ", nrow(joined_retained_tbl))
-  if (nrow(joined_retained_tbl) > nrow(retained_tbl)) {
-    stop(
-      "[01_clonality] DBH join created more rows than the retained-stem table (",
-      nrow(joined_retained_tbl), " > ", nrow(retained_tbl), ").",
-      call. = FALSE
-    )
-  }
-  if (nrow(joined_retained_tbl) < nrow(retained_tbl)) {
-    stop(
-      "[01_clonality] DBH join dropped retained stems unexpectedly (",
-      nrow(joined_retained_tbl), " < ", nrow(retained_tbl), ").",
-      call. = FALSE
-    )
-  }
   n_with_dbh <- sum(!is.na(joined_retained_tbl$Dhp_tige))
   n_missing_dbh <- sum(is.na(joined_retained_tbl$Dhp_tige))
-  message("[01_clonality] DBH matching method used: ", dbh_match$method)
   message("[01_clonality] Number of retained stems with matched Dhp_tige: ", n_with_dbh)
   message("[01_clonality] Number of retained stems missing Dhp_tige: ", n_missing_dbh)
-  if (n_with_dbh == 0) {
-    stop("[01_clonality] No DBH values are matched from genetique$Dhp_tige for retained sampled stems.", call. = FALSE)
-  }
   if (n_missing_dbh > 0) {
     warning(
       "[01_clonality] Some retained sampled stems are missing Dhp_tige values; site means will use available Dhp_tige values only. Missing count: ",
@@ -777,9 +781,10 @@ attach_dbh_to_clonality_assignments <- function(clonality_assignments, df_ids_tb
       call. = FALSE
     )
   }
-  print_retained_dbh_summary_by_original_site(retained_tbl, dbh_match)
+  print_retained_dbh_summary_by_original_site(joined_retained_tbl)
   clonality_assignments$DBH_cm <- joined_retained_tbl$Dhp_tige
   clonality_assignments$DBH_original_site_code <- joined_retained_tbl$DBH_original_site_code
+  clonality_assignments$DBH_matched_genetique_ID <- joined_retained_tbl$matched_genetique_ID
   clonality_assignments
 }
 

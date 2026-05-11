@@ -10,7 +10,7 @@
 #
 # Main outputs:
 # - outputs/tables/genetic_diversity_summary_table.csv
-# - outputs/tables/genetic_diversity_summary_table.xlsx (if openxlsx is available)
+# - outputs/tables/genetic_diversity_summary_table.xlsx
 # - outputs/tables/genetic_diversity_summary_table.docx
 ############################################################
 
@@ -34,11 +34,15 @@ suppressPackageStartupMessages({
   library(readxl)
 })
 
-# Reuse the project root, object-loading, validation, and output-directory
-# strategy used by the main population-genetic scripts.
+# Reuse the project root, object-loading, metadata-alignment, validation, and
+# output-directory strategy used by the main BeechCode genetic scripts.
 source("scripts/_load_objects.R")
 
 SCRIPT_TAG <- "[genetic_diversity_summary_table]"
+EXPECTED_SITE_LABELS <- c("S1", "S2", "S3", "S4", "S5", "S6", "N1", "N2", "N3", "N4", "N5", "N6")
+TABLE_TITLE <- "Table X. Genetic diversity indices for Fagus grandifolia sites ordered from south to north."
+TABLE_NOTE <- "N = number of individuals retained after filtering; Na = mean number of alleles per locus; Ar = rarefied allelic richness; Ho = observed heterozygosity; He = expected heterozygosity; FIS = inbreeding coefficient."
+
 GI_MLL_FILE <- file.path(OBJ_DIR, "gi_mll.rds")
 DF_IDS_FILE <- file.path(OBJ_DIR, "df_ids.rds")
 META_FILE <- file.path(OBJ_DIR, "meta.rds")
@@ -113,6 +117,10 @@ natural_site_rank <- function(x) {
   ifelse(is.na(num), 9999L, prefix_rank * 100L + num)
 }
 
+contains_x_site_labels <- function(x) {
+  any(grepl("^X[0-9]+$", as.character(x)))
+}
+
 # -----------------------------
 # site_lookup loading and site labels/order
 # -----------------------------
@@ -169,7 +177,6 @@ load_site_lookup <- function() {
   
   old_site_col <- pick_column(lookup, c("Site", "site", "site_code", "old_site", "code_site"), "old site code", required = TRUE)
   label_col <- pick_column(lookup, c("Site_label", "site_label", "new_site", "site_new", "label", "site_id"), "new site label")
-  region_col <- pick_column(lookup, c("Region", "region"), "region")
   order_col <- pick_column(lookup, c("Site_order", "site_order", "order", "ordre", "sort", "south_north_order"), "south-to-north order")
   latitude_col <- pick_column(lookup, c("Latitude", "latitude", "lat", "LAT", "Lat", "y", "Y"), "latitude")
   
@@ -179,7 +186,6 @@ load_site_lookup <- function() {
     mutate(
       old_site = normalize_lookup_key(.data[[old_site_col]]),
       site_label = normalize_lookup_key(.data[[label_col]]),
-      region = if (!is.na(region_col)) normalize_lookup_key(.data[[region_col]]) else NA_character_,
       site_order = if (!is.na(order_col)) suppressWarnings(as.numeric(.data[[order_col]])) else NA_real_,
       latitude = if (!is.na(latitude_col)) suppressWarnings(as.numeric(stringr::str_replace_all(as.character(.data[[latitude_col]]), ",", "."))) else NA_real_
     ) %>%
@@ -192,6 +198,9 @@ load_site_lookup <- function() {
   }
   if (anyDuplicated(out$old_site)) {
     stop(SCRIPT_TAG, " site_lookup contains duplicated old site codes after cleaning.", call. = FALSE)
+  }
+  if (anyDuplicated(out$site_label)) {
+    stop(SCRIPT_TAG, " site_lookup contains duplicated display site labels after cleaning.", call. = FALSE)
   }
   
   message(SCRIPT_TAG, " Loaded site_lookup rows: ", nrow(out))
@@ -212,12 +221,9 @@ map_site_labels <- function(site_values) {
   ifelse(is.na(labels) | !nzchar(labels), site_values, labels)
 }
 
-build_site_order_table <- function(original_site_values, display_site_values, df_ids_tbl = NULL) {
-  out <- data.frame(
-    original_site = as.character(original_site_values),
-    Site = as.character(display_site_values),
-    stringsAsFactors = FALSE
-  ) %>%
+build_site_order_table <- function(site_map, df_ids_tbl = NULL) {
+  out <- site_map %>%
+    transmute(original_site = Raw_site, Site = Site) %>%
     distinct(original_site, Site)
   
   if (!is.null(site_lookup)) {
@@ -229,8 +235,7 @@ build_site_order_table <- function(original_site_values, display_site_values, df
         latitude = latitude
       ) %>%
       distinct(original_site, .keep_all = TRUE)
-    out <- out %>%
-      left_join(lookup_order, by = c("original_site", "Site"))
+    out <- out %>% left_join(lookup_order, by = c("original_site", "Site"))
   } else {
     out$lookup_order <- NA_real_
     out$latitude <- NA_real_
@@ -262,15 +267,15 @@ build_site_order_table <- function(original_site_values, display_site_values, df
     message(SCRIPT_TAG, " Ordering sites south-to-north using latitude.")
     out <- out %>% arrange(is.na(latitude), latitude, natural_site_rank(Site), Site)
   } else {
-    message(SCRIPT_TAG, " Ordering sites using natural S1-S6/N1-N6 fallback order.")
-    out <- out %>% arrange(natural_site_rank(Site), Site)
+    message(SCRIPT_TAG, " Ordering sites using expected S1-S6/N1-N6 order.")
+    out <- out %>% mutate(expected_order = match(Site, EXPECTED_SITE_LABELS)) %>% arrange(is.na(expected_order), expected_order, natural_site_rank(Site), Site) %>% select(-expected_order)
   }
   
   out %>% mutate(display_order = row_number())
 }
 
 # -----------------------------
-# Final cleaned genetic dataset
+# Final cleaned genetic dataset and validated site assignment
 # -----------------------------
 if (!exists("gi_mll") || !inherits(gi_mll, "genind")) {
   stop(SCRIPT_TAG, " gi_mll was not loaded as a genind object. Run scripts/00_master_pipeline.R first.", call. = FALSE)
@@ -282,21 +287,68 @@ if (adegenet::nInd(gi_mll) != nrow(df_ids_mll)) {
   stop(SCRIPT_TAG, " nInd(gi_mll) does not match nrow(df_ids_mll).", call. = FALSE)
 }
 
-original_sites <- normalize_lookup_key(as.character(adegenet::pop(gi_mll)))
-if (length(original_sites) != adegenet::nInd(gi_mll) || any(!nzchar(original_sites))) {
-  stop(SCRIPT_TAG, " gi_mll does not contain a complete site/population assignment.", call. = FALSE)
+# Always rebuild population/site labels from df_ids_mll by matching individual ID.
+# This avoids using locus-like labels (X1, X2, ...) if any upstream object has an
+# incorrect pop slot and explicitly confirms every retained individual has a site.
+df_ids_cols_mll <- resolve_df_ids_columns(df_ids_mll, context = SCRIPT_TAG, require = TRUE)
+metadata_ids <- normalize_id(df_ids_mll[[df_ids_cols_mll$id_col]])
+metadata_sites <- normalize_lookup_key(df_ids_mll[[df_ids_cols_mll$site_col]])
+if (anyDuplicated(metadata_ids)) {
+  dup_ids <- unique(df_ids_mll[[df_ids_cols_mll$id_col]][duplicated(metadata_ids)])
+  stop(SCRIPT_TAG, " df_ids_mll contains duplicated individual IDs: ", paste(head(dup_ids, 10), collapse = ", "), call. = FALSE)
 }
 
-display_sites <- map_site_labels(original_sites)
-missing_lookup_sites <- if (!is.null(site_lookup)) setdiff(unique(original_sites), site_lookup$old_site) else character(0)
+match_idx <- match(normalize_id(adegenet::indNames(gi_mll)), metadata_ids)
+if (any(is.na(match_idx))) {
+  missing_ids <- adegenet::indNames(gi_mll)[is.na(match_idx)]
+  stop(SCRIPT_TAG, " Could not match every gi_mll individual to df_ids_mll. Missing examples: ", paste(head(missing_ids, 10), collapse = ", "), call. = FALSE)
+}
+
+raw_sites <- metadata_sites[match_idx]
+if (length(raw_sites) != adegenet::nInd(gi_mll) || any(is.na(raw_sites)) || any(!nzchar(raw_sites))) {
+  bad_ids <- adegenet::indNames(gi_mll)[is.na(raw_sites) | !nzchar(raw_sites)]
+  stop(SCRIPT_TAG, " Every gi_mll individual must have a valid site in df_ids_mll. Problem examples: ", paste(head(bad_ids, 10), collapse = ", "), call. = FALSE)
+}
+if (contains_x_site_labels(raw_sites)) {
+  stop(SCRIPT_TAG, " Raw metadata site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
+}
+
+site_map <- data.frame(
+  Raw_site = raw_sites,
+  Site = map_site_labels(raw_sites),
+  stringsAsFactors = FALSE
+)
+if (contains_x_site_labels(site_map$Site)) {
+  stop(SCRIPT_TAG, " Final site labels contain locus-like X labels after site_lookup mapping; refusing to continue.", call. = FALSE)
+}
+
+missing_lookup_sites <- if (!is.null(site_lookup)) setdiff(unique(raw_sites), site_lookup$old_site) else character(0)
 if (length(missing_lookup_sites) > 0) {
   message(SCRIPT_TAG, " Site code(s) not found in site_lookup and retained as-is: ", paste(missing_lookup_sites, collapse = ", "))
 }
 
-# Work on a copy so the sourced gi_mll object remains intact for any interactive session.
+final_site_labels <- sort(unique(site_map$Site))
+if (!setequal(final_site_labels, EXPECTED_SITE_LABELS)) {
+  stop(
+    SCRIPT_TAG, " Final site labels do not match the expected 12 site labels.",
+    "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+    "\nObserved: ", paste(final_site_labels, collapse = ", "),
+    call. = FALSE
+  )
+}
+
+# Work on a copy so sourced gi_mll remains intact for interactive sessions.
 gen_obj <- gi_mll
-adegenet::pop(gen_obj) <- as.factor(display_sites)
-site_order <- build_site_order_table(unique(original_sites), unique(display_sites), df_ids_tbl = df_ids_mll)
+adegenet::pop(gen_obj) <- factor(site_map$Site, levels = EXPECTED_SITE_LABELS)
+
+if (any(is.na(adegenet::pop(gen_obj)))) {
+  stop(SCRIPT_TAG, " Some individuals have NA pop labels after assigning validated site labels.", call. = FALSE)
+}
+
+site_order <- build_site_order_table(site_map, df_ids_tbl = df_ids_mll)
+if (!setequal(site_order$Site, EXPECTED_SITE_LABELS) || nrow(site_order) != length(EXPECTED_SITE_LABELS)) {
+  stop(SCRIPT_TAG, " Site-order table must contain exactly the 12 expected site labels.", call. = FALSE)
+}
 
 message(SCRIPT_TAG, " Individuals retained after filtering: ", adegenet::nInd(gen_obj))
 message(SCRIPT_TAG, " Loci retained after filtering: ", adegenet::nLoc(gen_obj))
@@ -306,6 +358,10 @@ message(SCRIPT_TAG, " Final site labels: ", paste(site_order$Site, collapse = ",
 # Diversity calculations
 # -----------------------------
 pop_sizes <- table(as.character(adegenet::pop(gen_obj)))
+pop_sizes <- pop_sizes[site_order$Site]
+if (any(is.na(pop_sizes)) || any(pop_sizes <= 0)) {
+  stop(SCRIPT_TAG, " N per site contains missing or zero values after population assignment.", call. = FALSE)
+}
 if (any(pop_sizes < 2)) {
   stop(
     SCRIPT_TAG, " At least one site has fewer than two retained individuals (",
@@ -317,18 +373,42 @@ if (any(pop_sizes < 2)) {
 
 hf <- hierfstat::genind2hierfstat(gen_obj)
 bs <- hierfstat::basic.stats(hf)
-
 if (is.null(bs$Ho) || is.null(bs$Hs) || is.null(bs$Fis)) {
   stop(SCRIPT_TAG, " hierfstat::basic.stats did not return Ho, Hs, and Fis matrices.", call. = FALSE)
 }
 
-site_levels <- rownames(bs$Ho)
-site_n_tbl <- table(as.character(adegenet::pop(gen_obj)))
+# hierfstat::basic.stats stores loci as rows and populations as columns in this
+# project. The previous version accidentally treated rows as sites, producing
+# X1, X2, ..., X15. These helpers explicitly aggregate by population/site.
+extract_basic_stat_by_site <- function(stat_matrix, stat_name, site_labels) {
+  mat <- as.matrix(stat_matrix)
+  storage.mode(mat) <- "numeric"
+  
+  if (all(site_labels %in% colnames(mat))) {
+    out <- vapply(site_labels, function(site) safe_mean(mat[, site]), numeric(1))
+  } else if (all(site_labels %in% rownames(mat))) {
+    out <- vapply(site_labels, function(site) safe_mean(mat[site, ]), numeric(1))
+  } else {
+    stop(
+      SCRIPT_TAG, " Could not find expected site labels in hierfstat basic.stats matrix for ", stat_name,
+      ". Row names: ", paste(head(rownames(mat), 20), collapse = ", "),
+      ". Column names: ", paste(head(colnames(mat), 20), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  data.frame(Site = names(out), value = as.numeric(out), stringsAsFactors = FALSE)
+}
+
+ho_by_site <- extract_basic_stat_by_site(bs$Ho, "Ho", site_order$Site) %>% rename(Ho = value)
+he_by_site <- extract_basic_stat_by_site(bs$Hs, "He", site_order$Site) %>% rename(He = value)
+fis_by_site <- extract_basic_stat_by_site(bs$Fis, "FIS", site_order$Site) %>% rename(FIS = value)
 
 allele_tab <- adegenet::tab(gen_obj, NA.method = "asis")
 loc_fac <- adegenet::locFac(gen_obj)
 loci <- adegenet::locNames(gen_obj)
 site_row_indices <- split(seq_len(nrow(allele_tab)), as.character(adegenet::pop(gen_obj)))
+site_row_indices <- site_row_indices[site_order$Site]
 
 count_alleles_for_site_locus <- function(rows, locus_name) {
   cols <- which(loc_fac == locus_name)
@@ -338,13 +418,15 @@ count_alleles_for_site_locus <- function(rows, locus_name) {
   as.integer(sum(colSums(mat, na.rm = TRUE) > 0))
 }
 
-mean_alleles_by_site <- tidyr::expand_grid(
-  Site = names(site_row_indices),
+allele_counts_by_site_locus <- tidyr::expand_grid(
+  Site = site_order$Site,
   Locus = loci
 ) %>%
   rowwise() %>%
   mutate(Allele_count = count_alleles_for_site_locus(site_row_indices[[Site]], Locus)) %>%
-  ungroup() %>%
+  ungroup()
+
+mean_alleles_by_site <- allele_counts_by_site_locus %>%
   group_by(Site) %>%
   summarise(Na = safe_mean(Allele_count), .groups = "drop")
 
@@ -356,37 +438,42 @@ if (is.null(ar_obj$Ar)) {
   stop(SCRIPT_TAG, " hierfstat::allelic.richness did not return an Ar matrix.", call. = FALSE)
 }
 
-ar_mat <- ar_obj$Ar
-if (all(site_levels %in% colnames(ar_mat))) {
-  allelic_richness_by_site <- data.frame(
-    Site = colnames(ar_mat),
-    Ar = as.numeric(colMeans(ar_mat, na.rm = TRUE)),
-    stringsAsFactors = FALSE
-  )
-} else if (all(site_levels %in% rownames(ar_mat))) {
-  allelic_richness_by_site <- data.frame(
-    Site = rownames(ar_mat),
-    Ar = as.numeric(rowMeans(ar_mat, na.rm = TRUE)),
-    stringsAsFactors = FALSE
-  )
-} else {
-  stop(SCRIPT_TAG, " Could not match allelic.richness Ar matrix dimensions to site labels.", call. = FALSE)
+extract_ar_by_site <- function(ar_matrix, site_labels) {
+  mat <- as.matrix(ar_matrix)
+  storage.mode(mat) <- "numeric"
+  
+  if (all(site_labels %in% colnames(mat))) {
+    out <- vapply(site_labels, function(site) safe_mean(mat[, site]), numeric(1))
+  } else if (all(site_labels %in% rownames(mat))) {
+    out <- vapply(site_labels, function(site) safe_mean(mat[site, ]), numeric(1))
+  } else {
+    stop(
+      SCRIPT_TAG, " Could not find expected site labels in hierfstat allelic.richness Ar matrix.",
+      " Row names: ", paste(head(rownames(mat), 20), collapse = ", "),
+      ". Column names: ", paste(head(colnames(mat), 20), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  data.frame(Site = names(out), Ar = as.numeric(out), stringsAsFactors = FALSE)
 }
 
-heterozygosity_by_site <- data.frame(
-  Site = site_levels,
-  N = as.integer(site_n_tbl[site_levels]),
-  Ho = apply(bs$Ho, 1, safe_mean),
-  He = apply(bs$Hs, 1, safe_mean),
-  FIS = apply(bs$Fis, 1, safe_mean),
+allelic_richness_by_site <- extract_ar_by_site(ar_obj$Ar, site_order$Site)
+
+n_by_site <- data.frame(
+  Site = names(pop_sizes),
+  N = as.integer(pop_sizes),
   stringsAsFactors = FALSE
 )
 
-genetic_diversity_summary_table <- heterozygosity_by_site %>%
+genetic_diversity_summary_table <- n_by_site %>%
   left_join(mean_alleles_by_site, by = "Site") %>%
   left_join(allelic_richness_by_site, by = "Site") %>%
+  left_join(ho_by_site, by = "Site") %>%
+  left_join(he_by_site, by = "Site") %>%
+  left_join(fis_by_site, by = "Site") %>%
   left_join(site_order %>% select(Site, display_order), by = "Site") %>%
-  arrange(display_order, Site) %>%
+  arrange(display_order) %>%
   transmute(
     Site = Site,
     N = as.integer(N),
@@ -407,12 +494,33 @@ genetic_diversity_summary_table_word <- genetic_diversity_summary_table %>%
   )
 
 # -----------------------------
+# Strong diagnostic checks requested for this standalone table
+# -----------------------------
+if (nrow(genetic_diversity_summary_table) != 12) {
+  stop(SCRIPT_TAG, " Final table must have exactly 12 rows, but it has ", nrow(genetic_diversity_summary_table), ".", call. = FALSE)
+}
+if (!identical(genetic_diversity_summary_table$Site, site_order$Site)) {
+  stop(SCRIPT_TAG, " Final table site order does not match the south-to-north site-order table.", call. = FALSE)
+}
+if (!setequal(genetic_diversity_summary_table$Site, EXPECTED_SITE_LABELS)) {
+  stop(SCRIPT_TAG, " Final table does not contain exactly S1-S6 and N1-N6.", call. = FALSE)
+}
+if (contains_x_site_labels(genetic_diversity_summary_table$Site)) {
+  stop(SCRIPT_TAG, " Final table contains locus-like X site labels (e.g., X1, X2), indicating a transposed/basic.stats orientation problem.", call. = FALSE)
+}
+if (any(is.na(genetic_diversity_summary_table$N))) {
+  stop(SCRIPT_TAG, " Final table N contains NA values.", call. = FALSE)
+}
+if (any(is.na(genetic_diversity_summary_table$Na))) {
+  stop(SCRIPT_TAG, " Final table Na contains NA values.", call. = FALSE)
+}
+
+# -----------------------------
 # Export helpers
 # -----------------------------
 write_genetic_diversity_xlsx <- function(summary_tbl, path) {
   if (!has_openxlsx) {
-    message(SCRIPT_TAG, " openxlsx is not available; skipping optional Excel export.")
-    return(NA_character_)
+    stop(SCRIPT_TAG, " openxlsx is required to save ", path, " but is not available in this R session.", call. = FALSE)
   }
   
   wb <- openxlsx::createWorkbook()
@@ -434,7 +542,7 @@ write_genetic_diversity_xlsx <- function(summary_tbl, path) {
   openxlsx::freezePane(wb, sheet, firstRow = TRUE)
   openxlsx::setColWidths(wb, sheet, cols = seq_len(ncol(summary_tbl)), widths = "auto")
   openxlsx::saveWorkbook(wb, path, overwrite = TRUE)
-  path
+  invisible(path)
 }
 
 xml_escape_word <- function(x) {
@@ -539,7 +647,7 @@ write_genetic_diversity_docx <- function(summary_tbl, path, title, note) {
   
   docx_status <- tryCatch(
     {
-      if (has_officer && has_flextable) {
+      if (has_officer && has_flextable && "body_add_flextable" %in% getNamespaceExports("flextable")) {
         ft <- flextable::flextable(summary_tbl) %>%
           flextable::theme_booktabs() %>%
           flextable::autofit() %>%
@@ -551,10 +659,10 @@ write_genetic_diversity_docx <- function(summary_tbl, path, title, note) {
         
         doc <- officer::read_docx()
         doc <- officer::body_add_par(doc, title, style = "heading 1")
-        doc <- officer::body_add_flextable(doc, ft)
+        doc <- flextable::body_add_flextable(doc, value = ft)
         doc <- officer::body_add_par(doc, note, style = "Normal")
         print(doc, target = path)
-        "created with flextable"
+        "created with flextable::body_add_flextable"
       } else if (has_officer) {
         message(SCRIPT_TAG, " flextable is not available/loadable; creating the Word table with officer::body_add_table instead.")
         doc <- officer::read_docx()
@@ -591,29 +699,26 @@ main_csv <- file.path(TABLES_DIR, "genetic_diversity_summary_table.csv")
 main_xlsx <- file.path(TABLES_DIR, "genetic_diversity_summary_table.xlsx")
 main_docx <- file.path(TABLES_DIR, "genetic_diversity_summary_table.docx")
 
-table_title <- "Table X. Genetic diversity indices for Fagus grandifolia sites ordered from south to north."
-table_note <- "N = number of individuals retained after filtering; Na = mean number of alleles per locus; Ar = allelic richness; Ho = observed heterozygosity; He = expected heterozygosity; FIS = inbreeding coefficient."
-
 write.csv(genetic_diversity_summary_table, main_csv, row.names = FALSE, na = "")
 message(SCRIPT_TAG, " Saved CSV table: ", main_csv)
 
-xlsx_path <- write_genetic_diversity_xlsx(genetic_diversity_summary_table, main_xlsx)
-if (!is.na(xlsx_path)) message(SCRIPT_TAG, " Saved Excel table: ", xlsx_path)
+write_genetic_diversity_xlsx(genetic_diversity_summary_table, main_xlsx)
+message(SCRIPT_TAG, " Saved Excel table: ", main_xlsx)
 
-write_genetic_diversity_docx(genetic_diversity_summary_table_word, main_docx, title = table_title, note = table_note)
+write_genetic_diversity_docx(genetic_diversity_summary_table_word, main_docx, title = TABLE_TITLE, note = TABLE_NOTE)
 
 # -----------------------------
 # Final console diagnostics
 # -----------------------------
-message("\n", SCRIPT_TAG, " Final diagnostic table:")
+message("\n", SCRIPT_TAG, " Final N per site:")
 print(genetic_diversity_summary_table %>% select(Site, N), row.names = FALSE)
 
-message("\n", SCRIPT_TAG, " Genetic diversity summary table:")
+message("\n", SCRIPT_TAG, " Final genetic diversity table:")
 print(genetic_diversity_summary_table_word, row.names = FALSE)
 
-message("\n", SCRIPT_TAG, " Files saved:")
+message("\n", SCRIPT_TAG, " Saved output paths:")
 message(" - ", main_csv)
-if (!is.na(xlsx_path)) message(" - ", xlsx_path)
+message(" - ", main_xlsx)
 message(" - ", main_docx)
 
 message("\n", SCRIPT_TAG, " Dataset used:")

@@ -107,6 +107,33 @@ if (length(bruvo_replen) != n_loci || any(is.na(bruvo_replen))) {
   stop(SCRIPT_TAG, " Bruvo repeat lengths are missing or incomplete.", call. = FALSE)
 }
 
+run_bruvo_call <- function(expr, context) {
+  captured_warnings <- character(0)
+  value <- withCallingHandlers(
+    expr,
+    warning = function(w) {
+      msg <- conditionMessage(w)
+      if (grepl("NAs introduced by coercion", msg, fixed = TRUE)) {
+        captured_warnings <<- c(captured_warnings, msg)
+        invokeRestart("muffleWarning")
+      }
+    }
+  )
+  list(
+    value = value,
+    warning_count = length(captured_warnings),
+    warning_messages = unique(captured_warnings),
+    context = context
+  )
+}
+
+format_warning_messages <- function(messages) {
+  if (length(messages) == 0) {
+    return(NA_character_)
+  }
+  paste(messages, collapse = " | ")
+}
+
 make_exact_mlg_labels <- function(x) {
   gc <- poppr::as.genclone(x)
   raw <- poppr::mlg.vector(gc)
@@ -115,14 +142,20 @@ make_exact_mlg_labels <- function(x) {
 
 make_bruvo_mll_labels <- function(x, threshold, algorithm, replen) {
   gc_mll <- poppr::as.genclone(x)
-  poppr::mlg.filter(
-    gc_mll,
-    distance = poppr::bruvo.dist,
-    replen = replen,
-    algorithm = algorithm
-  ) <- threshold
+  bruvo_filter_result <- run_bruvo_call({
+    poppr::mlg.filter(
+      gc_mll,
+      distance = poppr::bruvo.dist,
+      replen = replen,
+      algorithm = algorithm
+    ) <- threshold
+  }, context = "poppr::mlg.filter")
   raw <- poppr::mll(gc_mll)
-  paste0("MLL_", as.integer(factor(raw)))
+  list(
+    labels = paste0("MLL_", as.integer(factor(raw))),
+    warning_count = bruvo_filter_result$warning_count,
+    warning_messages = bruvo_filter_result$warning_messages
+  )
 }
 
 extract_final_mll_labels <- function(df_ids_tbl, x) {
@@ -144,12 +177,13 @@ extract_final_mlg_labels <- function(df_ids_tbl, x) {
 }
 
 exact_mlg_labels <- make_exact_mlg_labels(gobj)
-diagnostic_mll_labels <- make_bruvo_mll_labels(
+diagnostic_mll_result <- make_bruvo_mll_labels(
   gobj,
   threshold = BRUVO_MLL_THRESHOLD,
   algorithm = BRUVO_ALGORITHM,
   replen = bruvo_replen
 )
+diagnostic_mll_labels <- diagnostic_mll_result$labels
 final_mlg_labels <- extract_final_mlg_labels(df_ids, gobj)
 final_mll_labels <- extract_final_mll_labels(df_ids, gobj)
 
@@ -168,7 +202,11 @@ bruvo_matches_current_final_mll <- if (is.na(current_final_mll_total)) {
   identical(as.integer(diagnostic_bruvo_mll_total), as.integer(current_final_mll_total))
 }
 
-bruvo_dist <- poppr::bruvo.dist(gobj, replen = bruvo_replen)
+bruvo_dist_result <- run_bruvo_call(
+  poppr::bruvo.dist(gobj, replen = bruvo_replen),
+  context = "poppr::bruvo.dist"
+)
+bruvo_dist <- bruvo_dist_result$value
 bruvo_values <- as.numeric(bruvo_dist)
 bruvo_values <- bruvo_values[is.finite(bruvo_values)]
 
@@ -180,6 +218,11 @@ pairwise_le_threshold <- sum(bruvo_values <= BRUVO_MLL_THRESHOLD, na.rm = TRUE)
 pairwise_gt_threshold <- sum(bruvo_values > BRUVO_MLL_THRESHOLD, na.rm = TRUE)
 percent_le_threshold <- 100 * pairwise_le_threshold / length(bruvo_values)
 percent_gt_threshold <- 100 * pairwise_gt_threshold / length(bruvo_values)
+bruvo_coercion_warning_count <- diagnostic_mll_result$warning_count + bruvo_dist_result$warning_count
+bruvo_coercion_warning_messages <- unique(c(
+  diagnostic_mll_result$warning_messages,
+  bruvo_dist_result$warning_messages
+))
 
 summary_tbl <- data.frame(
   object_used = OBJECT_USED,
@@ -192,6 +235,8 @@ summary_tbl <- data.frame(
   bruvo_threshold = BRUVO_MLL_THRESHOLD,
   bruvo_algorithm = BRUVO_ALGORITHM,
   bruvo_replen = paste(paste(names(bruvo_replen), bruvo_replen, sep = "="), collapse = ";"),
+  captured_bruvo_na_coercion_warning_count = bruvo_coercion_warning_count,
+  captured_bruvo_na_coercion_warning_messages = format_warning_messages(bruvo_coercion_warning_messages),
   n_pairwise_distances = length(bruvo_values),
   min_bruvo_distance = min(bruvo_values, na.rm = TRUE),
   first_quartile_bruvo_distance = as.numeric(stats::quantile(bruvo_values, 0.25, na.rm = TRUE, names = FALSE)),
@@ -237,6 +282,15 @@ cat(SCRIPT_TAG, " Original final clonality code uses Bruvo distance: ", original
 cat(SCRIPT_TAG, " Original final clonality code calls poppr::bruvo.dist/bruvo.dist: ", original_calls_explicit_bruvo_dist, "\n", sep = "")
 cat(SCRIPT_TAG, " Original final clonality code contains threshold 0.09: ", original_threshold_found, "\n", sep = "")
 cat(SCRIPT_TAG, " Repeat length information used: constant replen = 2 for each retained locus\n", sep = "")
+cat(SCRIPT_TAG, " Captured and muffled expected Bruvo NA-coercion warnings: ", bruvo_coercion_warning_count, "\n", sep = "")
+if (bruvo_coercion_warning_count > 0) {
+  cat(
+    SCRIPT_TAG,
+    " Note: poppr can emit these warnings while converting missing microsatellite allele values internally; ",
+    "the warnings were captured to keep source() output clean and their count/messages were saved in the summary CSV.\n",
+    sep = ""
+  )
+}
 cat(SCRIPT_TAG, " Current final MLG total: ", current_final_mlg_total, "\n", sep = "")
 cat(SCRIPT_TAG, " Current final MLL total: ", current_final_mll_total, "\n", sep = "")
 cat(SCRIPT_TAG, " Diagnostic exact MLG total: ", exact_mlg_total, "\n", sep = "")

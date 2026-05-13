@@ -606,6 +606,19 @@ write_basic_docx_table <- function(df, path, title, note = NULL) {
   invisible(path)
 }
 
+add_flextable_to_docx <- function(doc, ft) {
+  if (requireNamespace("flextable", quietly = TRUE) && "body_add_flextable" %in% getNamespaceExports("flextable")) {
+    return(flextable::body_add_flextable(doc, value = ft))
+  }
+  if (requireNamespace("officer", quietly = TRUE) && "body_add_flextable" %in% getNamespaceExports("officer")) {
+    return(officer::body_add_flextable(doc, value = ft))
+  }
+  stop(
+    "No compatible body_add_flextable() function is exported by the installed officer/flextable packages.",
+    call. = FALSE
+  )
+}
+
 write_dbh_docx <- function(class_summary, path, figure_path) {
   title <- "Sampled-stem DBH distribution"
   note <- "This table summarizes DBH classes for the sampled Fagus grandifolia stems included in the full genetic/clonality dataset. DBH values are rounded to the nearest centimetre for class assignment; stems rounded above 8 cm are grouped as >8 cm."
@@ -626,13 +639,13 @@ write_dbh_docx <- function(class_summary, path, figure_path) {
         doc <- officer::read_docx()
         doc <- officer::body_add_par(doc, title, style = "heading 1")
         doc <- officer::body_add_par(doc, note, style = "Normal")
-        doc <- officer::body_add_flextable(doc, ft)
+        doc <- add_flextable_to_docx(doc, ft)
         if (file.exists(figure_path)) {
           doc <- officer::body_add_par(doc, "Figure. DBH distribution of sampled Fagus grandifolia stems.", style = "Normal")
           doc <- officer::body_add_img(doc, src = figure_path, width = 6.5, height = 4.5)
         }
         print(doc, target = path)
-        "created with officer + flextable"
+        "created with compatible officer/flextable export"
       } else if (requireNamespace("officer", quietly = TRUE)) {
         doc <- officer::read_docx()
         doc <- officer::body_add_par(doc, title, style = "heading 1")

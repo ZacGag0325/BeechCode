@@ -18,6 +18,7 @@ suppressPackageStartupMessages({
   library(pegas)
   library(dplyr)
   library(tidyr)
+  library(readxl)
   library(ggplot2)
   library(rlang)
 })
@@ -29,6 +30,8 @@ source("scripts/_load_objects.R")
 # ------------------------------------------------------------------
 suspect_null_loci <- c("EJV8T_A_0", "ERHBI_A_0", "FCM5", "FG5")
 analysis_suffix <- "noSuspectLoci"
+EXPECTED_SITE_LABELS <- c("S1", "S2", "S3", "S4", "S5", "S6", "N1", "N2", "N3", "N4", "N5", "N6")
+SITE_LOOKUP_SHEET <- "site_lookup"
 AMOVA_PERMUTATIONS <- 999
 HWE_MONTE_CARLO_REPS <- 9999L
 BRUVO_MLL_THRESHOLD <- 0.09
@@ -61,6 +64,274 @@ normalize_site <- function(x) {
 safe_row_mean <- function(x) {
   if (all(is.na(x))) return(NA_real_)
   mean(x, na.rm = TRUE)
+}
+
+normalize_lookup_key <- function(x) {
+  x <- trimws(as.character(x))
+  x <- gsub("\uFEFF", "", x, fixed = TRUE)
+  x <- gsub("[[:cntrl:]]", "", x)
+  x[is.na(x)] <- ""
+  x
+}
+
+normalize_ascii <- function(x) {
+  x <- iconv(as.character(x), from = "", to = "ASCII//TRANSLIT")
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "_", x)
+  x <- gsub("_+", "_", x)
+  gsub("^_|_$", "", x)
+}
+
+pick_column <- function(df, choices, label = "column", required = FALSE) {
+  idx <- match(TRUE, normalize_ascii(names(df)) %in% normalize_ascii(choices), nomatch = 0)
+  if (idx == 0) {
+    if (required) {
+      stop("[hwe_sensitivity] Could not find required ", label, ". Accepted names: ", paste(choices, collapse = ", "), call. = FALSE)
+    }
+    return(NA_character_)
+  }
+  names(df)[idx]
+}
+
+safe_mean <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) == 0 || all(is.na(x))) return(NA_real_)
+  mean(x, na.rm = TRUE)
+}
+
+safe_se <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  x <- x[!is.na(x)]
+  if (length(x) <= 1) return(NA_real_)
+  stats::sd(x) / sqrt(length(x))
+}
+
+contains_x_site_labels <- function(x) {
+  any(grepl("^X[0-9]+$", as.character(x)))
+}
+
+find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", "raw"), sheet = SITE_LOOKUP_SHEET) {
+  if (!dir.exists(raw_dir)) {
+    message("[hwe_sensitivity] site_lookup unavailable because data/raw does not exist: ", raw_dir)
+    return(NULL)
+  }
+  
+  excel_files <- list.files(raw_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
+  if (length(excel_files) == 0) {
+    message("[hwe_sensitivity] site_lookup unavailable: no Excel workbook was found in data/raw.")
+    return(NULL)
+  }
+  
+  has_lookup <- vapply(
+    excel_files,
+    function(path) {
+      sheets <- tryCatch(readxl::excel_sheets(path), error = function(e) character(0))
+      any(normalize_ascii(sheets) == normalize_ascii(sheet))
+    },
+    logical(1)
+  )
+  lookup_files <- excel_files[has_lookup]
+  
+  if (length(lookup_files) == 0) {
+    message("[hwe_sensitivity] site_lookup unavailable: no workbook in data/raw contains a '", sheet, "' sheet.")
+    return(NULL)
+  }
+  if (length(lookup_files) > 1) {
+    message("[hwe_sensitivity] Multiple workbooks contain site_lookup; using ", basename(lookup_files[1]), ".")
+  } else {
+    message("[hwe_sensitivity] Reading site_lookup from: ", basename(lookup_files[1]))
+  }
+  
+  lookup_files[1]
+}
+
+load_site_lookup <- function() {
+  workbook <- find_site_lookup_workbook()
+  if (is.null(workbook)) return(NULL)
+  
+  sheets <- readxl::excel_sheets(workbook)
+  sheet <- sheets[match(normalize_ascii(SITE_LOOKUP_SHEET), normalize_ascii(sheets))]
+  lookup <- suppressMessages(readxl::read_excel(workbook, sheet = sheet)) %>%
+    as.data.frame(stringsAsFactors = FALSE)
+  
+  old_site_col <- pick_column(lookup, c("Site", "site", "site_code", "old_site", "code_site"), "old site code", required = TRUE)
+  label_col <- pick_column(lookup, c("Site_label", "site_label", "new_site", "site_new", "label", "site_id"), "display site label")
+  order_col <- pick_column(lookup, c("Site_order", "site_order", "order", "ordre", "sort", "south_north_order"), "south-to-north site order")
+  
+  if (is.na(label_col)) label_col <- old_site_col
+  
+  out <- lookup %>%
+    mutate(
+      old_site = normalize_lookup_key(.data[[old_site_col]]),
+      site_label = normalize_lookup_key(.data[[label_col]]),
+      site_order = if (!is.na(order_col)) suppressWarnings(as.numeric(.data[[order_col]])) else NA_real_
+    ) %>%
+    filter(nzchar(old_site), nzchar(site_label)) %>%
+    distinct(old_site, .keep_all = TRUE)
+  
+  if (nrow(out) == 0) {
+    message("[hwe_sensitivity] site_lookup was found but no usable rows were detected; raw site labels will be retained.")
+    return(NULL)
+  }
+  if (anyDuplicated(out$old_site)) {
+    stop("[hwe_sensitivity] site_lookup contains duplicated old site codes after cleaning.", call. = FALSE)
+  }
+  if (anyDuplicated(out$site_label)) {
+    stop("[hwe_sensitivity] site_lookup contains duplicated display site labels after cleaning.", call. = FALSE)
+  }
+  
+  message("[hwe_sensitivity] Loaded site_lookup rows: ", nrow(out))
+  out
+}
+
+site_lookup <- load_site_lookup()
+
+map_site_labels <- function(site_values) {
+  site_values <- normalize_lookup_key(site_values)
+  if (is.null(site_lookup)) return(site_values)
+  
+  idx <- match(site_values, site_lookup$old_site)
+  labels <- site_lookup$site_label[idx]
+  ifelse(is.na(labels) | !nzchar(labels), site_values, labels)
+}
+
+build_site_order <- function(site_labels) {
+  sites <- unique(as.character(site_labels))
+  out <- data.frame(Site = sites, stringsAsFactors = FALSE)
+  
+  if (!is.null(site_lookup)) {
+    lookup_order <- site_lookup %>%
+      transmute(Site = site_label, site_order = site_order) %>%
+      distinct(Site, .keep_all = TRUE)
+    out <- out %>% left_join(lookup_order, by = "Site")
+  } else {
+    out$site_order <- NA_real_
+  }
+  
+  out %>%
+    mutate(expected_order = match(Site, EXPECTED_SITE_LABELS)) %>%
+    arrange(is.na(site_order), site_order, is.na(expected_order), expected_order, Site) %>%
+    transmute(Site)
+}
+
+get_clone_corrected_site_labels <- function(gobj) {
+  validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[hwe_sensitivity] df_ids_mll")
+  if (!all(adegenet::indNames(gobj) == df_ids_mll$ind_id)) {
+    stop("[hwe_sensitivity] Clone-corrected genind object is not aligned with df_ids_mll.", call. = FALSE)
+  }
+  
+  raw_sites <- normalize_lookup_key(df_ids_mll$Site)
+  if (any(!nzchar(raw_sites))) {
+    bad_ids <- df_ids_mll$ind_id[!nzchar(raw_sites)]
+    stop("[hwe_sensitivity] df_ids_mll contains missing/blank Site labels for: ", paste(head(bad_ids, 10), collapse = ", "), call. = FALSE)
+  }
+  if (contains_x_site_labels(raw_sites)) {
+    stop("[hwe_sensitivity] Raw df_ids_mll site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
+  }
+  
+  site_labels <- map_site_labels(raw_sites)
+  if (contains_x_site_labels(site_labels)) {
+    stop("[hwe_sensitivity] Final mapped site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
+  }
+  if (!setequal(unique(site_labels), EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] Final clone-corrected site labels must be exactly S1-S6 and N1-N6.",
+      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+      "\nObserved: ", paste(sort(unique(site_labels)), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  site_labels
+}
+
+extract_basic_stat_by_site <- function(stat_matrix, site_labels, stat_name) {
+  mat <- as.matrix(stat_matrix)
+  storage.mode(mat) <- "numeric"
+  
+  if (all(site_labels %in% colnames(mat))) {
+    values <- vapply(site_labels, function(site) safe_mean(mat[, site]), numeric(1))
+  } else if (all(site_labels %in% rownames(mat))) {
+    values <- vapply(site_labels, function(site) safe_mean(mat[site, ]), numeric(1))
+  } else {
+    stop(
+      "[hwe_sensitivity] Could not locate site labels in basic.stats matrix for ", stat_name, ".",
+      " Row names: ", paste(head(rownames(mat), 20), collapse = ", "),
+      ". Column names: ", paste(head(colnames(mat), 20), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  data.frame(Site = names(values), value = as.numeric(values), stringsAsFactors = FALSE)
+}
+
+extract_basic_stat_by_locus <- function(stat_matrix, stat_name, site_labels) {
+  mat <- as.matrix(stat_matrix)
+  storage.mode(mat) <- "numeric"
+  
+  if (all(site_labels %in% colnames(mat))) {
+    values <- apply(mat, 1, safe_mean)
+    loci <- rownames(mat)
+  } else if (all(site_labels %in% rownames(mat))) {
+    values <- apply(mat, 2, safe_mean)
+    loci <- colnames(mat)
+  } else {
+    values <- numeric(0)
+    loci <- character(0)
+  }
+  
+  data.frame(Locus = loci, value = as.numeric(values), stringsAsFactors = FALSE) %>%
+    rename(!!stat_name := value)
+}
+
+extract_ar_by_site <- function(ar_matrix, site_labels) {
+  mat <- as.matrix(ar_matrix)
+  storage.mode(mat) <- "numeric"
+  
+  if (all(site_labels %in% colnames(mat))) {
+    out <- vapply(site_labels, function(site) safe_mean(mat[, site]), numeric(1))
+    out_se <- vapply(site_labels, function(site) safe_se(mat[, site]), numeric(1))
+  } else if (all(site_labels %in% rownames(mat))) {
+    out <- vapply(site_labels, function(site) safe_mean(mat[site, ]), numeric(1))
+    out_se <- vapply(site_labels, function(site) safe_se(mat[site, ]), numeric(1))
+  } else {
+    stop(
+      "[hwe_sensitivity] Could not locate site labels in allelic.richness Ar matrix.",
+      " Row names: ", paste(head(rownames(mat), 20), collapse = ", "),
+      ". Column names: ", paste(head(colnames(mat), 20), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  data.frame(
+    Site = names(out),
+    Allelic_Richness = as.numeric(out),
+    Allelic_Richness_SE = as.numeric(out_se),
+    stringsAsFactors = FALSE
+  )
+}
+
+compute_na_by_site <- function(gobj, site_order) {
+  allele_tab <- adegenet::tab(gobj, NA.method = "asis")
+  loc_fac <- adegenet::locFac(gobj)
+  loci <- adegenet::locNames(gobj)
+  site_row_indices <- split(seq_len(nrow(allele_tab)), as.character(adegenet::pop(gobj)))
+  site_row_indices <- site_row_indices[site_order]
+  
+  count_alleles_for_site_locus <- function(rows, locus_name) {
+    cols <- which(loc_fac == locus_name)
+    if (length(cols) == 0 || length(rows) == 0) return(NA_integer_)
+    mat <- allele_tab[rows, cols, drop = FALSE]
+    if (all(is.na(mat))) return(NA_integer_)
+    as.integer(sum(colSums(mat, na.rm = TRUE) > 0))
+  }
+  
+  expand.grid(Site = site_order, Locus = loci, stringsAsFactors = FALSE) %>%
+    rowwise() %>%
+    mutate(Allele_count = count_alleles_for_site_locus(site_row_indices[[Site]], Locus)) %>%
+    ungroup() %>%
+    group_by(Site) %>%
+    summarise(Na = safe_mean(Allele_count), .groups = "drop")
 }
 
 extract_overall_stat <- function(overall_obj, stat_name) {
@@ -238,19 +509,60 @@ make_reduced_genind <- function(gobj, loci_to_remove) {
 run_diversity_bundle <- function(gobj, dataset_label) {
   hf <- hierfstat::genind2hierfstat(gobj)
   bs <- hierfstat::basic.stats(hf)
+  if (is.null(bs$Ho) || is.null(bs$Hs) || is.null(bs$Fis)) {
+    stop("[hwe_sensitivity] hierfstat::basic.stats did not return Ho, Hs, and Fis matrices for ", dataset_label, ".", call. = FALSE)
+  }
   
-  site_levels <- rownames(bs$Ho)
-  site_n_tbl <- table(as.character(adegenet::pop(gobj)))
+  site_order <- levels(droplevels(adegenet::pop(gobj)))
+  if (is.null(site_order) || length(site_order) == 0) site_order <- unique(as.character(adegenet::pop(gobj)))
+  if (contains_x_site_labels(site_order)) {
+    stop("[hwe_sensitivity] ", dataset_label, " site labels contain locus-like X labels; refusing to write by-site diversity output.", call. = FALSE)
+  }
   
-  by_site <- data.frame(
-    Dataset = dataset_label,
-    Site = site_levels,
-    N = as.integer(site_n_tbl[site_levels]),
-    Ho = apply(bs$Ho, 1, safe_row_mean),
-    He = apply(bs$Hs, 1, safe_row_mean),
-    FIS = apply(bs$Fis, 1, safe_row_mean),
-    stringsAsFactors = FALSE
-  )
+  ho_by_site <- extract_basic_stat_by_site(bs$Ho, site_order, "Ho") %>% rename(Ho = value)
+  he_by_site <- extract_basic_stat_by_site(bs$Hs, site_order, "He") %>% rename(He = value)
+  fis_by_site <- extract_basic_stat_by_site(bs$Fis, site_order, "FIS") %>% rename(FIS = value)
+  
+  pop_sizes <- table(as.character(adegenet::pop(gobj)))
+  pop_sizes <- pop_sizes[site_order]
+  if (any(is.na(pop_sizes)) || any(pop_sizes <= 0)) {
+    stop("[hwe_sensitivity] ", dataset_label, " N per site contains missing or zero values after site assignment.", call. = FALSE)
+  }
+  n_by_site <- data.frame(Site = names(pop_sizes), N = as.integer(pop_sizes), stringsAsFactors = FALSE)
+  na_by_site <- compute_na_by_site(gobj, site_order)
+  
+  min_n <- min(as.integer(pop_sizes), na.rm = TRUE)
+  ar <- if (!is.na(min_n) && min_n >= 2) hierfstat::allelic.richness(hf, min.n = min_n) else NULL
+  
+  if (is.null(ar) || is.null(ar$Ar)) {
+    ar_by_site <- data.frame(
+      Site = site_order,
+      Allelic_Richness = NA_real_,
+      Allelic_Richness_SE = NA_real_,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    ar_by_site <- extract_ar_by_site(ar$Ar, site_order)
+  }
+  
+  by_site <- n_by_site %>%
+    left_join(na_by_site, by = "Site") %>%
+    left_join(ar_by_site, by = "Site") %>%
+    left_join(ho_by_site, by = "Site") %>%
+    left_join(he_by_site, by = "Site") %>%
+    left_join(fis_by_site, by = "Site") %>%
+    mutate(Dataset = dataset_label) %>%
+    select(Dataset, Site, N, Na, Ho, He, FIS, Allelic_Richness, Allelic_Richness_SE)
+  
+  if (nrow(by_site) != length(site_order) || contains_x_site_labels(by_site$Site)) {
+    stop("[hwe_sensitivity] ", dataset_label, " by-site diversity table failed site-label validation.", call. = FALSE)
+  }
+  
+  by_locus <- extract_basic_stat_by_locus(bs$Ho, "Ho", site_order) %>%
+    full_join(extract_basic_stat_by_locus(bs$Hs, "He", site_order), by = "Locus") %>%
+    full_join(extract_basic_stat_by_locus(bs$Fis, "FIS", site_order), by = "Locus") %>%
+    mutate(Dataset = dataset_label) %>%
+    select(Dataset, Locus, Ho, He, FIS)
   
   overall_ho <- extract_overall_stat(bs$overall, "Ho")
   overall_he <- extract_overall_stat(bs$overall, "Hs")
@@ -270,30 +582,7 @@ run_diversity_bundle <- function(gobj, dataset_label) {
     stringsAsFactors = FALSE
   )
   
-  pop_sizes <- table(adegenet::pop(gobj))
-  min_n <- min(pop_sizes)
-  ar <- if (!is.na(min_n) && min_n >= 2) hierfstat::allelic.richness(hf, min.n = min_n) else NULL
-  
-  if (is.null(ar)) {
-    ar_by_site <- data.frame(
-      Dataset = dataset_label,
-      Site = site_levels,
-      Allelic_Richness = NA_real_,
-      Allelic_Richness_SE = NA_real_,
-      stringsAsFactors = FALSE
-    )
-  } else {
-    Ar <- ar$Ar
-    ar_by_site <- data.frame(
-      Dataset = dataset_label,
-      Site = colnames(Ar),
-      Allelic_Richness = as.numeric(colMeans(Ar, na.rm = TRUE)),
-      Allelic_Richness_SE = as.numeric(apply(Ar, 2, sd, na.rm = TRUE) / sqrt(nrow(Ar))),
-      stringsAsFactors = FALSE
-    )
-  }
-  
-  list(by_site = by_site, overall = overall, allelic_richness = ar_by_site)
+  list(by_site = by_site, by_locus = by_locus, overall = overall, allelic_richness = ar_by_site %>% mutate(Dataset = dataset_label) %>% select(Dataset, Site, Allelic_Richness, Allelic_Richness_SE))
 }
 
 run_differentiation_bundle <- function(gobj, dataset_label) {
@@ -617,6 +906,76 @@ compare_two_dataset_table <- function(df, by_cols, value_cols) {
   
   wide
 }
+
+compare_two_dataset_table_clean <- function(df, by_cols, value_cols) {
+  wide <- df %>%
+    select(Dataset, all_of(by_cols), all_of(value_cols)) %>%
+    pivot_wider(names_from = Dataset, values_from = all_of(value_cols), names_sep = "__")
+  
+  for (v in value_cols) {
+    full_col <- paste0(v, "__FULL")
+    red_col <- paste0(v, "__REDUCED")
+    if (all(c(full_col, red_col) %in% names(wide))) {
+      wide[[paste0(v, "_delta")]] <- suppressWarnings(as.numeric(wide[[red_col]]) - as.numeric(wide[[full_col]]))
+    }
+  }
+  
+  names(wide) <- gsub("__FULL$", "_full", names(wide))
+  names(wide) <- gsub("__REDUCED$", "_reduced", names(wide))
+  
+  ordered_cols <- c(
+    by_cols,
+    unlist(lapply(value_cols, function(v) c(paste0(v, "_full"), paste0(v, "_reduced"), paste0(v, "_delta"))))
+  )
+  ordered_cols <- ordered_cols[ordered_cols %in% names(wide)]
+  wide %>% select(all_of(ordered_cols), everything())
+}
+
+
+validate_site_summary_table <- function(tbl, context = "by-site summary") {
+  if (!("Site" %in% names(tbl))) {
+    stop("[hwe_sensitivity] ", context, " is missing a Site column.", call. = FALSE)
+  }
+  if (nrow(tbl) != length(EXPECTED_SITE_LABELS)) {
+    stop("[hwe_sensitivity] ", context, " must have 12 rows, but has ", nrow(tbl), ".", call. = FALSE)
+  }
+  if (!identical(as.character(tbl$Site), EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] ", context, " site labels/order are incorrect.",
+      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+      "\nObserved: ", paste(as.character(tbl$Site), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (contains_x_site_labels(tbl$Site)) {
+    stop("[hwe_sensitivity] ", context, " contains locus-like X labels; refusing to write output.", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+validate_by_site_comparison <- function(tbl, context = "by-site comparison") {
+  required_cols <- c("Site", "N_full", "N_reduced", "Ho_full", "Ho_reduced", "Ho_delta", "He_full", "He_reduced", "He_delta", "FIS_full", "FIS_reduced", "FIS_delta")
+  missing_cols <- setdiff(required_cols, names(tbl))
+  if (length(missing_cols) > 0) {
+    stop("[hwe_sensitivity] ", context, " is missing required columns: ", paste(missing_cols, collapse = ", "), call. = FALSE)
+  }
+  if (nrow(tbl) != length(EXPECTED_SITE_LABELS)) {
+    stop("[hwe_sensitivity] ", context, " must have 12 rows, but has ", nrow(tbl), ".", call. = FALSE)
+  }
+  if (!identical(as.character(tbl$Site), EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] ", context, " site labels/order are incorrect.",
+      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+      "\nObserved: ", paste(as.character(tbl$Site), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (contains_x_site_labels(tbl$Site)) {
+    stop("[hwe_sensitivity] ", context, " contains locus-like X labels; refusing to write output.", call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
 
 
 # ------------------------------------------------------------------
@@ -1040,6 +1399,23 @@ full_gi <- gi_mll
 reduced_info <- make_reduced_genind(full_gi, suspect_null_loci)
 reduced_gi <- reduced_info$reduced
 
+clone_corrected_site_labels <- get_clone_corrected_site_labels(full_gi)
+site_order <- build_site_order(clone_corrected_site_labels)
+if (!identical(site_order$Site, EXPECTED_SITE_LABELS)) {
+  stop(
+    "[hwe_sensitivity] Site-order table must contain S1-S6 and N1-N6 in the expected order.",
+    "\nObserved: ", paste(site_order$Site, collapse = ", "),
+    call. = FALSE
+  )
+}
+adegenet::pop(full_gi) <- factor(clone_corrected_site_labels, levels = site_order$Site)
+if (!all(adegenet::indNames(reduced_gi) == adegenet::indNames(full_gi))) {
+  stop("[hwe_sensitivity] Reduced clone-corrected genind object is not aligned with full_gi.", call. = FALSE)
+}
+adegenet::pop(reduced_gi) <- factor(clone_corrected_site_labels, levels = site_order$Site)
+message("[hwe_sensitivity] Diversity datasets are clone-corrected: FULL = gi_mll; REDUCED = gi_mll without suspect loci.")
+message("[hwe_sensitivity] Site labels/order for diversity summaries: ", paste(site_order$Site, collapse = ", "))
+
 full_clonality_gi <- gi
 reduced_clonality_info <- make_reduced_genind(full_clonality_gi, suspect_null_loci)
 reduced_clonality_gi <- reduced_clonality_info$reduced
@@ -1151,6 +1527,8 @@ clonality_sensitivity <- build_clonality_sensitivity(full_clonality_gi, reduced_
 # ------------------------------------------------------------------
 # Write reduced-only outputs requested for direct comparison with main outputs
 # ------------------------------------------------------------------
+validate_site_summary_table(red_div$by_site, "heterozygosity_fis_by_site_noSuspectLoci")
+validate_site_summary_table(red_div$allelic_richness, "allelic_richness_by_site_noSuspectLoci")
 write_csv_msg(red_div$by_site, file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_by_site_", analysis_suffix, ".csv")))
 write_csv_msg(red_div$overall, file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_overall_", analysis_suffix, ".csv")))
 write_csv_msg(red_div$allelic_richness, file.path(SENS_TABLES_DIR, paste0("allelic_richness_by_site_", analysis_suffix, ".csv")))
@@ -1195,6 +1573,7 @@ write.csv(red_diff$jost_mat, file.path(SENS_MATRICES_DIR, paste0("pairwise_jostD
 # Write comparison outputs (FULL vs REDUCED)
 # ------------------------------------------------------------------
 div_by_site_all <- bind_rows(full_div$by_site, red_div$by_site)
+div_by_locus_all <- bind_rows(full_div$by_locus, red_div$by_locus)
 div_overall_all <- bind_rows(full_div$overall, red_div$overall)
 ar_all <- bind_rows(full_div$allelic_richness, red_div$allelic_richness)
 
@@ -1218,8 +1597,13 @@ summary_stats <- data.frame(
 
 summary_stats_cmp <- compare_two_dataset_table(summary_stats, by_cols = character(0), value_cols = c("N_individuals", "N_loci"))
 div_overall_cmp <- compare_two_dataset_table(div_overall_all, by_cols = character(0), value_cols = c("N", "N_loci", "Ho", "He", "FIS"))
-div_site_cmp <- compare_two_dataset_table(div_by_site_all, by_cols = c("Site"), value_cols = c("N", "Ho", "He", "FIS"))
-ar_cmp <- compare_two_dataset_table(ar_all, by_cols = c("Site"), value_cols = c("Allelic_Richness", "Allelic_Richness_SE"))
+div_site_cmp <- compare_two_dataset_table_clean(div_by_site_all, by_cols = c("Site"), value_cols = c("N", "Ho", "He", "FIS", "Na", "Allelic_Richness", "Allelic_Richness_SE"))
+validate_by_site_comparison(div_site_cmp, "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison")
+div_locus_cmp <- compare_two_dataset_table_clean(div_by_locus_all, by_cols = c("Locus"), value_cols = c("Ho", "He", "FIS"))
+ar_cmp <- compare_two_dataset_table_clean(ar_all, by_cols = c("Site"), value_cols = c("Allelic_Richness", "Allelic_Richness_SE"))
+if (!identical(as.character(ar_cmp$Site), EXPECTED_SITE_LABELS) || contains_x_site_labels(ar_cmp$Site)) {
+  stop("[hwe_sensitivity] full_vs_noSuspectLoci_allelic_richness_comparison is not a validated by-site table.", call. = FALSE)
+}
 diff_cmp <- compare_two_dataset_table(diff_summary_all, by_cols = character(0), value_cols = c("mean_pairwise_JostD", "median_pairwise_JostD", "mean_pairwise_FST", "median_pairwise_FST"))
 pca_cmp <- compare_two_dataset_table(pca_var_all, by_cols = c("PC"), value_cols = c("Percent_Variance"))
 dapc_cmp <- compare_two_dataset_table(dapc_eig_all, by_cols = c("Axis"), value_cols = c("Eigenvalue"))
@@ -1227,6 +1611,7 @@ dapc_cmp <- compare_two_dataset_table(dapc_eig_all, by_cols = c("Axis"), value_c
 write_csv_msg(summary_stats_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_locus_count_comparison.csv"))
 write_csv_msg(div_overall_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_overall_comparison.csv"))
 write_csv_msg(div_site_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison.csv"))
+write_csv_msg(div_locus_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_by_locus_comparison.csv"))
 write_csv_msg(ar_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_allelic_richness_comparison.csv"))
 write_csv_msg(diff_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_differentiation_comparison.csv"))
 write_csv_msg(pca_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pca_variance_comparison.csv"))
@@ -1307,3 +1692,5 @@ cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.docx"), 
 cat("============================================================\n\n")
 
 message("[hwe_sensitivity] Completed reduced-loci sensitivity branch successfully.")
+cat("\n[hwe_sensitivity] Corrected FULL vs REDUCED by-site diversity comparison (should be 12 rows: S1-S6, N1-N6):\n")
+print(div_site_cmp)

@@ -1,18 +1,21 @@
 # scripts/hwe_sensitivity_analysis.R
 ############################################################
-# Sensitivity analysis: rerun core genetics analyses with suspect loci removed
+# Sensitivity analysis: rerun core genetics summaries with
+# suspect loci removed.
 #
-# Purpose:
-# - Keep the main full-data workflow intact.
-# - Build a reduced clone-corrected object excluding suspect loci.
-# - Re-run key summaries and differentiation analyses on reduced data.
-# - Save outputs with explicit `_noSuspectLoci` naming for side-by-side comparison.
+# Main fix:
+# - FULL vs REDUCED heterozygosity/FIS comparison is truly
+#   by site, not by locus.
+# - Site order is forced to:
+#   S1, S2, S3, S4, S5, S6, N1, N2, N3, N4, N5, N6
+# - FULL diversity = clone-corrected gi_mll with all retained loci.
+# - REDUCED diversity = clone-corrected gi_mll after removing:
+#   EJV8T_A_0, ERHBI_A_0, FCM5, FG5.
 ############################################################
 
 suppressPackageStartupMessages({
   library(adegenet)
   library(poppr)
-  library(ade4)
   library(hierfstat)
   library(mmod)
   library(pegas)
@@ -26,24 +29,25 @@ suppressPackageStartupMessages({
 source("scripts/_load_objects.R")
 
 # ------------------------------------------------------------------
-# User-editable sensitivity settings
+# Settings
 # ------------------------------------------------------------------
 suspect_null_loci <- c("EJV8T_A_0", "ERHBI_A_0", "FCM5", "FG5")
 analysis_suffix <- "noSuspectLoci"
-EXPECTED_SITE_LABELS <- c("S1", "S2", "S3", "S4", "S5", "S6", "N1", "N2", "N3", "N4", "N5", "N6")
+
+EXPECTED_SITE_LABELS <- c(
+  "S1", "S2", "S3", "S4", "S5", "S6",
+  "N1", "N2", "N3", "N4", "N5", "N6"
+)
+
 SITE_LOOKUP_SHEET <- "site_lookup"
-AMOVA_PERMUTATIONS <- 999
 HWE_MONTE_CARLO_REPS <- 9999L
-BRUVO_MLL_THRESHOLD <- 0.09
-BRUVO_ALGORITHM <- "farthest_neighbor"
 
 SENS_TABLES_DIR <- file.path(TABLES_DIR, analysis_suffix)
 SENS_FIGURES_DIR <- file.path(FIGURES_DIR, analysis_suffix)
 SENS_MATRICES_DIR <- file.path(MATRICES_DIR, analysis_suffix)
 COMPARISON_DIR <- file.path(TABLES_DIR, "comparisons")
-WORD_DIR <- file.path(OUTPUT_DIR, "word")
 
-for (d in c(SENS_TABLES_DIR, SENS_FIGURES_DIR, SENS_MATRICES_DIR, COMPARISON_DIR, WORD_DIR)) {
+for (d in c(SENS_TABLES_DIR, SENS_FIGURES_DIR, SENS_MATRICES_DIR, COMPARISON_DIR)) {
   dir.create(d, recursive = TRUE, showWarnings = FALSE)
 }
 
@@ -51,21 +55,8 @@ message("[hwe_sensitivity] Starting reduced-loci sensitivity branch.")
 message("[hwe_sensitivity] Suspect loci requested for removal: ", paste(suspect_null_loci, collapse = ", "))
 
 # ------------------------------------------------------------------
-# Helpers
+# General helpers
 # ------------------------------------------------------------------
-normalize_site <- function(x) {
-  x <- trimws(as.character(x))
-  x <- gsub("\\uFEFF", "", x, fixed = TRUE)
-  x <- gsub("[[:cntrl:]]", "", x)
-  x <- gsub("\\s+", " ", x)
-  toupper(x)
-}
-
-safe_row_mean <- function(x) {
-  if (all(is.na(x))) return(NA_real_)
-  mean(x, na.rm = TRUE)
-}
-
 normalize_lookup_key <- function(x) {
   x <- trimws(as.character(x))
   x <- gsub("\uFEFF", "", x, fixed = TRUE)
@@ -86,7 +77,11 @@ pick_column <- function(df, choices, label = "column", required = FALSE) {
   idx <- match(TRUE, normalize_ascii(names(df)) %in% normalize_ascii(choices), nomatch = 0)
   if (idx == 0) {
     if (required) {
-      stop("[hwe_sensitivity] Could not find required ", label, ". Accepted names: ", paste(choices, collapse = ", "), call. = FALSE)
+      stop(
+        "[hwe_sensitivity] Could not find required ", label,
+        ". Accepted names: ", paste(choices, collapse = ", "),
+        call. = FALSE
+      )
     }
     return(NA_character_)
   }
@@ -110,13 +105,81 @@ contains_x_site_labels <- function(x) {
   any(grepl("^X[0-9]+$", as.character(x)))
 }
 
-find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", "raw"), sheet = SITE_LOOKUP_SHEET) {
+write_csv_msg <- function(df, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  write.csv(df, path, row.names = FALSE, na = "")
+  message("[hwe_sensitivity] Saved: ", path)
+}
+
+force_expected_site_order <- function(df, site_col = "Site", context = "site table") {
+  if (!site_col %in% names(df)) {
+    stop("[hwe_sensitivity] ", context, " is missing column: ", site_col, call. = FALSE)
+  }
+  
+  observed <- as.character(df[[site_col]])
+  if (!setequal(observed, EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] ", context, " must contain exactly S1-S6 and N1-N6.",
+      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+      "\nObserved: ", paste(sort(unique(observed)), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  df %>%
+    mutate("{site_col}" := factor(.data[[site_col]], levels = EXPECTED_SITE_LABELS)) %>%
+    arrange(.data[[site_col]]) %>%
+    mutate("{site_col}" := as.character(.data[[site_col]]))
+}
+
+validate_site_table <- function(df, context = "site table") {
+  df <- force_expected_site_order(df, "Site", context)
+  
+  if (nrow(df) != length(EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] ", context, " must have 12 rows, but has ",
+      nrow(df), ".",
+      call. = FALSE
+    )
+  }
+  
+  if (!identical(as.character(df$Site), EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] ", context, " site labels/order are incorrect.",
+      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+      "\nObserved: ", paste(as.character(df$Site), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  if (contains_x_site_labels(df$Site)) {
+    stop(
+      "[hwe_sensitivity] ", context,
+      " contains locus-like X labels; refusing to write output.",
+      call. = FALSE
+    )
+  }
+  
+  df
+}
+
+# ------------------------------------------------------------------
+# site_lookup loading and label mapping
+# ------------------------------------------------------------------
+find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", "raw"),
+                                      sheet = SITE_LOOKUP_SHEET) {
   if (!dir.exists(raw_dir)) {
     message("[hwe_sensitivity] site_lookup unavailable because data/raw does not exist: ", raw_dir)
     return(NULL)
   }
   
-  excel_files <- list.files(raw_dir, pattern = "\\.(xlsx|xls)$", full.names = TRUE, ignore.case = TRUE)
+  excel_files <- list.files(
+    raw_dir,
+    pattern = "\\.(xlsx|xls)$",
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
   if (length(excel_files) == 0) {
     message("[hwe_sensitivity] site_lookup unavailable: no Excel workbook was found in data/raw.")
     return(NULL)
@@ -130,12 +193,14 @@ find_site_lookup_workbook <- function(raw_dir = file.path(PROJECT_ROOT, "data", 
     },
     logical(1)
   )
+  
   lookup_files <- excel_files[has_lookup]
   
   if (length(lookup_files) == 0) {
     message("[hwe_sensitivity] site_lookup unavailable: no workbook in data/raw contains a '", sheet, "' sheet.")
     return(NULL)
   }
+  
   if (length(lookup_files) > 1) {
     message("[hwe_sensitivity] Multiple workbooks contain site_lookup; using ", basename(lookup_files[1]), ".")
   } else {
@@ -151,12 +216,28 @@ load_site_lookup <- function() {
   
   sheets <- readxl::excel_sheets(workbook)
   sheet <- sheets[match(normalize_ascii(SITE_LOOKUP_SHEET), normalize_ascii(sheets))]
+  
   lookup <- suppressMessages(readxl::read_excel(workbook, sheet = sheet)) %>%
     as.data.frame(stringsAsFactors = FALSE)
   
-  old_site_col <- pick_column(lookup, c("Site", "site", "site_code", "old_site", "code_site"), "old site code", required = TRUE)
-  label_col <- pick_column(lookup, c("Site_label", "site_label", "new_site", "site_new", "label", "site_id"), "display site label")
-  order_col <- pick_column(lookup, c("Site_order", "site_order", "order", "ordre", "sort", "south_north_order"), "south-to-north site order")
+  old_site_col <- pick_column(
+    lookup,
+    c("Site", "site", "site_code", "old_site", "code_site"),
+    "old site code",
+    required = TRUE
+  )
+  
+  label_col <- pick_column(
+    lookup,
+    c("Site_label", "site_label", "new_site", "site_new", "label", "site_id"),
+    "display site label"
+  )
+  
+  order_col <- pick_column(
+    lookup,
+    c("Site_order", "site_order", "order", "ordre", "sort", "south_north_order"),
+    "site order"
+  )
   
   if (is.na(label_col)) label_col <- old_site_col
   
@@ -173,9 +254,11 @@ load_site_lookup <- function() {
     message("[hwe_sensitivity] site_lookup was found but no usable rows were detected; raw site labels will be retained.")
     return(NULL)
   }
+  
   if (anyDuplicated(out$old_site)) {
     stop("[hwe_sensitivity] site_lookup contains duplicated old site codes after cleaning.", call. = FALSE)
   }
+  
   if (anyDuplicated(out$site_label)) {
     stop("[hwe_sensitivity] site_lookup contains duplicated display site labels after cleaning.", call. = FALSE)
   }
@@ -192,47 +275,38 @@ map_site_labels <- function(site_values) {
   
   idx <- match(site_values, site_lookup$old_site)
   labels <- site_lookup$site_label[idx]
+  
   ifelse(is.na(labels) | !nzchar(labels), site_values, labels)
-}
-
-build_site_order <- function(site_labels) {
-  sites <- unique(as.character(site_labels))
-  out <- data.frame(Site = sites, stringsAsFactors = FALSE)
-  
-  if (!is.null(site_lookup)) {
-    lookup_order <- site_lookup %>%
-      transmute(Site = site_label, site_order = site_order) %>%
-      distinct(Site, .keep_all = TRUE)
-    out <- out %>% left_join(lookup_order, by = "Site")
-  } else {
-    out$site_order <- NA_real_
-  }
-  
-  out %>%
-    mutate(expected_order = match(Site, EXPECTED_SITE_LABELS)) %>%
-    arrange(is.na(site_order), site_order, is.na(expected_order), expected_order, Site) %>%
-    transmute(Site)
 }
 
 get_clone_corrected_site_labels <- function(gobj) {
   validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[hwe_sensitivity] df_ids_mll")
+  
   if (!all(adegenet::indNames(gobj) == df_ids_mll$ind_id)) {
     stop("[hwe_sensitivity] Clone-corrected genind object is not aligned with df_ids_mll.", call. = FALSE)
   }
   
   raw_sites <- normalize_lookup_key(df_ids_mll$Site)
+  
   if (any(!nzchar(raw_sites))) {
     bad_ids <- df_ids_mll$ind_id[!nzchar(raw_sites)]
-    stop("[hwe_sensitivity] df_ids_mll contains missing/blank Site labels for: ", paste(head(bad_ids, 10), collapse = ", "), call. = FALSE)
+    stop(
+      "[hwe_sensitivity] df_ids_mll contains missing/blank Site labels for: ",
+      paste(head(bad_ids, 10), collapse = ", "),
+      call. = FALSE
+    )
   }
+  
   if (contains_x_site_labels(raw_sites)) {
     stop("[hwe_sensitivity] Raw df_ids_mll site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
   }
   
   site_labels <- map_site_labels(raw_sites)
+  
   if (contains_x_site_labels(site_labels)) {
     stop("[hwe_sensitivity] Final mapped site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
   }
+  
   if (!setequal(unique(site_labels), EXPECTED_SITE_LABELS)) {
     stop(
       "[hwe_sensitivity] Final clone-corrected site labels must be exactly S1-S6 and N1-N6.",
@@ -245,6 +319,82 @@ get_clone_corrected_site_labels <- function(gobj) {
   site_labels
 }
 
+# ------------------------------------------------------------------
+# Genind reduction helper
+# ------------------------------------------------------------------
+make_reduced_genind <- function(gobj, loci_to_remove) {
+  loci_available <- adegenet::locNames(gobj)
+  
+  requested <- unique(trimws(as.character(loci_to_remove)))
+  requested <- requested[nzchar(requested)]
+  
+  found <- intersect(requested, loci_available)
+  missing <- setdiff(requested, loci_available)
+  retained <- setdiff(loci_available, found)
+  
+  if (length(retained) < 2) {
+    stop("[hwe_sensitivity] Too few loci retained after filtering (<2).", call. = FALSE)
+  }
+  
+  if (length(missing) > 0) {
+    warning(
+      "[hwe_sensitivity] Requested locus/loci not found and therefore not removed: ",
+      paste(missing, collapse = ", ")
+    )
+  }
+  
+  if (length(found) == 0) {
+    warning("[hwe_sensitivity] None of the requested loci were found; reduced dataset equals full dataset.")
+  }
+  
+  loci_df <- adegenet::genind2df(gobj, sep = "/", usepop = FALSE)
+  keep_df <- intersect(retained, names(loci_df))
+  
+  if (length(keep_df) != length(retained)) {
+    missing_keep <- setdiff(retained, names(loci_df))
+    stop(
+      "[hwe_sensitivity] Failed to retain all expected loci when rebuilding genind. Missing: ",
+      paste(missing_keep, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  rebuilt <- adegenet::df2genind(
+    X = loci_df[, keep_df, drop = FALSE],
+    sep = "/",
+    ploidy = adegenet::ploidy(gobj),
+    ind.names = adegenet::indNames(gobj),
+    type = if (!is.null(gobj@type) && length(gobj@type) > 0) gobj@type else "codom",
+    NA.char = "NA"
+  )
+  
+  adegenet::pop(rebuilt) <- adegenet::pop(gobj)
+  
+  if (adegenet::nLoc(rebuilt) != length(retained)) {
+    stop(
+      "[hwe_sensitivity] Locus subsetting mismatch: expected ",
+      length(retained), " got ", adegenet::nLoc(rebuilt), ".",
+      call. = FALSE
+    )
+  }
+  
+  message("[hwe_sensitivity] Loci successfully removed: ", if (length(found) > 0) paste(found, collapse = ", ") else "none")
+  message("[hwe_sensitivity] Loci not found: ", if (length(missing) > 0) paste(missing, collapse = ", ") else "none")
+  message("[hwe_sensitivity] Locus count before filtering: ", length(loci_available))
+  message("[hwe_sensitivity] Locus count after filtering: ", length(retained))
+  
+  list(
+    reduced = rebuilt,
+    found = found,
+    missing = missing,
+    retained = retained,
+    all_full = loci_available
+  )
+}
+
+# ------------------------------------------------------------------
+# Diversity helpers
+# ------------------------------------------------------------------
 extract_basic_stat_by_site <- function(stat_matrix, site_labels, stat_name) {
   mat <- as.matrix(stat_matrix)
   storage.mode(mat) <- "numeric"
@@ -315,6 +465,7 @@ compute_na_by_site <- function(gobj, site_order) {
   allele_tab <- adegenet::tab(gobj, NA.method = "asis")
   loc_fac <- adegenet::locFac(gobj)
   loci <- adegenet::locNames(gobj)
+  
   site_row_indices <- split(seq_len(nrow(allele_tab)), as.character(adegenet::pop(gobj)))
   site_row_indices <- site_row_indices[site_order]
   
@@ -346,36 +497,140 @@ extract_overall_stat <- function(overall_obj, stat_name) {
     rn <- rownames(overall_obj)
     cn <- colnames(overall_obj)
     
-    if (!is.null(rn) && stat_name %in% rn) return(safe_row_mean(as.numeric(overall_obj[stat_name, , drop = TRUE])))
-    if (!is.null(cn) && stat_name %in% cn) return(safe_row_mean(as.numeric(overall_obj[, stat_name, drop = TRUE])))
+    if (!is.null(rn) && stat_name %in% rn) {
+      return(safe_mean(as.numeric(overall_obj[stat_name, , drop = TRUE])))
+    }
+    
+    if (!is.null(cn) && stat_name %in% cn) {
+      return(safe_mean(as.numeric(overall_obj[, stat_name, drop = TRUE])))
+    }
   }
   
   NA_real_
 }
 
-write_csv_msg <- function(df, path) {
-  write.csv(df, path, row.names = FALSE)
-  message("[hwe_sensitivity] Saved: ", path)
-}
-
-write_failure_log <- function(step_name, dataset_label, model_label = NA_character_, err_msg = NA_character_) {
-  log_df <- data.frame(
-    timestamp_utc = format(Sys.time(), tz = "UTC", usetz = TRUE),
-    step = as.character(step_name),
-    dataset = as.character(dataset_label),
-    model = as.character(model_label),
-    error_message = as.character(err_msg),
+run_diversity_bundle <- function(gobj, dataset_label) {
+  site_order <- EXPECTED_SITE_LABELS
+  observed_sites <- unique(as.character(adegenet::pop(gobj)))
+  
+  if (!setequal(observed_sites, site_order)) {
+    stop(
+      "[hwe_sensitivity] ", dataset_label, " pop labels are not the expected S1-S6/N1-N6 set.",
+      "\nExpected: ", paste(site_order, collapse = ", "),
+      "\nObserved: ", paste(sort(observed_sites), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  hf <- hierfstat::genind2hierfstat(gobj)
+  bs <- hierfstat::basic.stats(hf)
+  
+  if (is.null(bs$Ho) || is.null(bs$Hs) || is.null(bs$Fis)) {
+    stop(
+      "[hwe_sensitivity] hierfstat::basic.stats did not return Ho, Hs, and Fis matrices for ",
+      dataset_label, ".",
+      call. = FALSE
+    )
+  }
+  
+  ho_by_site <- extract_basic_stat_by_site(bs$Ho, site_order, "Ho") %>%
+    rename(Ho = value)
+  
+  he_by_site <- extract_basic_stat_by_site(bs$Hs, site_order, "He") %>%
+    rename(He = value)
+  
+  fis_by_site <- extract_basic_stat_by_site(bs$Fis, site_order, "FIS") %>%
+    rename(FIS = value)
+  
+  pop_sizes <- table(as.character(adegenet::pop(gobj)))
+  pop_sizes <- pop_sizes[site_order]
+  
+  if (any(is.na(pop_sizes)) || any(pop_sizes <= 0)) {
+    stop(
+      "[hwe_sensitivity] ", dataset_label,
+      " N per site contains missing or zero values after site assignment.",
+      call. = FALSE
+    )
+  }
+  
+  n_by_site <- data.frame(
+    Site = names(pop_sizes),
+    N = as.integer(pop_sizes),
     stringsAsFactors = FALSE
   )
-  log_path <- file.path(SENS_TABLES_DIR, paste0("failure_log_", analysis_suffix, ".csv"))
-  if (file.exists(log_path)) {
-    existing <- tryCatch(read.csv(log_path, stringsAsFactors = FALSE), error = function(e) NULL)
-    if (!is.null(existing)) log_df <- bind_rows(existing, log_df)
+  
+  na_by_site <- compute_na_by_site(gobj, site_order)
+  
+  min_n <- min(as.integer(pop_sizes), na.rm = TRUE)
+  ar <- if (!is.na(min_n) && min_n >= 2) {
+    hierfstat::allelic.richness(hf, min.n = min_n)
+  } else {
+    NULL
   }
-  write.csv(log_df, log_path, row.names = FALSE)
-  message("[hwe_sensitivity] Wrote failure log: ", log_path)
+  
+  if (is.null(ar) || is.null(ar$Ar)) {
+    ar_by_site <- data.frame(
+      Site = site_order,
+      Allelic_Richness = NA_real_,
+      Allelic_Richness_SE = NA_real_,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    ar_by_site <- extract_ar_by_site(ar$Ar, site_order)
+  }
+  
+  ar_by_site <- validate_site_table(ar_by_site, paste0(dataset_label, " allelic richness"))
+  
+  by_site <- n_by_site %>%
+    left_join(na_by_site, by = "Site") %>%
+    left_join(ar_by_site, by = "Site") %>%
+    left_join(ho_by_site, by = "Site") %>%
+    left_join(he_by_site, by = "Site") %>%
+    left_join(fis_by_site, by = "Site") %>%
+    mutate(Dataset = dataset_label) %>%
+    select(Dataset, Site, N, Na, Ho, He, FIS, Allelic_Richness, Allelic_Richness_SE) %>%
+    validate_site_table(paste0(dataset_label, " heterozygosity/FIS by site"))
+  
+  by_locus <- extract_basic_stat_by_locus(bs$Ho, "Ho", site_order) %>%
+    full_join(extract_basic_stat_by_locus(bs$Hs, "He", site_order), by = "Locus") %>%
+    full_join(extract_basic_stat_by_locus(bs$Fis, "FIS", site_order), by = "Locus") %>%
+    mutate(Dataset = dataset_label) %>%
+    select(Dataset, Locus, Ho, He, FIS)
+  
+  overall_ho <- extract_overall_stat(bs$overall, "Ho")
+  overall_he <- extract_overall_stat(bs$overall, "Hs")
+  overall_fis <- extract_overall_stat(bs$overall, "Fis")
+  
+  if (is.na(overall_ho)) overall_ho <- safe_mean(by_site$Ho)
+  if (is.na(overall_he)) overall_he <- safe_mean(by_site$He)
+  if (is.na(overall_fis)) overall_fis <- safe_mean(by_site$FIS)
+  
+  overall <- data.frame(
+    Dataset = dataset_label,
+    N = adegenet::nInd(gobj),
+    N_loci = adegenet::nLoc(gobj),
+    Ho = overall_ho,
+    He = overall_he,
+    FIS = overall_fis,
+    stringsAsFactors = FALSE
+  )
+  
+  ar_by_site <- ar_by_site %>%
+    mutate(Dataset = dataset_label) %>%
+    select(Dataset, Site, Allelic_Richness, Allelic_Richness_SE) %>%
+    validate_site_table(paste0(dataset_label, " allelic richness by site"))
+  
+  list(
+    by_site = by_site,
+    by_locus = by_locus,
+    overall = overall,
+    allelic_richness = ar_by_site
+  )
 }
 
+# ------------------------------------------------------------------
+# HWE, differentiation, PCA/DAPC helper summaries
+# ------------------------------------------------------------------
 matrix_to_long_unique <- function(m, value_name) {
   long_all <- as.data.frame(as.table(m), stringsAsFactors = FALSE)
   names(long_all) <- c("Site1", "Site2", value_name)
@@ -394,197 +649,6 @@ matrix_to_long_unique <- function(m, value_name) {
     select(Site1, Site2, all_of(value_name))
 }
 
-resolve_site_latitude <- function(meta_df) {
-  site_col <- resolve_col_ci(meta_df, c("site", "population", "pop"))
-  lat_col <- resolve_col_ci(meta_df, c("latitude", "lat"))
-  
-  if (is.na(site_col) || is.na(lat_col)) {
-    stop("[hwe_sensitivity] Could not find Site and Latitude columns in meta for AMOVA hierarchy.")
-  }
-  
-  data.frame(
-    Site = trimws(as.character(meta_df[[site_col]])),
-    Latitude = suppressWarnings(as.numeric(meta_df[[lat_col]])),
-    stringsAsFactors = FALSE
-  ) %>%
-    filter(nzchar(Site), !is.na(Latitude)) %>%
-    mutate(Site_norm = normalize_site(Site)) %>%
-    group_by(Site_norm) %>%
-    summarise(
-      Site = dplyr::first(Site),
-      Latitude = mean(Latitude, na.rm = TRUE),
-      .groups = "drop"
-    ) %>%
-    arrange(Latitude, Site)
-}
-
-build_latitude_regions <- function(site_levels, meta_df) {
-  site_lat_tbl <- resolve_site_latitude(meta_df)
-  idx <- match(normalize_site(site_levels), site_lat_tbl$Site_norm)
-  
-  if (any(is.na(idx))) {
-    missing_sites <- site_levels[is.na(idx)]
-    stop("[hwe_sensitivity] Missing latitude for AMOVA site(s): ", paste(missing_sites, collapse = ", "))
-  }
-  
-  ranked_tbl <- site_lat_tbl[idx, c("Site_norm", "Site", "Latitude"), drop = FALSE] %>%
-    mutate(Site_from_AMOVA = site_levels) %>%
-    arrange(Latitude, Site_from_AMOVA) %>%
-    mutate(
-      Rank_south_to_north = dplyr::row_number(),
-      Region = ifelse(Rank_south_to_north <= floor(n() / 2), "South", "North")
-    )
-  
-  setNames(ranked_tbl$Region, ranked_tbl$Site_from_AMOVA)
-}
-
-make_reduced_genind <- function(gobj, loci_to_remove) {
-  loci_available <- adegenet::locNames(gobj)
-  requested <- unique(trimws(as.character(loci_to_remove)))
-  requested <- requested[nzchar(requested)]
-  
-  found <- intersect(requested, loci_available)
-  missing <- setdiff(requested, loci_available)
-  retained <- setdiff(loci_available, found)
-  
-  if (length(retained) < 2) {
-    stop("[hwe_sensitivity] Too few loci retained after filtering (<2).")
-  }
-  
-  if (length(missing) > 0) {
-    warning(
-      "[hwe_sensitivity] Requested locus/loci not found and therefore not removed: ",
-      paste(missing, collapse = ", ")
-    )
-  }
-  
-  if (length(found) == 0) {
-    warning("[hwe_sensitivity] None of the requested loci were found; reduced dataset equals full dataset.")
-  }
-  
-  reduced <- local({
-    loci_df <- adegenet::genind2df(gobj, sep = "/", usepop = FALSE)
-    df_loci <- names(loci_df)
-    keep_df <- intersect(retained, df_loci)
-    
-    if (length(keep_df) != length(retained)) {
-      missing_keep <- setdiff(retained, df_loci)
-      stop(
-        "[hwe_sensitivity] Failed to retain all expected loci when rebuilding genind. Missing: ",
-        paste(missing_keep, collapse = ", ")
-      )
-    }
-    
-    rebuilt <- adegenet::df2genind(
-      X = loci_df[, keep_df, drop = FALSE],
-      sep = "/",
-      ploidy = adegenet::ploidy(gobj),
-      ind.names = adegenet::indNames(gobj),
-      type = if (!is.null(gobj@type) && length(gobj@type) > 0) gobj@type else "codom",
-      NA.char = "NA"
-    )
-    
-    adegenet::pop(rebuilt) <- adegenet::pop(gobj)
-    rebuilt
-  })
-  
-  if (adegenet::nLoc(reduced) != length(retained)) {
-    stop("[hwe_sensitivity] Locus subsetting mismatch: expected ", length(retained), " got ", adegenet::nLoc(reduced), ".")
-  }
-  
-  message("[hwe_sensitivity] Loci successfully removed: ", if (length(found) > 0) paste(found, collapse = ", ") else "none")
-  message("[hwe_sensitivity] Loci not found: ", if (length(missing) > 0) paste(missing, collapse = ", ") else "none")
-  message("[hwe_sensitivity] Locus count before filtering: ", length(loci_available))
-  message("[hwe_sensitivity] Locus count after filtering: ", length(retained))
-  
-  list(
-    reduced = reduced,
-    found = found,
-    missing = missing,
-    retained = retained,
-    all_full = loci_available
-  )
-}
-
-run_diversity_bundle <- function(gobj, dataset_label) {
-  hf <- hierfstat::genind2hierfstat(gobj)
-  bs <- hierfstat::basic.stats(hf)
-  if (is.null(bs$Ho) || is.null(bs$Hs) || is.null(bs$Fis)) {
-    stop("[hwe_sensitivity] hierfstat::basic.stats did not return Ho, Hs, and Fis matrices for ", dataset_label, ".", call. = FALSE)
-  }
-  
-  site_order <- levels(droplevels(adegenet::pop(gobj)))
-  if (is.null(site_order) || length(site_order) == 0) site_order <- unique(as.character(adegenet::pop(gobj)))
-  if (contains_x_site_labels(site_order)) {
-    stop("[hwe_sensitivity] ", dataset_label, " site labels contain locus-like X labels; refusing to write by-site diversity output.", call. = FALSE)
-  }
-  
-  ho_by_site <- extract_basic_stat_by_site(bs$Ho, site_order, "Ho") %>% rename(Ho = value)
-  he_by_site <- extract_basic_stat_by_site(bs$Hs, site_order, "He") %>% rename(He = value)
-  fis_by_site <- extract_basic_stat_by_site(bs$Fis, site_order, "FIS") %>% rename(FIS = value)
-  
-  pop_sizes <- table(as.character(adegenet::pop(gobj)))
-  pop_sizes <- pop_sizes[site_order]
-  if (any(is.na(pop_sizes)) || any(pop_sizes <= 0)) {
-    stop("[hwe_sensitivity] ", dataset_label, " N per site contains missing or zero values after site assignment.", call. = FALSE)
-  }
-  n_by_site <- data.frame(Site = names(pop_sizes), N = as.integer(pop_sizes), stringsAsFactors = FALSE)
-  na_by_site <- compute_na_by_site(gobj, site_order)
-  
-  min_n <- min(as.integer(pop_sizes), na.rm = TRUE)
-  ar <- if (!is.na(min_n) && min_n >= 2) hierfstat::allelic.richness(hf, min.n = min_n) else NULL
-  
-  if (is.null(ar) || is.null(ar$Ar)) {
-    ar_by_site <- data.frame(
-      Site = site_order,
-      Allelic_Richness = NA_real_,
-      Allelic_Richness_SE = NA_real_,
-      stringsAsFactors = FALSE
-    )
-  } else {
-    ar_by_site <- extract_ar_by_site(ar$Ar, site_order)
-  }
-  
-  by_site <- n_by_site %>%
-    left_join(na_by_site, by = "Site") %>%
-    left_join(ar_by_site, by = "Site") %>%
-    left_join(ho_by_site, by = "Site") %>%
-    left_join(he_by_site, by = "Site") %>%
-    left_join(fis_by_site, by = "Site") %>%
-    mutate(Dataset = dataset_label) %>%
-    select(Dataset, Site, N, Na, Ho, He, FIS, Allelic_Richness, Allelic_Richness_SE)
-  
-  if (nrow(by_site) != length(site_order) || contains_x_site_labels(by_site$Site)) {
-    stop("[hwe_sensitivity] ", dataset_label, " by-site diversity table failed site-label validation.", call. = FALSE)
-  }
-  
-  by_locus <- extract_basic_stat_by_locus(bs$Ho, "Ho", site_order) %>%
-    full_join(extract_basic_stat_by_locus(bs$Hs, "He", site_order), by = "Locus") %>%
-    full_join(extract_basic_stat_by_locus(bs$Fis, "FIS", site_order), by = "Locus") %>%
-    mutate(Dataset = dataset_label) %>%
-    select(Dataset, Locus, Ho, He, FIS)
-  
-  overall_ho <- extract_overall_stat(bs$overall, "Ho")
-  overall_he <- extract_overall_stat(bs$overall, "Hs")
-  overall_fis <- extract_overall_stat(bs$overall, "Fis")
-  
-  if (is.na(overall_ho)) overall_ho <- safe_row_mean(by_site$Ho)
-  if (is.na(overall_he)) overall_he <- safe_row_mean(by_site$He)
-  if (is.na(overall_fis)) overall_fis <- safe_row_mean(by_site$FIS)
-  
-  overall <- data.frame(
-    Dataset = dataset_label,
-    N = adegenet::nInd(gobj),
-    N_loci = adegenet::nLoc(gobj),
-    Ho = overall_ho,
-    He = overall_he,
-    FIS = overall_fis,
-    stringsAsFactors = FALSE
-  )
-  
-  list(by_site = by_site, by_locus = by_locus, overall = overall, allelic_richness = ar_by_site %>% mutate(Dataset = dataset_label) %>% select(Dataset, Site, Allelic_Richness, Allelic_Richness_SE))
-}
-
 run_differentiation_bundle <- function(gobj, dataset_label) {
   jost_mat <- as.matrix(mmod::pairwise_D(gobj, linearized = FALSE))
   diag(jost_mat) <- 0
@@ -596,18 +660,28 @@ run_differentiation_bundle <- function(gobj, dataset_label) {
     hierfstat::pairwise.WCfst(hf),
     error = function(e) hierfstat::pairwise.neifst(hf)
   )
+  
   fst_mat <- as.matrix(fst_raw)
   diag(fst_mat) <- 0
   
-  site_lookup <- tapply(as.character(adegenet::pop(gobj)), hf[[1]], function(x) names(sort(table(x), decreasing = TRUE))[1])
-  site_lookup <- as.character(site_lookup)
-  if (length(site_lookup) == nrow(fst_mat)) {
-    rownames(fst_mat) <- site_lookup
-    colnames(fst_mat) <- site_lookup
+  site_lookup_tmp <- tapply(
+    as.character(adegenet::pop(gobj)),
+    hf[[1]],
+    function(x) names(sort(table(x), decreasing = TRUE))[1]
+  )
+  
+  site_lookup_tmp <- as.character(site_lookup_tmp)
+  
+  if (length(site_lookup_tmp) == nrow(fst_mat)) {
+    rownames(fst_mat) <- site_lookup_tmp
+    colnames(fst_mat) <- site_lookup_tmp
   }
   
-  jost_long <- matrix_to_long_unique(jost_mat, "JostD") %>% mutate(Dataset = dataset_label)
-  fst_long <- matrix_to_long_unique(fst_mat, "FST") %>% mutate(Dataset = dataset_label)
+  jost_long <- matrix_to_long_unique(jost_mat, "JostD") %>%
+    mutate(Dataset = dataset_label)
+  
+  fst_long <- matrix_to_long_unique(fst_mat, "FST") %>%
+    mutate(Dataset = dataset_label)
   
   summary_tbl <- data.frame(
     Dataset = dataset_label,
@@ -618,180 +692,13 @@ run_differentiation_bundle <- function(gobj, dataset_label) {
     stringsAsFactors = FALSE
   )
   
-  list(jost_mat = jost_mat, fst_mat = fst_mat, jost_long = jost_long, fst_long = fst_long, summary = summary_tbl)
-}
-
-run_amova_bundle <- function(gi_use, dataset_label) {
-  validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[hwe_sensitivity] df_ids_mll")
-  id_to_site <- setNames(as.character(df_ids_mll$Site), normalize_id(df_ids_mll$ind_id))
-  
-  inds <- adegenet::indNames(gi_use)
-  site_from_dfids <- id_to_site[normalize_id(inds)]
-  site_labels <- if (all(!is.na(site_from_dfids))) site_from_dfids else as.character(adegenet::pop(gi_use))
-  
-  valid <- !is.na(site_labels) & nzchar(site_labels)
-  gi_f <- gi_use[valid, , drop = FALSE]
-  site_f <- droplevels(as.factor(site_labels[valid]))
-  
-  group_tab <- table(site_f)
-  keep_groups <- names(group_tab)[group_tab >= 2]
-  if (length(keep_groups) < 2) {
-    stop("[hwe_sensitivity] Need >=2 sites with >=2 individuals for AMOVA.")
-  }
-  
-  keep_idx <- site_f %in% keep_groups
-  gi_f <- gi_f[keep_idx, , drop = FALSE]
-  site_f <- droplevels(site_f[keep_idx])
-  adegenet::pop(gi_f) <- site_f
-  
-  run_amova_model <- function(gi_obj, strata_df, formula_obj, model_label) {
-    tryCatch({
-      adegenet::strata(gi_obj) <- strata_df
-      fit <- poppr::poppr.amova(gi_obj, formula_obj)
-      
-      components <- as.data.frame(fit$componentsofcovariance, stringsAsFactors = FALSE)
-      components$Source <- rownames(components)
-      rownames(components) <- NULL
-      if (ncol(components) > 0) names(components)[1] <- "Sigma"
-      
-      phi_stats <- as.data.frame(fit$statphi, stringsAsFactors = FALSE)
-      phi_stats$Source <- rownames(phi_stats)
-      rownames(phi_stats) <- NULL
-      if (ncol(phi_stats) > 0) names(phi_stats)[1] <- "Phi"
-      
-      results <- full_join(components, phi_stats, by = "Source") %>%
-        mutate(
-          Dataset = dataset_label,
-          Model = model_label,
-          N_individuals_used = adegenet::nInd(gi_obj),
-          N_groups_used = dplyr::n_distinct(strata_df$Site),
-          Permutations = AMOVA_PERMUTATIONS
-        ) %>%
-        select(Dataset, Model, Source, everything())
-      
-      rand <- tryCatch(
-        ade4::randtest(fit, nrepet = AMOVA_PERMUTATIONS),
-        error = function(e) {
-          cat(
-            "[hwe_sensitivity][WARN] randtest failed for dataset=", dataset_label,
-            " model=", model_label, " : ", conditionMessage(e), "\n", sep = ""
-          )
-          write_failure_log("amova_randtest", dataset_label, model_label, conditionMessage(e))
-          NULL
-        }
-      )
-      
-      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " class(rand)=", paste(class(rand), collapse = ","), "\n", sep = "")
-      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " names(rand)=", if (is.null(rand)) "NULL" else paste(names(rand), collapse = ","), "\n", sep = "")
-      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " length(rand$obs)=", if (is.null(rand) || is.null(rand$obs)) 0L else length(rand$obs), "\n", sep = "")
-      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " length(rand$pvalue)=", if (is.null(rand) || is.null(rand$pvalue)) 0L else length(rand$pvalue), "\n", sep = "")
-      cat("[hwe_sensitivity][DEBUG] dataset=", dataset_label, " model=", model_label, " names(rand$obs)=", if (is.null(rand) || is.null(rand$obs) || is.null(names(rand$obs))) "NULL" else paste(names(rand$obs), collapse = ","), "\n", sep = "")
-      
-      variance_sources <- if ("Source" %in% names(results)) as.character(results$Source) else character(0)
-      obs_vals <- if (!is.null(rand) && !is.null(rand$obs)) as.numeric(rand$obs) else numeric(0)
-      p_vals <- if (!is.null(rand) && !is.null(rand$pvalue)) as.numeric(rand$pvalue) else numeric(0)
-      obs_names <- if (!is.null(rand) && !is.null(rand$obs)) names(rand$obs) else NULL
-      obs_names <- if (is.null(obs_names)) character(0) else as.character(obs_names)
-      
-      base_components <- unique(c(obs_names, variance_sources))
-      if (length(base_components) == 0) base_components <- "AMOVA_component_unavailable"
-      
-      rand_df <- data.frame(
-        Dataset = dataset_label,
-        Model = model_label,
-        component = base_components,
-        statistic = NA_real_,
-        p_value = NA_real_,
-        permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      )
-      
-      if (length(obs_names) == 0 || length(obs_vals) == 0) {
-        cat(
-          "[hwe_sensitivity][WARN] rand$obs missing/empty; writing NA statistics for dataset=",
-          dataset_label, " model=", model_label, ".\n", sep = ""
-        )
-      } else {
-        n_assign <- min(length(obs_names), length(obs_vals))
-        rand_df$statistic[match(obs_names[seq_len(n_assign)], rand_df$component)] <- obs_vals[seq_len(n_assign)]
-      }
-      
-      if (length(obs_names) == 0 || length(p_vals) == 0) {
-        cat(
-          "[hwe_sensitivity][WARN] rand$pvalue missing/empty; writing NA p-values for dataset=",
-          dataset_label, " model=", model_label, ".\n", sep = ""
-        )
-      } else {
-        n_assign_p <- min(length(obs_names), length(p_vals))
-        rand_df$p_value[match(obs_names[seq_len(n_assign_p)], rand_df$component)] <- p_vals[seq_len(n_assign_p)]
-      }
-      
-      list(results = results, rand = rand_df)
-    }, error = function(e) {
-      cat(
-        "[hwe_sensitivity][WARN] AMOVA model failed for dataset=", dataset_label,
-        " model=", model_label, " : ", conditionMessage(e), "\n", sep = ""
-      )
-      write_failure_log("amova_model", dataset_label, model_label, conditionMessage(e))
-      fail_results <- data.frame(
-        Dataset = dataset_label,
-        Model = model_label,
-        Source = "AMOVA_failed",
-        Sigma = NA_real_,
-        Phi = NA_real_,
-        N_individuals_used = adegenet::nInd(gi_obj),
-        N_groups_used = dplyr::n_distinct(strata_df$Site),
-        Permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      )
-      fail_rand <- data.frame(
-        Dataset = dataset_label,
-        Model = model_label,
-        component = "AMOVA_failed",
-        statistic = NA_real_,
-        p_value = NA_real_,
-        permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      )
-      list(results = fail_results, rand = fail_rand)
-    })
-  }
-  
-  strata_site <- data.frame(
-    pop = site_f,
-    Site = site_f,
-    row.names = adegenet::indNames(gi_f),
-    stringsAsFactors = TRUE
+  list(
+    jost_mat = jost_mat,
+    fst_mat = fst_mat,
+    jost_long = jost_long,
+    fst_long = fst_long,
+    summary = summary_tbl
   )
-  
-  site_fit <- run_amova_model(gi_f, strata_site, ~pop, "Site_only")
-  amova_results <- site_fit$results
-  amova_rand <- site_fit$rand
-  
-  site_region_map <- build_latitude_regions(levels(site_f), meta)
-  region_f <- factor(site_region_map[as.character(site_f)], levels = c("South", "North"))
-  
-  if (nlevels(droplevels(region_f)) >= 2) {
-    keep_region <- !is.na(region_f)
-    gi_h <- gi_f[keep_region, , drop = FALSE]
-    site_h <- droplevels(site_f[keep_region])
-    region_h <- droplevels(region_f[keep_region])
-    adegenet::pop(gi_h) <- site_h
-    
-    strata_h <- data.frame(
-      Region = region_h,
-      Site = site_h,
-      pop = site_h,
-      row.names = adegenet::indNames(gi_h),
-      stringsAsFactors = TRUE
-    )
-    
-    h_fit <- run_amova_model(gi_h, strata_h, ~Region/Site, "NorthSouth_Site_hierarchical")
-    amova_results <- bind_rows(amova_results, h_fit$results)
-    amova_rand <- bind_rows(amova_rand, h_fit$rand)
-  }
-  
-  list(results = amova_results, rand = amova_rand)
 }
 
 run_hwe_by_site_locus <- function(gobj, dataset_label) {
@@ -802,11 +709,12 @@ run_hwe_by_site_locus <- function(gobj, dataset_label) {
   all_rows <- list()
   idx <- 1L
   
-  for (site in sort(unique(site_vec))) {
+  for (site in EXPECTED_SITE_LABELS) {
     use <- site_vec == site
     if (sum(use) < 2) next
     
     site_df <- loci_df[use, , drop = FALSE]
+    
     for (loc in loci_names) {
       vals <- trimws(as.character(site_df[[loc]]))
       vals[vals %in% c("", "NA", "0", "0/0", "NA/NA", "-")] <- NA_character_
@@ -814,6 +722,7 @@ run_hwe_by_site_locus <- function(gobj, dataset_label) {
       if (length(vals) < 2) next
       
       geno_fac <- factor(vals)
+      
       p_val <- tryCatch(
         pegas::hw.test(geno_fac, B = HWE_MONTE_CARLO_REPS)$p.value,
         error = function(e) NA_real_
@@ -828,6 +737,7 @@ run_hwe_by_site_locus <- function(gobj, dataset_label) {
         p_value_raw = as.numeric(p_val),
         stringsAsFactors = FALSE
       )
+      
       idx <- idx + 1L
     }
   }
@@ -835,14 +745,15 @@ run_hwe_by_site_locus <- function(gobj, dataset_label) {
   out <- bind_rows(all_rows)
   if (nrow(out) == 0) return(out)
   
-  out <- out %>%
+  out %>%
     mutate(
+      Site = factor(Site, levels = EXPECTED_SITE_LABELS),
       p_value_adj_fdr = p.adjust(p_value_raw, method = "BH"),
       hwe_reject_raw_0_05 = !is.na(p_value_raw) & p_value_raw < 0.05,
       hwe_reject_fdr_0_05 = !is.na(p_value_adj_fdr) & p_value_adj_fdr < 0.05
-    )
-  
-  out
+    ) %>%
+    arrange(Site, Locus) %>%
+    mutate(Site = as.character(Site))
 }
 
 run_pca_bundle <- function(gobj, dataset_label) {
@@ -870,7 +781,13 @@ run_pca_bundle <- function(gobj, dataset_label) {
 
 run_dapc_bundle <- function(gobj, dataset_label) {
   grp <- as.factor(adegenet::pop(gobj))
-  dapc_fit <- adegenet::dapc(gobj, pop = grp, n.pca = min(50, nInd(gobj) - 1), n.da = min(nlevels(grp) - 1, 10))
+  
+  dapc_fit <- adegenet::dapc(
+    gobj,
+    pop = grp,
+    n.pca = min(50, adegenet::nInd(gobj) - 1),
+    n.da = min(nlevels(grp) - 1, 10)
+  )
   
   coords <- as.data.frame(dapc_fit$ind.coord[, 1:2, drop = FALSE], stringsAsFactors = FALSE)
   coords$Individual <- rownames(coords)
@@ -880,6 +797,7 @@ run_dapc_bundle <- function(gobj, dataset_label) {
   if (ncol(coords) >= 2) names(coords)[1:2] <- c("LD1", "LD2")
   
   eig <- as.numeric(dapc_fit$eig)
+  
   eig_df <- data.frame(
     Dataset = dataset_label,
     Axis = paste0("LD", seq_along(eig)),
@@ -890,6 +808,9 @@ run_dapc_bundle <- function(gobj, dataset_label) {
   list(coords = coords, eig = eig_df)
 }
 
+# ------------------------------------------------------------------
+# Comparison helpers
+# ------------------------------------------------------------------
 compare_two_dataset_table <- function(df, by_cols, value_cols) {
   wide <- df %>%
     select(Dataset, all_of(by_cols), all_of(value_cols)) %>%
@@ -899,6 +820,7 @@ compare_two_dataset_table <- function(df, by_cols, value_cols) {
     full_col <- paste0(v, "__FULL")
     red_col <- paste0(v, "__REDUCED")
     delta_col <- paste0("delta_", v, "_REDUCED_minus_FULL")
+    
     if (all(c(full_col, red_col) %in% names(wide))) {
       wide[[delta_col]] <- suppressWarnings(as.numeric(wide[[red_col]]) - as.numeric(wide[[full_col]]))
     }
@@ -915,6 +837,7 @@ compare_two_dataset_table_clean <- function(df, by_cols, value_cols) {
   for (v in value_cols) {
     full_col <- paste0(v, "__FULL")
     red_col <- paste0(v, "__REDUCED")
+    
     if (all(c(full_col, red_col) %in% names(wide))) {
       wide[[paste0(v, "_delta")]] <- suppressWarnings(as.numeric(wide[[red_col]]) - as.numeric(wide[[full_col]]))
     }
@@ -923,503 +846,73 @@ compare_two_dataset_table_clean <- function(df, by_cols, value_cols) {
   names(wide) <- gsub("__FULL$", "_full", names(wide))
   names(wide) <- gsub("__REDUCED$", "_reduced", names(wide))
   
+  if ("Site" %in% names(wide) && setequal(as.character(wide$Site), EXPECTED_SITE_LABELS)) {
+    wide <- force_expected_site_order(wide, "Site", "comparison table")
+  }
+  
   ordered_cols <- c(
     by_cols,
-    unlist(lapply(value_cols, function(v) c(paste0(v, "_full"), paste0(v, "_reduced"), paste0(v, "_delta"))))
+    unlist(lapply(
+      value_cols,
+      function(v) c(paste0(v, "_full"), paste0(v, "_reduced"), paste0(v, "_delta"))
+    ))
   )
+  
   ordered_cols <- ordered_cols[ordered_cols %in% names(wide)]
-  wide %>% select(all_of(ordered_cols), everything())
-}
-
-
-validate_site_summary_table <- function(tbl, context = "by-site summary") {
-  if (!("Site" %in% names(tbl))) {
-    stop("[hwe_sensitivity] ", context, " is missing a Site column.", call. = FALSE)
-  }
-  if (nrow(tbl) != length(EXPECTED_SITE_LABELS)) {
-    stop("[hwe_sensitivity] ", context, " must have 12 rows, but has ", nrow(tbl), ".", call. = FALSE)
-  }
-  if (!identical(as.character(tbl$Site), EXPECTED_SITE_LABELS)) {
-    stop(
-      "[hwe_sensitivity] ", context, " site labels/order are incorrect.",
-      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
-      "\nObserved: ", paste(as.character(tbl$Site), collapse = ", "),
-      call. = FALSE
-    )
-  }
-  if (contains_x_site_labels(tbl$Site)) {
-    stop("[hwe_sensitivity] ", context, " contains locus-like X labels; refusing to write output.", call. = FALSE)
-  }
-  invisible(TRUE)
+  
+  wide %>%
+    select(all_of(ordered_cols), everything())
 }
 
 validate_by_site_comparison <- function(tbl, context = "by-site comparison") {
-  required_cols <- c("Site", "N_full", "N_reduced", "Ho_full", "Ho_reduced", "Ho_delta", "He_full", "He_reduced", "He_delta", "FIS_full", "FIS_reduced", "FIS_delta")
+  required_cols <- c(
+    "Site",
+    "N_full", "N_reduced",
+    "Ho_full", "Ho_reduced", "Ho_delta",
+    "He_full", "He_reduced", "He_delta",
+    "FIS_full", "FIS_reduced", "FIS_delta"
+  )
+  
   missing_cols <- setdiff(required_cols, names(tbl))
+  
   if (length(missing_cols) > 0) {
-    stop("[hwe_sensitivity] ", context, " is missing required columns: ", paste(missing_cols, collapse = ", "), call. = FALSE)
-  }
-  if (nrow(tbl) != length(EXPECTED_SITE_LABELS)) {
-    stop("[hwe_sensitivity] ", context, " must have 12 rows, but has ", nrow(tbl), ".", call. = FALSE)
-  }
-  if (!identical(as.character(tbl$Site), EXPECTED_SITE_LABELS)) {
     stop(
-      "[hwe_sensitivity] ", context, " site labels/order are incorrect.",
-      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
-      "\nObserved: ", paste(as.character(tbl$Site), collapse = ", "),
+      "[hwe_sensitivity] ", context,
+      " is missing required columns: ",
+      paste(missing_cols, collapse = ", "),
       call. = FALSE
     )
   }
-  if (contains_x_site_labels(tbl$Site)) {
-    stop("[hwe_sensitivity] ", context, " contains locus-like X labels; refusing to write output.", call. = FALSE)
-  }
-  invisible(TRUE)
-}
-
-
-
-# ------------------------------------------------------------------
-# Clonality sensitivity helpers (full gi vs gi with suspect loci removed)
-# ------------------------------------------------------------------
-calc_clonal_richness <- function(N, G) {
-  ifelse(!is.na(N) & !is.na(G) & N > 1, (G - 1) / (N - 1), NA_real_)
-}
-
-compute_mlg_mll_from_gi <- function(gobj, threshold = BRUVO_MLL_THRESHOLD, algorithm = BRUVO_ALGORITHM) {
-  if (!inherits(gobj, "genind")) {
-    stop("[hwe_sensitivity] Clonality input must be a genind object.")
-  }
-  if (adegenet::nInd(gobj) < 1) {
-    stop("[hwe_sensitivity] Clonality input contains no individuals.")
-  }
-  if (adegenet::nLoc(gobj) < 2) {
-    stop("[hwe_sensitivity] Bruvo MLL clustering requires at least two loci.")
-  }
   
-  gc_mlg <- poppr::as.genclone(gobj)
-  mlg_raw <- tryCatch(
-    poppr::mlg.vector(gc_mlg),
-    error = function(e) as.integer(factor(poppr::mlg(gc_mlg)))
-  )
-  mlg_labels <- paste0("MLG_", as.integer(factor(mlg_raw)))
+  tbl <- validate_site_table(tbl, context)
   
-  replen <- rep(2, adegenet::nLoc(gobj))
-  names(replen) <- adegenet::locNames(gobj)
-  
-  gc_mll <- gc_mlg
-  poppr::mlg.filter(
-    gc_mll,
-    distance = poppr::bruvo.dist,
-    replen = replen,
-    algorithm = algorithm
-  ) <- threshold
-  
-  mll_raw <- poppr::mll(gc_mll)
-  mll_labels <- paste0("MLL_", as.integer(factor(mll_raw)))
-  
-  if (length(mlg_labels) != adegenet::nInd(gobj) || length(mll_labels) != adegenet::nInd(gobj)) {
-    stop("[hwe_sensitivity] MLG/MLL assignment length does not match the number of genind individuals.")
-  }
-  
-  data.frame(
-    Individual = adegenet::indNames(gobj),
-    Site = as.character(adegenet::pop(gobj)),
-    MLG = mlg_labels,
-    MLL = mll_labels,
-    stringsAsFactors = FALSE
-  )
-}
-
-add_site_labels_for_clonality <- function(assignments_df, df_ids_tbl, gobj) {
-  if (!all(c("Individual", "Site") %in% names(assignments_df))) {
-    stop("[hwe_sensitivity] Internal clonality assignments are missing Individual or Site columns.")
-  }
-  aligned_ids <- align_df_ids_to_genind(gobj, df_ids_tbl, context = "[hwe_sensitivity] clonality metadata")
-  meta_tbl <- data.frame(
-    Individual = aligned_ids$ind_id,
-    Site = aligned_ids$Site,
-    stringsAsFactors = FALSE
-  )
-  
-  optional_cols <- intersect(c("Site_label", "Region", "Site_order"), names(aligned_ids))
-  if (length(optional_cols) > 0) {
-    meta_tbl <- cbind(meta_tbl, aligned_ids[, optional_cols, drop = FALSE])
-  }
-  
-  out <- assignments_df %>%
-    select(Individual, MLG, MLL) %>%
-    left_join(meta_tbl, by = "Individual")
-  
-  if (!"Site_label" %in% names(out)) out$Site_label <- out$Site
-  if (!"Site_order" %in% names(out)) out$Site_order <- seq_len(nrow(out))
-  if (!"Region" %in% names(out)) out$Region <- NA_character_
-  
-  out$Site <- ifelse(is.na(out$Site) | !nzchar(out$Site), as.character(assignments_df$Site), as.character(out$Site))
-  out$Site_label <- ifelse(is.na(out$Site_label) | !nzchar(as.character(out$Site_label)), out$Site, as.character(out$Site_label))
-  out$Site_order <- suppressWarnings(as.numeric(out$Site_order))
-  out <- out %>%
-    distinct(Individual, .keep_all = TRUE)
-  
-  if (any(is.na(out$Site) | !nzchar(as.character(out$Site)))) {
-    stop("[hwe_sensitivity] Clonality individual table contains missing Site values.")
-  }
-  if (nrow(out) != nrow(assignments_df)) {
-    stop("[hwe_sensitivity] Clonality individual table must contain exactly one row per retained individual.")
-  }
-  
-  out
-}
-
-make_repeated_clone_table <- function(assignments_df, clone_col) {
-  clone_sym <- rlang::sym(clone_col)
-  assignments_df %>%
-    filter(!is.na(!!clone_sym)) %>%
-    group_by(!!clone_sym) %>%
-    mutate(Group_Size = dplyr::n()) %>%
-    ungroup() %>%
-    filter(Group_Size > 1) %>%
-    arrange(!!clone_sym, Individual)
-}
-
-make_repeated_group_signature <- function(repeated_df, clone_col) {
-  if (nrow(repeated_df) == 0) return(character(0))
-  split(repeated_df$Individual, repeated_df[[clone_col]]) %>%
-    lapply(function(x) paste(sort(unique(as.character(x))), collapse = "|")) %>%
-    unlist(use.names = FALSE) %>%
-    sort()
-}
-
-summarise_clonality_by_site <- function(assignments_df, dataset_label) {
-  required_cols <- c("Individual", "Site", "MLG", "MLL")
-  if (!all(required_cols %in% names(assignments_df))) {
-    stop("[hwe_sensitivity] Clonality site summary requires individual-level columns: ", paste(required_cols, collapse = ", "))
-  }
-  if (anyDuplicated(assignments_df$Individual)) {
-    dup_ids <- unique(as.character(assignments_df$Individual[duplicated(assignments_df$Individual)]))
-    stop("[hwe_sensitivity] Clonality assignments must have one row per retained individual. Duplicates: ", paste(head(dup_ids, 10), collapse = ", "))
-  }
-  if (any(is.na(assignments_df$Site) | !nzchar(as.character(assignments_df$Site)))) {
-    stop("[hwe_sensitivity] Cannot summarise clonality by site because at least one individual has a missing Site.")
-  }
-  
-  site_meta <- assignments_df %>%
-    group_by(Site) %>%
-    summarise(
-      Site_label = dplyr::first(na.omit(as.character(Site_label))),
-      Site_order = suppressWarnings(min(as.numeric(Site_order), na.rm = TRUE)),
-      .groups = "drop"
-    ) %>%
-    mutate(
-      Site_label = ifelse(is.na(Site_label) | !nzchar(Site_label), as.character(Site), Site_label),
-      Site_order = ifelse(is.infinite(Site_order), NA_real_, Site_order)
-    )
-  
-  assignments_df %>%
-    group_by(Site) %>%
-    summarise(
-      Dataset = dataset_label,
-      N = dplyr::n(),
-      MLG = dplyr::n_distinct(MLG, na.rm = TRUE),
-      MLL = dplyr::n_distinct(MLL, na.rm = TRUE),
-      repeated_MLG_groups = sum(table(MLG) > 1),
-      repeated_MLL_groups = sum(table(MLL) > 1),
-      .groups = "drop"
-    ) %>%
-    left_join(site_meta, by = "Site") %>%
-    mutate(
-      R_MLG = calc_clonal_richness(N, MLG),
-      R_MLL = calc_clonal_richness(N, MLL)
-    ) %>%
-    arrange(Site_order, Site_label)
-}
-
-summarise_clonality_overall <- function(assignments_df, dataset_label, repeated_mll_same_as_full = NA) {
-  repeated_mlg <- make_repeated_clone_table(assignments_df, "MLG")
-  repeated_mll <- make_repeated_clone_table(assignments_df, "MLL")
-  repeated_mll_sites <- sort(unique(as.character(repeated_mll$Site_label)))
-  repeated_mll_inds <- sort(unique(as.character(repeated_mll$Individual)))
-  N <- nrow(assignments_df)
-  total_MLG <- dplyr::n_distinct(assignments_df$MLG, na.rm = TRUE)
-  total_MLL <- dplyr::n_distinct(assignments_df$MLL, na.rm = TRUE)
-  
-  data.frame(
-    Dataset = dataset_label,
-    total_N = N,
-    total_MLG = total_MLG,
-    total_MLL = total_MLL,
-    R_MLG = calc_clonal_richness(N, total_MLG),
-    R_MLL = calc_clonal_richness(N, total_MLL),
-    total_repeated_MLGs = dplyr::n_distinct(repeated_mlg$MLG, na.rm = TRUE),
-    total_repeated_MLLs = dplyr::n_distinct(repeated_mll$MLL, na.rm = TRUE),
-    total_MLG_clone_copies = N - total_MLG,
-    total_MLL_clone_copies = N - total_MLL,
-    repeated_MLL_individuals = if (length(repeated_mll_inds) == 0) "none" else paste(repeated_mll_inds, collapse = ";"),
-    repeated_MLL_sites = if (length(repeated_mll_sites) == 0) "none" else paste(repeated_mll_sites, collapse = ";"),
-    same_individuals_sites_in_repeated_MLLs_as_full = as.character(repeated_mll_same_as_full),
-    stringsAsFactors = FALSE
-  )
-}
-
-build_clonality_sensitivity <- function(full_gobj, reduced_gobj, df_ids_tbl) {
-  message("[hwe_sensitivity] Recomputing full-loci MLGs and Bruvo MLLs from gi for clonality sensitivity.")
-  message("[hwe_sensitivity] Recomputing reduced-loci MLGs and Bruvo MLLs after removing suspect loci.")
-  message("[hwe_sensitivity] Bruvo MLL threshold: ", BRUVO_MLL_THRESHOLD)
-  message("[hwe_sensitivity] Bruvo clustering algorithm: ", BRUVO_ALGORITHM)
-  
-  full_assign <- compute_mlg_mll_from_gi(full_gobj) %>%
-    add_site_labels_for_clonality(df_ids_tbl, full_gobj) %>%
-    mutate(Dataset = "FULL")
-  reduced_assign <- compute_mlg_mll_from_gi(reduced_gobj) %>%
-    add_site_labels_for_clonality(df_ids_tbl, reduced_gobj) %>%
-    mutate(Dataset = "REDUCED")
-  
-  if (!identical(full_assign$Individual, reduced_assign$Individual)) {
-    stop("[hwe_sensitivity] Full and reduced clonality assignments are not in the same individual order.")
-  }
-  
-  full_site <- summarise_clonality_by_site(full_assign, "FULL")
-  reduced_site <- summarise_clonality_by_site(reduced_assign, "REDUCED")
-  unique_sites <- sort(unique(c(as.character(full_assign$Site), as.character(reduced_assign$Site))))
-  
-  comparison <- full_site %>%
-    select(Site, Site_label, Site_order, N_full = N, MLG_full = MLG, R_MLG_full = R_MLG, MLL_full = MLL, R_MLL_full = R_MLL) %>%
-    full_join(
-      reduced_site %>%
-        select(Site, N_reduced = N, MLG_reduced = MLG, R_MLG_reduced = R_MLG, MLL_reduced = MLL, R_MLL_reduced = R_MLL),
-      by = "Site"
-    ) %>%
-    mutate(
-      delta_MLG = MLG_reduced - MLG_full,
-      delta_MLL = MLL_reduced - MLL_full,
-      delta_R_MLG = R_MLG_reduced - R_MLG_full,
-      delta_R_MLL = R_MLL_reduced - R_MLL_full,
-      interpretation = dplyr::case_when(
-        is.na(delta_MLG) | is.na(delta_MLL) ~ "Could not compare this site because one dataset is missing site-level values.",
-        delta_MLG == 0 & delta_MLL == 0 & abs(delta_R_MLG) < 1e-12 & abs(delta_R_MLL) < 1e-12 ~ "No meaningful clonality change after removing HWE-deviating loci.",
-        delta_MLL != 0 | abs(delta_R_MLL) >= 0.01 ~ "Meaningful clonality change: Bruvo-based MLL count or R_MLL changed.",
-        delta_MLG != 0 | abs(delta_R_MLG) >= 0.01 ~ "Minor clonality change: exact MLG count or R_MLG changed, but MLL conclusion is stable.",
-        TRUE ~ "Very small numerical change only; clonality conclusion is stable."
-      )
-    ) %>%
-    arrange(Site_order, Site_label) %>%
-    transmute(
-      Site = as.character(Site_label),
-      N_full,
-      MLG_full,
-      R_MLG_full,
-      MLL_full,
-      R_MLL_full,
-      N_reduced,
-      MLG_reduced,
-      R_MLG_reduced,
-      MLL_reduced,
-      R_MLL_reduced,
-      delta_MLG,
-      delta_MLL,
-      delta_R_MLG,
-      delta_R_MLL,
-      interpretation
-    )
-  
-  if (nrow(comparison) > length(unique_sites)) {
-    stop(
-      "[hwe_sensitivity] Final clonality comparison has more rows (", nrow(comparison),
-      ") than the number of unique sites (", length(unique_sites), "). Do not group by individuals, MLGs, MLLs, row names, column names, or pairwise comparisons."
-    )
-  }
-  if (nrow(comparison) != length(unique_sites)) {
-    stop(
-      "[hwe_sensitivity] Final clonality comparison must have exactly one row per site, but has ",
-      nrow(comparison), " rows for ", length(unique_sites), " unique sites."
-    )
-  }
-  duplicate_sites <- comparison$Site[duplicated(comparison$Site)]
-  if (length(duplicate_sites) > 0) {
-    stop("[hwe_sensitivity] Final clonality comparison contains duplicated site rows: ", paste(unique(duplicate_sites), collapse = ", "))
-  }
-  
-  cat("\n[hwe_sensitivity] Final site-level clonality comparison table:\n")
-  print(comparison)
-  cat("[hwe_sensitivity] Final site-level clonality comparison row count: ", nrow(comparison), "\n", sep = "")
-  
-  full_mll_repeated <- make_repeated_clone_table(full_assign, "MLL")
-  reduced_mll_repeated <- make_repeated_clone_table(reduced_assign, "MLL")
-  same_repeated_mll_individuals <- identical(
-    sort(unique(as.character(full_mll_repeated$Individual))),
-    sort(unique(as.character(reduced_mll_repeated$Individual)))
-  )
-  same_repeated_mll_sites <- identical(
-    sort(unique(as.character(full_mll_repeated$Site_label))),
-    sort(unique(as.character(reduced_mll_repeated$Site_label)))
-  )
-  same_repeated_mll_groups <- identical(
-    make_repeated_group_signature(full_mll_repeated, "MLL"),
-    make_repeated_group_signature(reduced_mll_repeated, "MLL")
-  )
-  same_individuals_sites <- same_repeated_mll_individuals && same_repeated_mll_sites
-  
-  overall <- bind_rows(
-    summarise_clonality_overall(full_assign, "FULL", repeated_mll_same_as_full = TRUE),
-    summarise_clonality_overall(reduced_assign, "REDUCED", repeated_mll_same_as_full = same_individuals_sites)
-  )
-  overall$same_repeated_MLL_group_memberships_as_full <- as.character(c(TRUE, same_repeated_mll_groups))
-  
-  changed_sites <- comparison %>%
-    filter(
-      !is.na(delta_MLG) & !is.na(delta_MLL) &
-        (delta_MLG != 0 | delta_MLL != 0 | abs(delta_R_MLG) >= 0.01 | abs(delta_R_MLL) >= 0.01)
-    ) %>%
-    pull(Site)
-  
-  list(
-    comparison = comparison,
-    overall = overall,
-    assignments = bind_rows(full_assign, reduced_assign),
-    repeated_MLG = bind_rows(
-      make_repeated_clone_table(full_assign, "MLG") %>% mutate(Dataset = "FULL"),
-      make_repeated_clone_table(reduced_assign, "MLG") %>% mutate(Dataset = "REDUCED")
-    ),
-    repeated_MLL = bind_rows(
-      full_mll_repeated %>% mutate(Dataset = "FULL"),
-      reduced_mll_repeated %>% mutate(Dataset = "REDUCED")
-    ),
-    changed_sites = changed_sites,
-    same_repeated_mll_individuals = same_repeated_mll_individuals,
-    same_repeated_mll_sites = same_repeated_mll_sites,
-    same_repeated_mll_groups = same_repeated_mll_groups
-  )
-}
-
-xml_escape_word <- function(x) {
-  x <- as.character(x)
-  x[is.na(x)] <- ""
-  x <- gsub("&", "&amp;", x, fixed = TRUE)
-  x <- gsub("<", "&lt;", x, fixed = TRUE)
-  x <- gsub(">", "&gt;", x, fixed = TRUE)
-  x <- gsub('"', "&quot;", x, fixed = TRUE)
-  x <- gsub("'", "&apos;", x, fixed = TRUE)
-  x
-}
-
-word_cell_xml <- function(value, bold = FALSE) {
-  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
-  paste0(
-    "<w:tc>",
-    "<w:tcPr><w:tcW w:w=\"2400\" w:type=\"dxa\"/></w:tcPr>",
-    "<w:p><w:r>", bold_xml, "<w:t>", xml_escape_word(value), "</w:t></w:r></w:p>",
-    "</w:tc>"
-  )
-}
-
-word_paragraph_xml <- function(value, bold = FALSE) {
-  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
-  paste0("<w:p><w:r>", bold_xml, "<w:t>", xml_escape_word(value), "</w:t></w:r></w:p>")
-}
-
-word_table_xml <- function(df) {
-  df <- as.data.frame(lapply(df, as.character), stringsAsFactors = FALSE, check.names = FALSE)
-  header <- paste0("<w:tr>", paste(vapply(names(df), word_cell_xml, character(1), bold = TRUE), collapse = ""), "</w:tr>")
-  rows <- apply(df, 1, function(row) paste0("<w:tr>", paste(vapply(row, word_cell_xml, character(1)), collapse = ""), "</w:tr>"))
-  paste0(
-    "<w:tbl>",
-    "<w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"0\" w:type=\"auto\"/>",
-    "<w:tblBorders>",
-    "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
-    "<w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
-    "<w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
-    "<w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
-    "<w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
-    "<w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>",
-    "</w:tblBorders></w:tblPr>",
-    header,
-    paste(rows, collapse = ""),
-    "</w:tbl>"
-  )
-}
-
-write_clonality_docx <- function(comparison_tbl, overall_tbl, path) {
-  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
-  tmp_dir <- tempfile("hwe_clonality_docx_")
-  dir.create(file.path(tmp_dir, "_rels"), recursive = TRUE, showWarnings = FALSE)
-  dir.create(file.path(tmp_dir, "word", "_rels"), recursive = TRUE, showWarnings = FALSE)
-  
-  document_xml <- paste0(
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ',
-    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
-    '<w:body>',
-    word_paragraph_xml("HWE sensitivity clonality comparison", bold = TRUE),
-    word_paragraph_xml("Site-level FULL vs REDUCED comparison", bold = TRUE),
-    word_table_xml(comparison_tbl),
-    word_paragraph_xml("Overall summary", bold = TRUE),
-    word_table_xml(overall_tbl),
-    '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/>',
-    '<w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
-    '</w:body></w:document>'
-  )
-  
-  writeLines(c(
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
-    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
-    '<Default Extension="xml" ContentType="application/xml"/>',
-    '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>',
-    '</Types>'
-  ), file.path(tmp_dir, "[Content_Types].xml"), useBytes = TRUE)
-  writeLines(c(
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
-    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>',
-    '</Relationships>'
-  ), file.path(tmp_dir, "_rels", ".rels"), useBytes = TRUE)
-  writeLines(c(
-    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
-  ), file.path(tmp_dir, "word", "_rels", "document.xml.rels"), useBytes = TRUE)
-  writeLines(document_xml, file.path(tmp_dir, "word", "document.xml"), useBytes = TRUE)
-  
-  old_wd <- getwd()
-  on.exit(setwd(old_wd), add = TRUE)
-  setwd(tmp_dir)
-  if (file.exists(path)) unlink(path)
-  utils::zip(
-    zipfile = path,
-    files = list.files(tmp_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE),
-    flags = "-q"
-  )
-  if (!file.exists(path)) stop("[hwe_sensitivity] Failed to create Word document at: ", path)
-  message("[hwe_sensitivity] Saved: ", path)
-  invisible(path)
+  invisible(tbl)
 }
 
 # ------------------------------------------------------------------
-# Build reduced object and manifest
+# Build clone-corrected full and reduced diversity objects
 # ------------------------------------------------------------------
 full_gi <- gi_mll
+
 reduced_info <- make_reduced_genind(full_gi, suspect_null_loci)
 reduced_gi <- reduced_info$reduced
 
 clone_corrected_site_labels <- get_clone_corrected_site_labels(full_gi)
-site_order <- build_site_order(clone_corrected_site_labels)
-if (!identical(site_order$Site, EXPECTED_SITE_LABELS)) {
-  stop(
-    "[hwe_sensitivity] Site-order table must contain S1-S6 and N1-N6 in the expected order.",
-    "\nObserved: ", paste(site_order$Site, collapse = ", "),
-    call. = FALSE
-  )
-}
-adegenet::pop(full_gi) <- factor(clone_corrected_site_labels, levels = site_order$Site)
+
+adegenet::pop(full_gi) <- factor(clone_corrected_site_labels, levels = EXPECTED_SITE_LABELS)
+
 if (!all(adegenet::indNames(reduced_gi) == adegenet::indNames(full_gi))) {
   stop("[hwe_sensitivity] Reduced clone-corrected genind object is not aligned with full_gi.", call. = FALSE)
 }
-adegenet::pop(reduced_gi) <- factor(clone_corrected_site_labels, levels = site_order$Site)
+
+adegenet::pop(reduced_gi) <- factor(clone_corrected_site_labels, levels = EXPECTED_SITE_LABELS)
+
 message("[hwe_sensitivity] Diversity datasets are clone-corrected: FULL = gi_mll; REDUCED = gi_mll without suspect loci.")
-message("[hwe_sensitivity] Site labels/order for diversity summaries: ", paste(site_order$Site, collapse = ", "))
+message("[hwe_sensitivity] Site labels/order for diversity summaries: ", paste(EXPECTED_SITE_LABELS, collapse = ", "))
 
-full_clonality_gi <- gi
-reduced_clonality_info <- make_reduced_genind(full_clonality_gi, suspect_null_loci)
-reduced_clonality_gi <- reduced_clonality_info$reduced
-
+# ------------------------------------------------------------------
+# Locus manifest
+# ------------------------------------------------------------------
 locus_manifest <- data.frame(
   dataset = c("FULL", "REDUCED"),
   n_loci = c(adegenet::nLoc(full_gi), adegenet::nLoc(reduced_gi)),
@@ -1432,86 +925,19 @@ locus_manifest <- data.frame(
   stringsAsFactors = FALSE
 )
 
-write_csv_msg(locus_manifest, file.path(SENS_TABLES_DIR, paste0("locus_manifest_", analysis_suffix, ".csv")))
-
-clonality_locus_manifest <- data.frame(
-  dataset = c("FULL_CLONALITY_GI", "REDUCED_CLONALITY_GI"),
-  n_loci = c(adegenet::nLoc(full_clonality_gi), adegenet::nLoc(reduced_clonality_gi)),
-  loci = c(
-    paste(adegenet::locNames(full_clonality_gi), collapse = ";"),
-    paste(adegenet::locNames(reduced_clonality_gi), collapse = ";")
-  ),
-  removed_loci = c("", paste(reduced_clonality_info$found, collapse = ";")),
-  requested_but_not_found = c("", paste(reduced_clonality_info$missing, collapse = ";")),
-  stringsAsFactors = FALSE
+write_csv_msg(
+  locus_manifest,
+  file.path(SENS_TABLES_DIR, paste0("locus_manifest_", analysis_suffix, ".csv"))
 )
-write_csv_msg(clonality_locus_manifest, file.path(SENS_TABLES_DIR, paste0("locus_manifest_clonality_", analysis_suffix, ".csv")))
 
 # ------------------------------------------------------------------
-# Run parallel full/reduced analyses
+# Run full/reduced summaries
 # ------------------------------------------------------------------
 full_div <- run_diversity_bundle(full_gi, "FULL")
 red_div <- run_diversity_bundle(reduced_gi, "REDUCED")
 
 full_diff <- run_differentiation_bundle(full_gi, "FULL")
 red_diff <- run_differentiation_bundle(reduced_gi, "REDUCED")
-
-full_amova <- tryCatch(
-  run_amova_bundle(full_gi, "FULL"),
-  error = function(e) {
-    write_failure_log("run_amova_bundle", "FULL", "bundle", conditionMessage(e))
-    list(
-      results = data.frame(
-        Dataset = "FULL",
-        Model = "bundle_failed",
-        Source = "bundle_failed",
-        Sigma = NA_real_,
-        Phi = NA_real_,
-        N_individuals_used = nInd(full_gi),
-        N_groups_used = NA_integer_,
-        Permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      ),
-      rand = data.frame(
-        Dataset = "FULL",
-        Model = "bundle_failed",
-        component = "bundle_failed",
-        statistic = NA_real_,
-        p_value = NA_real_,
-        permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      )
-    )
-  }
-)
-red_amova <- tryCatch(
-  run_amova_bundle(reduced_gi, "REDUCED"),
-  error = function(e) {
-    write_failure_log("run_amova_bundle", "REDUCED", "bundle", conditionMessage(e))
-    list(
-      results = data.frame(
-        Dataset = "REDUCED",
-        Model = "bundle_failed",
-        Source = "bundle_failed",
-        Sigma = NA_real_,
-        Phi = NA_real_,
-        N_individuals_used = nInd(reduced_gi),
-        N_groups_used = NA_integer_,
-        Permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      ),
-      rand = data.frame(
-        Dataset = "REDUCED",
-        Model = "bundle_failed",
-        component = "bundle_failed",
-        statistic = NA_real_,
-        p_value = NA_real_,
-        permutations = AMOVA_PERMUTATIONS,
-        stringsAsFactors = FALSE
-      )
-    )
-  }
-)
 
 full_hwe <- run_hwe_by_site_locus(full_gi, "FULL")
 red_hwe <- run_hwe_by_site_locus(reduced_gi, "REDUCED")
@@ -1522,55 +948,71 @@ red_pca <- run_pca_bundle(reduced_gi, "REDUCED")
 full_dapc <- run_dapc_bundle(full_gi, "FULL")
 red_dapc <- run_dapc_bundle(reduced_gi, "REDUCED")
 
-clonality_sensitivity <- build_clonality_sensitivity(full_clonality_gi, reduced_clonality_gi, df_ids)
-
 # ------------------------------------------------------------------
-# Write reduced-only outputs requested for direct comparison with main outputs
+# Write reduced-only outputs
 # ------------------------------------------------------------------
-validate_site_summary_table(red_div$by_site, "heterozygosity_fis_by_site_noSuspectLoci")
-validate_site_summary_table(red_div$allelic_richness, "allelic_richness_by_site_noSuspectLoci")
-write_csv_msg(red_div$by_site, file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_by_site_", analysis_suffix, ".csv")))
-write_csv_msg(red_div$overall, file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_overall_", analysis_suffix, ".csv")))
-write_csv_msg(red_div$allelic_richness, file.path(SENS_TABLES_DIR, paste0("allelic_richness_by_site_", analysis_suffix, ".csv")))
-write_csv_msg(red_diff$fst_long, file.path(SENS_TABLES_DIR, paste0("pairwise_fst_", analysis_suffix, ".csv")))
-write_csv_msg(red_diff$jost_long, file.path(SENS_TABLES_DIR, paste0("pairwise_jostD_", analysis_suffix, ".csv")))
-write_csv_msg(red_amova$results, file.path(SENS_TABLES_DIR, paste0("amova_", analysis_suffix, ".csv")))
-write_csv_msg(red_amova$rand, file.path(SENS_TABLES_DIR, paste0("amova_randtest_", analysis_suffix, ".csv")))
-write_csv_msg(red_hwe, file.path(SENS_TABLES_DIR, paste0("hwe_by_site_by_locus_", analysis_suffix, ".csv")))
-write_csv_msg(red_pca$variance, file.path(SENS_TABLES_DIR, paste0("pca_variance_", analysis_suffix, ".csv")))
-write_csv_msg(red_dapc$eig, file.path(SENS_TABLES_DIR, paste0("dapc_eigenvalues_", analysis_suffix, ".csv")))
-
-clonality_output <- list(
-  site_comparison = clonality_sensitivity$comparison,
-  overall_summary = clonality_sensitivity$overall,
-  individual_assignments = clonality_sensitivity$assignments,
-  repeated_MLGs = clonality_sensitivity$repeated_MLG,
-  repeated_MLLs = clonality_sensitivity$repeated_MLL,
-  settings = list(
-    suspect_loci_requested = suspect_null_loci,
-    suspect_loci_removed_for_clonality = reduced_clonality_info$found,
-    suspect_loci_not_found_for_clonality = reduced_clonality_info$missing,
-    bruvo_mll_threshold = BRUVO_MLL_THRESHOLD,
-    bruvo_algorithm = BRUVO_ALGORITHM
-  )
+red_div$by_site <- validate_site_table(
+  red_div$by_site,
+  "heterozygosity_fis_by_site_noSuspectLoci"
 )
-write_csv_msg(clonality_sensitivity$comparison, file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.csv"))
-saveRDS(clonality_output, file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"))
-message("[hwe_sensitivity] Saved: ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"))
-write_clonality_docx(
-  clonality_sensitivity$comparison,
-  clonality_sensitivity$overall,
-  file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.docx")
-)
-write_csv_msg(clonality_sensitivity$overall, file.path(TABLES_DIR, "hwe_sensitivity_clonality_overall_summary.csv"))
-write_csv_msg(clonality_sensitivity$assignments, file.path(TABLES_DIR, "hwe_sensitivity_clonality_individual_assignments_long.csv"))
-write_csv_msg(clonality_sensitivity$repeated_MLL, file.path(TABLES_DIR, "hwe_sensitivity_clonality_repeated_MLLs_long.csv"))
 
-write.csv(red_diff$fst_mat, file.path(SENS_MATRICES_DIR, paste0("pairwise_fst_", analysis_suffix, ".csv")))
-write.csv(red_diff$jost_mat, file.path(SENS_MATRICES_DIR, paste0("pairwise_jostD_", analysis_suffix, ".csv")))
+red_div$allelic_richness <- validate_site_table(
+  red_div$allelic_richness,
+  "allelic_richness_by_site_noSuspectLoci"
+)
+
+write_csv_msg(
+  red_div$by_site,
+  file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_by_site_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_div$overall,
+  file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_overall_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_div$allelic_richness,
+  file.path(SENS_TABLES_DIR, paste0("allelic_richness_by_site_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_diff$fst_long,
+  file.path(SENS_TABLES_DIR, paste0("pairwise_fst_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_diff$jost_long,
+  file.path(SENS_TABLES_DIR, paste0("pairwise_jostD_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_hwe,
+  file.path(SENS_TABLES_DIR, paste0("hwe_by_site_by_locus_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_pca$variance,
+  file.path(SENS_TABLES_DIR, paste0("pca_variance_", analysis_suffix, ".csv"))
+)
+
+write_csv_msg(
+  red_dapc$eig,
+  file.path(SENS_TABLES_DIR, paste0("dapc_eigenvalues_", analysis_suffix, ".csv"))
+)
+
+write.csv(
+  red_diff$fst_mat,
+  file.path(SENS_MATRICES_DIR, paste0("pairwise_fst_", analysis_suffix, ".csv"))
+)
+
+write.csv(
+  red_diff$jost_mat,
+  file.path(SENS_MATRICES_DIR, paste0("pairwise_jostD_", analysis_suffix, ".csv"))
+)
 
 # ------------------------------------------------------------------
-# Write comparison outputs (FULL vs REDUCED)
+# FULL vs REDUCED comparisons
 # ------------------------------------------------------------------
 div_by_site_all <- bind_rows(full_div$by_site, red_div$by_site)
 div_by_locus_all <- bind_rows(full_div$by_locus, red_div$by_locus)
@@ -1581,52 +1023,160 @@ diff_summary_all <- bind_rows(full_diff$summary, red_diff$summary)
 fst_long_all <- bind_rows(full_diff$fst_long, red_diff$fst_long)
 jost_long_all <- bind_rows(full_diff$jost_long, red_diff$jost_long)
 
-amova_results_all <- bind_rows(full_amova$results, red_amova$results)
-amova_rand_all <- bind_rows(full_amova$rand, red_amova$rand)
-
 hwe_all <- bind_rows(full_hwe, red_hwe)
 pca_var_all <- bind_rows(full_pca$variance, red_pca$variance)
 dapc_eig_all <- bind_rows(full_dapc$eig, red_dapc$eig)
 
 summary_stats <- data.frame(
   Dataset = c("FULL", "REDUCED"),
-  N_individuals = c(nInd(full_gi), nInd(reduced_gi)),
-  N_loci = c(nLoc(full_gi), nLoc(reduced_gi)),
+  N_individuals = c(adegenet::nInd(full_gi), adegenet::nInd(reduced_gi)),
+  N_loci = c(adegenet::nLoc(full_gi), adegenet::nLoc(reduced_gi)),
   stringsAsFactors = FALSE
 )
 
-summary_stats_cmp <- compare_two_dataset_table(summary_stats, by_cols = character(0), value_cols = c("N_individuals", "N_loci"))
-div_overall_cmp <- compare_two_dataset_table(div_overall_all, by_cols = character(0), value_cols = c("N", "N_loci", "Ho", "He", "FIS"))
-div_site_cmp <- compare_two_dataset_table_clean(div_by_site_all, by_cols = c("Site"), value_cols = c("N", "Ho", "He", "FIS", "Na", "Allelic_Richness", "Allelic_Richness_SE"))
-validate_by_site_comparison(div_site_cmp, "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison")
-div_locus_cmp <- compare_two_dataset_table_clean(div_by_locus_all, by_cols = c("Locus"), value_cols = c("Ho", "He", "FIS"))
-ar_cmp <- compare_two_dataset_table_clean(ar_all, by_cols = c("Site"), value_cols = c("Allelic_Richness", "Allelic_Richness_SE"))
-if (!identical(as.character(ar_cmp$Site), EXPECTED_SITE_LABELS) || contains_x_site_labels(ar_cmp$Site)) {
-  stop("[hwe_sensitivity] full_vs_noSuspectLoci_allelic_richness_comparison is not a validated by-site table.", call. = FALSE)
-}
-diff_cmp <- compare_two_dataset_table(diff_summary_all, by_cols = character(0), value_cols = c("mean_pairwise_JostD", "median_pairwise_JostD", "mean_pairwise_FST", "median_pairwise_FST"))
-pca_cmp <- compare_two_dataset_table(pca_var_all, by_cols = c("PC"), value_cols = c("Percent_Variance"))
-dapc_cmp <- compare_two_dataset_table(dapc_eig_all, by_cols = c("Axis"), value_cols = c("Eigenvalue"))
+summary_stats_cmp <- compare_two_dataset_table(
+  summary_stats,
+  by_cols = character(0),
+  value_cols = c("N_individuals", "N_loci")
+)
 
-write_csv_msg(summary_stats_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_locus_count_comparison.csv"))
-write_csv_msg(div_overall_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_overall_comparison.csv"))
-write_csv_msg(div_site_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison.csv"))
-write_csv_msg(div_locus_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_by_locus_comparison.csv"))
-write_csv_msg(ar_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_allelic_richness_comparison.csv"))
-write_csv_msg(diff_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_differentiation_comparison.csv"))
-write_csv_msg(pca_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pca_variance_comparison.csv"))
-write_csv_msg(dapc_cmp, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_dapc_comparison.csv"))
+div_overall_cmp <- compare_two_dataset_table(
+  div_overall_all,
+  by_cols = character(0),
+  value_cols = c("N", "N_loci", "Ho", "He", "FIS")
+)
 
-write_csv_msg(fst_long_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pairwise_fst_long.csv"))
-write_csv_msg(jost_long_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pairwise_jostD_long.csv"))
-write_csv_msg(amova_results_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_amova_long.csv"))
-write_csv_msg(amova_rand_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_amova_randtest_long.csv"))
-write_csv_msg(hwe_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_hwe_by_site_by_locus_long.csv"))
-write_csv_msg(pca_var_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pca_variance_long.csv"))
-write_csv_msg(dapc_eig_all, file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_dapc_eigenvalues_long.csv"))
+div_site_cmp <- compare_two_dataset_table_clean(
+  div_by_site_all,
+  by_cols = c("Site"),
+  value_cols = c(
+    "N",
+    "Ho",
+    "He",
+    "FIS",
+    "Na",
+    "Allelic_Richness",
+    "Allelic_Richness_SE"
+  )
+)
+
+div_site_cmp <- validate_site_table(
+  div_site_cmp,
+  "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison"
+)
+
+validate_by_site_comparison(
+  div_site_cmp,
+  "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison"
+)
+
+div_locus_cmp <- compare_two_dataset_table_clean(
+  div_by_locus_all,
+  by_cols = c("Locus"),
+  value_cols = c("Ho", "He", "FIS")
+)
+
+ar_cmp <- compare_two_dataset_table_clean(
+  ar_all,
+  by_cols = c("Site"),
+  value_cols = c("Allelic_Richness", "Allelic_Richness_SE")
+)
+
+ar_cmp <- validate_site_table(
+  ar_cmp,
+  "full_vs_noSuspectLoci_allelic_richness_comparison"
+)
+
+diff_cmp <- compare_two_dataset_table(
+  diff_summary_all,
+  by_cols = character(0),
+  value_cols = c(
+    "mean_pairwise_JostD",
+    "median_pairwise_JostD",
+    "mean_pairwise_FST",
+    "median_pairwise_FST"
+  )
+)
+
+pca_cmp <- compare_two_dataset_table(
+  pca_var_all,
+  by_cols = c("PC"),
+  value_cols = c("Percent_Variance")
+)
+
+dapc_cmp <- compare_two_dataset_table(
+  dapc_eig_all,
+  by_cols = c("Axis"),
+  value_cols = c("Eigenvalue")
+)
+
+write_csv_msg(
+  summary_stats_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_locus_count_comparison.csv")
+)
+
+write_csv_msg(
+  div_overall_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_overall_comparison.csv")
+)
+
+write_csv_msg(
+  div_site_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_by_site_comparison.csv")
+)
+
+write_csv_msg(
+  div_locus_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_heterozygosity_fis_by_locus_comparison.csv")
+)
+
+write_csv_msg(
+  ar_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_allelic_richness_comparison.csv")
+)
+
+write_csv_msg(
+  diff_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_differentiation_comparison.csv")
+)
+
+write_csv_msg(
+  pca_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pca_variance_comparison.csv")
+)
+
+write_csv_msg(
+  dapc_cmp,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_dapc_comparison.csv")
+)
+
+write_csv_msg(
+  fst_long_all,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pairwise_fst_long.csv")
+)
+
+write_csv_msg(
+  jost_long_all,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pairwise_jostD_long.csv")
+)
+
+write_csv_msg(
+  hwe_all,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_hwe_by_site_by_locus_long.csv")
+)
+
+write_csv_msg(
+  pca_var_all,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_pca_variance_long.csv")
+)
+
+write_csv_msg(
+  dapc_eig_all,
+  file.path(COMPARISON_DIR, "full_vs_noSuspectLoci_dapc_eigenvalues_long.csv")
+)
 
 # ------------------------------------------------------------------
-# Figures for reduced-only and comparison views
+# Figures
 # ------------------------------------------------------------------
 pca_scores_all <- bind_rows(full_pca$scores, red_pca$scores)
 dapc_coords_all <- bind_rows(full_dapc$coords, red_dapc$coords)
@@ -1635,17 +1185,35 @@ pca_plot <- ggplot(pca_scores_all, aes(PC1, PC2, color = Site)) +
   geom_point(alpha = 0.8, size = 1.8) +
   facet_wrap(~ Dataset, scales = "free") +
   theme_bw(base_size = 11) +
-  labs(title = "PCA comparison: FULL vs noSuspectLoci", x = "PC1", y = "PC2")
+  labs(
+    title = "PCA comparison: FULL vs noSuspectLoci",
+    x = "PC1",
+    y = "PC2"
+  )
 
-ggsave(file.path(SENS_FIGURES_DIR, paste0("pca_", analysis_suffix, ".pdf")), pca_plot, width = 8.2, height = 4.6)
+ggsave(
+  file.path(SENS_FIGURES_DIR, paste0("pca_", analysis_suffix, ".pdf")),
+  pca_plot,
+  width = 8.2,
+  height = 4.6
+)
 
 dapc_plot <- ggplot(dapc_coords_all, aes(LD1, LD2, color = Site)) +
   geom_point(alpha = 0.8, size = 1.8) +
   facet_wrap(~ Dataset, scales = "free") +
   theme_bw(base_size = 11) +
-  labs(title = "DAPC comparison: FULL vs noSuspectLoci", x = "LD1", y = "LD2")
+  labs(
+    title = "DAPC comparison: FULL vs noSuspectLoci",
+    x = "LD1",
+    y = "LD2"
+  )
 
-ggsave(file.path(SENS_FIGURES_DIR, paste0("dapc_", analysis_suffix, ".pdf")), dapc_plot, width = 8.2, height = 4.6)
+ggsave(
+  file.path(SENS_FIGURES_DIR, paste0("dapc_", analysis_suffix, ".pdf")),
+  dapc_plot,
+  width = 8.2,
+  height = 4.6
+)
 
 delta_tbl <- bind_rows(
   div_overall_cmp %>% transmute(metric = "Ho", delta = delta_Ho_REDUCED_minus_FULL),
@@ -1659,38 +1227,25 @@ delta_plot <- ggplot(delta_tbl, aes(metric, delta, fill = metric)) +
   geom_col(show.legend = FALSE, width = 0.72) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
   theme_bw(base_size = 11) +
-  labs(title = "Sensitivity deltas (REDUCED - FULL)", x = NULL, y = "Delta")
+  labs(
+    title = "Sensitivity deltas (REDUCED - FULL)",
+    x = NULL,
+    y = "Delta"
+  )
 
-ggsave(file.path(SENS_FIGURES_DIR, "full_vs_noSuspectLoci_metric_deltas.pdf"), delta_plot, width = 8, height = 4.5)
+ggsave(
+  file.path(SENS_FIGURES_DIR, "full_vs_noSuspectLoci_metric_deltas.pdf"),
+  delta_plot,
+  width = 8,
+  height = 4.5
+)
 
-meaningful_site_changes <- clonality_sensitivity$changed_sites
-overall_full <- clonality_sensitivity$overall[clonality_sensitivity$overall$Dataset == "FULL", , drop = FALSE]
-overall_reduced <- clonality_sensitivity$overall[clonality_sensitivity$overall$Dataset == "REDUCED", , drop = FALSE]
-overall_changed <- !identical(overall_full$total_MLG, overall_reduced$total_MLG) ||
-  !identical(overall_full$total_MLL, overall_reduced$total_MLL) ||
-  !isTRUE(all.equal(overall_full$R_MLG, overall_reduced$R_MLG, tolerance = 1e-12)) ||
-  !isTRUE(all.equal(overall_full$R_MLL, overall_reduced$R_MLL, tolerance = 1e-12)) ||
-  !isTRUE(clonality_sensitivity$same_repeated_mll_individuals) ||
-  !isTRUE(clonality_sensitivity$same_repeated_mll_sites)
-
-cat("\n")
-cat("============================================================\n")
-cat("HWE SENSITIVITY CLONALITY RESULT\n")
-cat("============================================================\n")
-cat("Removed loci: ", if (length(reduced_clonality_info$found) > 0) paste(reduced_clonality_info$found, collapse = ", ") else "none", "\n", sep = "")
-cat("Bruvo MLL threshold: ", BRUVO_MLL_THRESHOLD, "\n", sep = "")
-cat("Bruvo clustering algorithm: ", BRUVO_ALGORITHM, "\n", sep = "")
-cat("Did clonality change after removing HWE-deviating loci? ", if (overall_changed) "YES" else "NO", "\n", sep = "")
-cat("Sites changed: ", if (length(meaningful_site_changes) > 0) paste(meaningful_site_changes, collapse = ", ") else "none", "\n", sep = "")
-cat("Same individuals in repeated MLLs? ", if (clonality_sensitivity$same_repeated_mll_individuals) "YES" else "NO", "\n", sep = "")
-cat("Same sites in repeated MLLs? ", if (clonality_sensitivity$same_repeated_mll_sites) "YES" else "NO", "\n", sep = "")
-cat("Main clonality conclusion robust? ", if (!overall_changed && length(meaningful_site_changes) == 0) "YES" else "CHECK SITE-LEVEL CHANGES", "\n", sep = "")
-cat("Primary outputs:\n")
-cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.csv"), "\n", sep = "")
-cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.rds"), "\n", sep = "")
-cat("  - ", file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.docx"), "\n", sep = "")
-cat("============================================================\n\n")
-
-message("[hwe_sensitivity] Completed reduced-loci sensitivity branch successfully.")
+# ------------------------------------------------------------------
+# Final console verification
+# ------------------------------------------------------------------
 cat("\n[hwe_sensitivity] Corrected FULL vs REDUCED by-site diversity comparison (should be 12 rows: S1-S6, N1-N6):\n")
 print(div_site_cmp)
+cat("[hwe_sensitivity] Corrected by-site comparison row count: ", nrow(div_site_cmp), "\n", sep = "")
+cat("[hwe_sensitivity] Corrected by-site comparison site order: ", paste(div_site_cmp$Site, collapse = ", "), "\n", sep = "")
+
+message("[hwe_sensitivity] Completed reduced-loci sensitivity branch successfully.")

@@ -100,6 +100,48 @@ format_number <- function(x, digits, na_text = "NA") {
   ifelse(is.na(x), na_text, sprintf(paste0("%.", digits, "f"), x))
 }
 
+normalize_col_name <- function(x) {
+  x_norm <- iconv(x, from = "", to = "ASCII//TRANSLIT")
+  x_norm <- tolower(x_norm)
+  x_norm <- gsub("[^a-z0-9]+", "_", x_norm)
+  x_norm <- gsub("_+", "_", x_norm)
+  gsub("^_|_$", "", x_norm)
+}
+
+find_table_col <- function(df, candidates) {
+  exact_idx <- match(candidates, names(df), nomatch = 0)
+  exact_idx <- exact_idx[exact_idx > 0]
+  if (length(exact_idx) > 0) return(names(df)[exact_idx[1]])
+  
+  names_norm <- normalize_col_name(names(df))
+  candidate_norm <- normalize_col_name(candidates)
+  norm_idx <- match(candidate_norm, names_norm, nomatch = 0)
+  norm_idx <- norm_idx[norm_idx > 0]
+  if (length(norm_idx) > 0) names(df)[norm_idx[1]] else NA_character_
+}
+
+require_table_col <- function(df, label, candidates) {
+  col <- find_table_col(df, candidates)
+  if (!is.na(col)) return(col)
+  
+  stop(
+    "Missing required column for ", label, ". Accepted column names include: ",
+    paste(candidates, collapse = ", "),
+    "\nColumns found in CSV: ", paste(names(df), collapse = ", "),
+    call. = FALSE
+  )
+}
+
+format_table_column <- function(x, digits = NULL, na_text = "NA") {
+  if (is.numeric(x)) {
+    if (is.null(digits)) return(ifelse(is.na(x), na_text, as.character(x)))
+    return(format_number(x, digits, na_text = na_text))
+  }
+  
+  x_chr <- as.character(x)
+  ifelse(is.na(x_chr) | x_chr == "", na_text, x_chr)
+}
+
 # -----------------------------
 # Paths
 # -----------------------------
@@ -121,44 +163,40 @@ if (!file.exists(csv_path)) {
 # -----------------------------
 site_table <- readr::read_csv(csv_path, show_col_types = FALSE)
 
-required_cols <- c(
-  "Site",
-  "Basal Area",
-  "Mean DBH",
-  "Beech Basal Area",
-  "Mean Beech DBH",
-  "Beech Sapling Basal Area",
-  "Dominant Species",
-  "Elevation"
-)
-missing_cols <- setdiff(required_cols, names(site_table))
-if (length(missing_cols) > 0) {
-  stop("Missing required columns in CSV: ", paste(missing_cols, collapse = ", "), call. = FALSE)
-}
+# The upstream site_description_table_article.R script now writes an
+# article-ready CSV with formatted column names such as
+# "Basal area (m²·ha⁻¹)" and mean (SD) character values. Older CSVs used
+# raw numeric names such as "Basal Area". Accept both shapes so this
+# formatter can be run safely after either version of the table generator.
+site_col <- require_table_col(site_table, "site", c("Site"))
+latitude_col <- find_table_col(site_table, c("Latitude", "Lat"))
+elevation_col <- require_table_col(site_table, "elevation", c("Elevation", "Elevation (m)", "elevation_mean"))
+basal_area_col <- require_table_col(site_table, "basal area", c("Basal Area", "Basal_Area", "Basal area (m²·ha⁻¹)", "basal_area_mean"))
+mean_dbh_col <- require_table_col(site_table, "mean DBH", c("Mean DBH", "Mean_DBH", "Mean DBH (cm)", "mean_dbh"))
+beech_basal_area_col <- require_table_col(site_table, "beech basal area", c("Beech Basal Area", "Beech_Basal_Area", "Beech basal area (m²·ha⁻¹)", "beech_basal_area_mean"))
+mean_beech_dbh_col <- require_table_col(site_table, "mean beech DBH", c("Mean Beech DBH", "Mean_Beech_DBH", "Mean beech DBH (cm)", "mean_beech_dbh"))
+beech_sapling_basal_area_col <- require_table_col(site_table, "beech sapling basal area", c("Beech Sapling Basal Area", "Beech sapling basal area (m²·ha⁻¹)", "beech_sapling_basal_area_mean"))
+dominant_species_col <- require_table_col(site_table, "dominant species", c("Dominant Species", "Top 3 dominant species", "Top 3 Dominant Species", "top_3_species_converted_codes"))
 
 # -----------------------------
 # Build article-ready table
 # -----------------------------
-site_table_pretty <- site_table %>%
-  mutate(
-    `Basal area\n(m²·ha⁻¹)` = format_number(`Basal Area`, 1),
-    `Mean DBH\n(cm)` = format_number(`Mean DBH`, 1),
-    `Beech basal area\n(m²·ha⁻¹)` = format_number(`Beech Basal Area`, 2),
-    `Mean beech DBH\n(cm)` = format_number(`Mean Beech DBH`, 1),
-    `Beech saplings basal area\n(m²·ha⁻¹)` = format_number(`Beech Sapling Basal Area`, 2),
-    `Dominant species` = `Dominant Species`,
-    `Elevation\n(m)` = format_number(Elevation, 0)
-  ) %>%
-  select(
-    Site,
-    `Basal area\n(m²·ha⁻¹)`,
-    `Mean DBH\n(cm)`,
-    `Beech basal area\n(m²·ha⁻¹)`,
-    `Mean beech DBH\n(cm)`,
-    `Beech saplings basal area\n(m²·ha⁻¹)`,
-    `Dominant species`,
-    `Elevation\n(m)`
-  )
+site_table_pretty <- data.frame(
+  Site = format_table_column(site_table[[site_col]]),
+  check.names = FALSE
+)
+
+if (!is.na(latitude_col)) {
+  site_table_pretty[["Latitude"]] <- format_table_column(site_table[[latitude_col]], digits = 5)
+}
+
+site_table_pretty[["Elevation\n(m)"]] <- format_table_column(site_table[[elevation_col]], digits = 0)
+site_table_pretty[["Basal area\n(m²·ha⁻¹)"]] <- format_table_column(site_table[[basal_area_col]], digits = 1)
+site_table_pretty[["Mean DBH\n(cm)"]] <- format_table_column(site_table[[mean_dbh_col]], digits = 1)
+site_table_pretty[["Beech basal area\n(m²·ha⁻¹)"]] <- format_table_column(site_table[[beech_basal_area_col]], digits = 2)
+site_table_pretty[["Mean beech DBH\n(cm)"]] <- format_table_column(site_table[[mean_beech_dbh_col]], digits = 1)
+site_table_pretty[["Beech saplings basal area\n(m²·ha⁻¹)"]] <- format_table_column(site_table[[beech_sapling_basal_area_col]], digits = 2)
+site_table_pretty[["Dominant species"]] <- format_table_column(site_table[[dominant_species_col]])
 
 # -----------------------------
 # Save Word table

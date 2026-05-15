@@ -392,6 +392,214 @@ make_reduced_genind <- function(gobj, loci_to_remove) {
   )
 }
 
+
+# ------------------------------------------------------------------
+# Clonality sensitivity helpers (full, non-clone-corrected gi)
+# ------------------------------------------------------------------
+DEFAULT_BRUVO_MLL_THRESHOLD <- 0.09
+DEFAULT_BRUVO_ALGORITHM <- "farthest_neighbor"
+
+get_full_dataset_site_labels <- function(gobj) {
+  aligned <- align_df_ids_to_genind(gobj, df_ids, context = "[hwe_sensitivity gi]")
+  raw_sites <- normalize_lookup_key(aligned$Site)
+  
+  if (any(!nzchar(raw_sites))) {
+    bad_ids <- aligned$ind_id[!nzchar(raw_sites)]
+    stop(
+      "[hwe_sensitivity] df_ids contains missing/blank Site labels for full gi individuals: ",
+      paste(head(bad_ids, 10), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  if (contains_x_site_labels(raw_sites)) {
+    stop("[hwe_sensitivity] Raw df_ids site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
+  }
+  
+  site_labels <- map_site_labels(raw_sites)
+  
+  if (contains_x_site_labels(site_labels)) {
+    stop("[hwe_sensitivity] Final mapped full-dataset site labels contain locus-like X labels; refusing to continue.", call. = FALSE)
+  }
+  
+  if (!setequal(unique(site_labels), EXPECTED_SITE_LABELS)) {
+    stop(
+      "[hwe_sensitivity] Final full-dataset site labels must be exactly S1-S6 and N1-N6.",
+      "\nExpected: ", paste(EXPECTED_SITE_LABELS, collapse = ", "),
+      "\nObserved: ", paste(sort(unique(site_labels)), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  site_labels
+}
+
+compute_mlg_mll_assignments <- function(gobj,
+                                        threshold = DEFAULT_BRUVO_MLL_THRESHOLD,
+                                        algorithm = DEFAULT_BRUVO_ALGORITHM) {
+  gc_mlg <- poppr::as.genclone(gobj)
+  mlg_raw <- tryCatch(
+    poppr::mlg.vector(gc_mlg),
+    error = function(e) as.integer(factor(poppr::mlg(gc_mlg)))
+  )
+  mlg_labels <- paste0("MLG_", as.integer(factor(mlg_raw)))
+  
+  replen <- rep(2, adegenet::nLoc(gobj))
+  names(replen) <- adegenet::locNames(gobj)
+  
+  gc_mll <- gc_mlg
+  poppr::mlg.filter(
+    gc_mll,
+    distance = poppr::bruvo.dist,
+    replen = replen,
+    algorithm = algorithm
+  ) <- threshold
+  
+  mll_raw <- poppr::mll(gc_mll)
+  mll_labels <- paste0("MLL_", as.integer(factor(mll_raw)))
+  
+  data.frame(
+    Individual = adegenet::indNames(gobj),
+    Site = as.character(adegenet::pop(gobj)),
+    MLG = mlg_labels,
+    MLL = mll_labels,
+    Bruvo_MLL_threshold = threshold,
+    Bruvo_algorithm = algorithm,
+    stringsAsFactors = FALSE
+  )
+}
+
+calc_clonal_richness <- function(n_individuals, n_groups) {
+  ifelse(n_individuals <= 1, NA_real_, (n_groups - 1) / (n_individuals - 1))
+}
+
+summarise_clonality_assignments <- function(assignments, dataset_label) {
+  overall <- assignments %>%
+    summarise(
+      Dataset = dataset_label,
+      Level = "overall",
+      Site = "ALL",
+      N = dplyr::n(),
+      N_MLG = dplyr::n_distinct(MLG),
+      N_MLL = dplyr::n_distinct(MLL),
+      .groups = "drop"
+    )
+  
+  by_site <- assignments %>%
+    group_by(Site) %>%
+    summarise(
+      Dataset = dataset_label,
+      Level = "site",
+      N = dplyr::n(),
+      N_MLG = dplyr::n_distinct(MLG),
+      N_MLL = dplyr::n_distinct(MLL),
+      .groups = "drop"
+    ) %>%
+    validate_site_table(paste0(dataset_label, " clonality sensitivity by site"))
+  
+  bind_rows(overall, by_site) %>%
+    mutate(
+      R_MLG = calc_clonal_richness(N, N_MLG),
+      R_MLL = calc_clonal_richness(N, N_MLL),
+      Clonality_MLG = 1 - (N_MLG / N),
+      Clonality_MLL = 1 - (N_MLL / N),
+      Bruvo_MLL_threshold = DEFAULT_BRUVO_MLL_THRESHOLD,
+      Bruvo_algorithm = DEFAULT_BRUVO_ALGORITHM
+    ) %>%
+    select(
+      Dataset, Level, Site, N, N_MLG, N_MLL, R_MLG, R_MLL,
+      Clonality_MLG, Clonality_MLL, Bruvo_MLL_threshold, Bruvo_algorithm
+    )
+}
+
+run_clonality_sensitivity_bundle <- function(full_gobj, loci_to_remove) {
+  full_for_clones <- full_gobj
+  full_site_labels <- get_full_dataset_site_labels(full_for_clones)
+  adegenet::pop(full_for_clones) <- factor(full_site_labels, levels = EXPECTED_SITE_LABELS)
+  
+  reduced_info_full <- make_reduced_genind(full_for_clones, loci_to_remove)
+  reduced_for_clones <- reduced_info_full$reduced
+  adegenet::pop(reduced_for_clones) <- factor(full_site_labels, levels = EXPECTED_SITE_LABELS)
+  
+  full_assign <- compute_mlg_mll_assignments(full_for_clones) %>% mutate(Dataset = "FULL")
+  reduced_assign <- compute_mlg_mll_assignments(reduced_for_clones) %>% mutate(Dataset = "REDUCED")
+  
+  full_summary <- summarise_clonality_assignments(full_assign, "FULL")
+  reduced_summary <- summarise_clonality_assignments(reduced_assign, "REDUCED")
+  summary_all <- bind_rows(full_summary, reduced_summary)
+  
+  comparison <- compare_two_dataset_table_clean(
+    summary_all,
+    by_cols = c("Level", "Site"),
+    value_cols = c("N", "N_MLG", "N_MLL", "R_MLG", "R_MLL", "Clonality_MLG", "Clonality_MLL")
+  ) %>%
+    mutate(
+      Bruvo_MLL_threshold = DEFAULT_BRUVO_MLL_THRESHOLD,
+      Bruvo_algorithm = DEFAULT_BRUVO_ALGORITHM,
+      Removed_loci = paste(reduced_info_full$found, collapse = ";"),
+      Requested_loci_not_found = paste(reduced_info_full$missing, collapse = ";")
+    )
+  
+  overall_summary <- comparison %>%
+    filter(Level == "overall", Site == "ALL")
+  
+  site_comparison <- comparison %>%
+    filter(Level == "site") %>%
+    validate_site_table("hwe_sensitivity_clonality_comparison site rows")
+  
+  bind_rows(overall_summary, site_comparison)
+}
+
+check_clonality_sensitivity_expectations <- function(overall_summary, comparison_tbl) {
+  expected <- data.frame(
+    Dataset = c("FULL", "REDUCED"),
+    total_N = c(276L, 276L),
+    total_MLG = c(270L, 270L),
+    total_MLL = c(268L, 267L),
+    R_MLL = c(0.970909, 0.967273),
+    stringsAsFactors = FALSE
+  )
+  
+  actual <- data.frame(
+    Dataset = c("FULL", "REDUCED"),
+    total_N = c(overall_summary$N_full[1], overall_summary$N_reduced[1]),
+    total_MLG = c(overall_summary$N_MLG_full[1], overall_summary$N_MLG_reduced[1]),
+    total_MLL = c(overall_summary$N_MLL_full[1], overall_summary$N_MLL_reduced[1]),
+    R_MLL = c(overall_summary$R_MLL_full[1], overall_summary$R_MLL_reduced[1]),
+    stringsAsFactors = FALSE
+  )
+  
+  mismatch <- !isTRUE(all.equal(actual$total_N, expected$total_N, check.attributes = FALSE)) ||
+    !isTRUE(all.equal(actual$total_MLG, expected$total_MLG, check.attributes = FALSE)) ||
+    !isTRUE(all.equal(actual$total_MLL, expected$total_MLL, check.attributes = FALSE)) ||
+    !isTRUE(all.equal(round(actual$R_MLL, 6), expected$R_MLL, tolerance = 1e-6, check.attributes = FALSE))
+  
+  changed_sites <- comparison_tbl %>%
+    filter(Level == "site", !is.na(N_MLL_delta), abs(N_MLL_delta) > 0) %>%
+    select(Site, N_MLL_full, N_MLL_reduced, N_MLL_delta)
+  
+  site_expectation_ok <- nrow(changed_sites) == 1 &&
+    changed_sites$Site[1] == "N5" &&
+    changed_sites$N_MLL_full[1] == 24 &&
+    changed_sites$N_MLL_reduced[1] == 23
+  
+  if (mismatch || !site_expectation_ok) {
+    warning(
+      "[hwe_sensitivity] Clonality sensitivity values differ from the previously expected check values. ",
+      "This may be legitimate if inputs changed; review outputs/tables/hwe_sensitivity_clonality_*.csv.",
+      call. = FALSE
+    )
+    message("[hwe_sensitivity] Actual clonality sensitivity overall summary:")
+    print(actual)
+    message("[hwe_sensitivity] Site rows with changed N_MLL:")
+    print(changed_sites)
+  } else {
+    message("[hwe_sensitivity] Clonality sensitivity outputs match the expected previous values.")
+  }
+  
+  invisible(!mismatch && site_expectation_ok)
+}
+
 # ------------------------------------------------------------------
 # Diversity helpers
 # ------------------------------------------------------------------
@@ -508,7 +716,6 @@ extract_overall_stat <- function(overall_obj, stat_name) {
   
   NA_real_
 }
-
 run_diversity_bundle <- function(gobj, dataset_label) {
   site_order <- EXPECTED_SITE_LABELS
   observed_sites <- unique(as.character(adegenet::pop(gobj)))
@@ -909,6 +1116,25 @@ adegenet::pop(reduced_gi) <- factor(clone_corrected_site_labels, levels = EXPECT
 
 message("[hwe_sensitivity] Diversity datasets are clone-corrected: FULL = gi_mll; REDUCED = gi_mll without suspect loci.")
 message("[hwe_sensitivity] Site labels/order for diversity summaries: ", paste(EXPECTED_SITE_LABELS, collapse = ", "))
+
+message("[hwe_sensitivity] Clonality sensitivity datasets are non-clone-corrected: FULL = gi; REDUCED = gi without suspect loci.")
+clonality_sensitivity_comparison <- run_clonality_sensitivity_bundle(gi, suspect_null_loci)
+clonality_sensitivity_overall_summary <- clonality_sensitivity_comparison %>%
+  filter(Level == "overall", Site == "ALL")
+check_clonality_sensitivity_expectations(
+  clonality_sensitivity_overall_summary,
+  clonality_sensitivity_comparison
+)
+
+write_csv_msg(
+  clonality_sensitivity_comparison,
+  file.path(TABLES_DIR, "hwe_sensitivity_clonality_comparison.csv")
+)
+
+write_csv_msg(
+  clonality_sensitivity_overall_summary,
+  file.path(TABLES_DIR, "hwe_sensitivity_clonality_overall_summary.csv")
+)
 
 # ------------------------------------------------------------------
 # Locus manifest

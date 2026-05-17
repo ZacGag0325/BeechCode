@@ -58,7 +58,9 @@ setwd(PROJECT_ROOT)
 # User-adjustable settings
 # ----------------------------
 APPENDIX_DIR <- file.path(PROJECT_ROOT, "outputs", "appendix_tables")
+HWE_APPENDIX_DIR <- file.path(PROJECT_ROOT, "outputs", "appendices")
 dir.create(APPENDIX_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(HWE_APPENDIX_DIR, recursive = TRUE, showWarnings = FALSE)
 
 EXPECTED_SITE_LABELS <- c(paste0("S", 1:6), paste0("N", 1:6))
 HWE_MONTE_CARLO_REPS <- 9999L
@@ -495,44 +497,92 @@ format_hwe_p_value <- function(p) {
   )
 }
 
-format_hwe_stat_cell <- function(chi_square, df, exact_p_value) {
-  chi_txt <- ifelse(is.na(chi_square) | !is.finite(chi_square), "--", format(round(chi_square, 2), nsmall = 2, trim = TRUE, scientific = FALSE))
-  df_txt <- ifelse(is.na(df), "--", as.character(df))
-  p_txt <- format_hwe_p_value(exact_p_value)
-  paste0("X2=", chi_txt, "; df=", df_txt, "; p=", p_txt)
+format_hwe_chi_value <- function(x) {
+  ifelse(
+    is.na(x) | !is.finite(x),
+    "--",
+    ifelse(
+      abs(x) >= 1000 | (abs(x) > 0 & abs(x) < 0.01),
+      formatC(x, format = "e", digits = 2),
+      format(round(x, 2), nsmall = 2, trim = TRUE, scientific = FALSE)
+    )
+  )
 }
 
-build_hwe_display_table <- function(hwe_long, site_levels) {
+format_hwe_df_value <- function(x) {
+  ifelse(is.na(x) | !is.finite(x), "--", as.character(as.integer(x)))
+}
+
+build_hwe_c1_table <- function(hwe_wide, hwe_long, site_levels) {
   scope_levels <- c("All", site_levels)
+  loci_order <- as.character(hwe_wide$Locus)
+  
+  format_scope_value <- function(scope, metric, formatter = as.character) {
+    value_col <- paste(scope, metric, sep = "_")
+    status_col <- paste(scope, "status", sep = "_")
+    p_col <- paste(scope, "exact_p_value", sep = "_")
+    
+    if (!value_col %in% names(hwe_wide)) return(rep("--", nrow(hwe_wide)))
+    
+    status <- if (status_col %in% names(hwe_wide)) as.character(hwe_wide[[status_col]]) else NA_character_
+    p_value <- if (p_col %in% names(hwe_wide)) suppressWarnings(as.numeric(hwe_wide[[p_col]])) else NA_real_
+    value <- suppressWarnings(as.numeric(hwe_wide[[value_col]]))
+    test_ok <- status == "ok" & is.finite(p_value) & !is.na(p_value) & is.finite(value) & !is.na(value)
+    
+    out <- rep("--", nrow(hwe_wide))
+    out[test_ok] <- formatter(value[test_ok])
+    out
+  }
+  
+  display_wide <- data.frame(Locus = loci_order, stringsAsFactors = FALSE)
+  
+  for (scope in scope_levels) {
+    display_wide[[paste(scope, "chi2", sep = "_")]] <- format_scope_value(scope, "chi_square", format_hwe_chi_value)
+    display_wide[[paste(scope, "df", sep = "_")]] <- format_scope_value(scope, "df", format_hwe_df_value)
+    display_wide[[paste(scope, "P_exact", sep = "_")]] <- format_scope_value(scope, "exact_p_value", format_hwe_p_value)
+  }
+  
+  significant_matrix <- matrix(FALSE, nrow = nrow(display_wide), ncol = ncol(display_wide), dimnames = list(NULL, names(display_wide)))
+  for (scope in scope_levels) {
+    sig_source_col <- paste(scope, "significant_bonferroni", sep = "_")
+    p_display_col <- paste(scope, "P_exact", sep = "_")
+    status_col <- paste(scope, "status", sep = "_")
+    if (sig_source_col %in% names(hwe_wide) && p_display_col %in% colnames(significant_matrix)) {
+      status <- if (status_col %in% names(hwe_wide)) as.character(hwe_wide[[status_col]]) else NA_character_
+      significant_matrix[, p_display_col] <- status == "ok" & !is.na(hwe_wide[[sig_source_col]]) & as.logical(hwe_wide[[sig_source_col]])
+    }
+  }
   
   display_long <- hwe_long %>%
     mutate(
       Appendix_scope = ifelse(Scope == "Overall", "All", Site),
-      Display = format_hwe_stat_cell(chi_square, df, exact_p_value),
-      significant_bonferroni = !is.na(significant_bonferroni) & significant_bonferroni
+      test_ok = status == "ok" & is.finite(exact_p_value) & !is.na(exact_p_value),
+      chi2 = ifelse(test_ok, format_hwe_chi_value(chi_square), "--"),
+      df_display = ifelse(test_ok, format_hwe_df_value(df), "--"),
+      P_exact = ifelse(test_ok, format_hwe_p_value(exact_p_value), "--"),
+      P_exact_significant_bonferroni = test_ok & !is.na(significant_bonferroni) & significant_bonferroni,
+      chi_square_source = ifelse(test_ok, chi_square, NA_real_),
+      df_source = ifelse(test_ok, df, NA_integer_),
+      exact_p_value_source = ifelse(test_ok, exact_p_value, NA_real_)
     ) %>%
     filter(Appendix_scope %in% scope_levels) %>%
-    select(Locus, Appendix_scope, Display, significant_bonferroni)
+    select(
+      Locus,
+      Appendix_scope,
+      chi2,
+      df = df_display,
+      P_exact,
+      P_exact_significant_bonferroni,
+      chi_square_source,
+      df_source,
+      exact_p_value_source,
+      bonferroni_p_value,
+      status,
+      note
+    ) %>%
+    arrange(match(Locus, loci_order), match(Appendix_scope, scope_levels))
   
-  display_table <- display_long %>%
-    select(Locus, Appendix_scope, Display) %>%
-    pivot_wider(names_from = Appendix_scope, values_from = Display) %>%
-    select(any_of(c("Locus", scope_levels))) %>%
-    arrange(Locus)
-  
-  significant_wide <- display_long %>%
-    select(Locus, Appendix_scope, significant_bonferroni) %>%
-    pivot_wider(names_from = Appendix_scope, values_from = significant_bonferroni, values_fill = FALSE) %>%
-    right_join(display_table %>% select(Locus), by = "Locus") %>%
-    select(any_of(c("Locus", scope_levels))) %>%
-    arrange(match(Locus, display_table$Locus))
-  
-  significant_matrix <- as.matrix(significant_wide[, names(display_table), drop = FALSE])
-  significant_matrix[is.na(significant_matrix)] <- FALSE
-  significant_matrix[, "Locus"] <- FALSE
-  mode(significant_matrix) <- "logical"
-  
-  list(table = display_table, significant = significant_matrix)
+  list(long = display_long, wide = display_wide, significant = significant_matrix, scopes = scope_levels)
 }
 
 # ----------------------------
@@ -730,6 +780,121 @@ write_basic_docx <- function(df,
   invisible(path)
 }
 
+word_c1_cell_xml <- function(value,
+                             bold = FALSE,
+                             color = NULL,
+                             width = 310L,
+                             font_size = 14L,
+                             grid_span = NULL,
+                             v_merge = NULL,
+                             align = "center") {
+  run_props <- paste0(
+    if (bold) "<w:b/>" else "",
+    if (!is.null(color) && nzchar(color)) paste0("<w:color w:val=\"", color, "\"/>") else "",
+    paste0("<w:sz w:val=\"", as.integer(font_size), "\"/>")
+  )
+  run_props <- paste0("<w:rPr>", run_props, "</w:rPr>")
+  grid_xml <- if (!is.null(grid_span)) paste0("<w:gridSpan w:val=\"", as.integer(grid_span), "\"/>") else ""
+  merge_xml <- if (!is.null(v_merge)) paste0("<w:vMerge w:val=\"", v_merge, "\"/>") else ""
+  
+  paste0(
+    "<w:tc><w:tcPr><w:tcW w:w=\"", as.integer(width), "\" w:type=\"dxa\"/>",
+    grid_xml, merge_xml,
+    "<w:tcMar><w:top w:w=\"20\" w:type=\"dxa\"/><w:left w:w=\"25\" w:type=\"dxa\"/><w:bottom w:w=\"20\" w:type=\"dxa\"/><w:right w:w=\"25\" w:type=\"dxa\"/></w:tcMar>",
+    "</w:tcPr><w:p><w:pPr><w:jc w:val=\"", align, "\"/><w:spacing w:before=\"0\" w:after=\"0\"/></w:pPr><w:r>",
+    run_props, "<w:t>", xml_escape(value), "</w:t></w:r></w:p></w:tc>"
+  )
+}
+
+write_hwe_c1_docx <- function(display_wide,
+                              significant_matrix,
+                              site_levels,
+                              path,
+                              caption) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  scope_levels <- c("All", site_levels)
+  display_wide <- as.data.frame(display_wide, stringsAsFactors = FALSE, check.names = FALSE)
+  display_wide[] <- lapply(display_wide, as.character)
+  significant_matrix <- as.matrix(significant_matrix[, names(display_wide), drop = FALSE])
+  significant_matrix[is.na(significant_matrix)] <- FALSE
+  
+  group_cells <- c(
+    word_c1_cell_xml("Locus", bold = TRUE, width = 850L, font_size = 14L, v_merge = "restart"),
+    vapply(scope_levels, function(scope) {
+      word_c1_cell_xml(scope, bold = TRUE, width = 920L, font_size = 14L, grid_span = 3L)
+    }, character(1))
+  )
+  header_group <- paste0("<w:tr>", paste(group_cells, collapse = ""), "</w:tr>")
+  
+  subheader_cells <- c(
+    word_c1_cell_xml("", width = 850L, font_size = 14L, v_merge = "continue"),
+    unlist(lapply(scope_levels, function(scope) {
+      c(
+        word_c1_cell_xml("chi²", bold = TRUE, width = 310L, font_size = 14L),
+        word_c1_cell_xml("df", bold = TRUE, width = 180L, font_size = 14L),
+        word_c1_cell_xml("P exact", bold = TRUE, width = 430L, font_size = 14L)
+      )
+    }), use.names = FALSE)
+  )
+  header_sub <- paste0("<w:tr>", paste(subheader_cells, collapse = ""), "</w:tr>")
+  
+  rows <- vapply(seq_len(nrow(display_wide)), function(i) {
+    row_cells <- word_c1_cell_xml(display_wide$Locus[i], width = 850L, font_size = 14L, align = "left")
+    for (scope in scope_levels) {
+      chi_col <- paste(scope, "chi2", sep = "_")
+      df_col <- paste(scope, "df", sep = "_")
+      p_col <- paste(scope, "P_exact", sep = "_")
+      row_cells <- paste0(
+        row_cells,
+        word_c1_cell_xml(display_wide[[chi_col]][i], width = 310L, font_size = 14L),
+        word_c1_cell_xml(display_wide[[df_col]][i], width = 180L, font_size = 14L),
+        word_c1_cell_xml(
+          display_wide[[p_col]][i],
+          color = if (isTRUE(significant_matrix[i, p_col])) "C00000" else NULL,
+          width = 430L,
+          font_size = 14L
+        )
+      )
+    }
+    paste0("<w:tr>", row_cells, "</w:tr>")
+  }, character(1))
+  
+  tmp_dir <- tempfile("hwe_c1_docx_")
+  dir.create(file.path(tmp_dir, "_rels"), recursive = TRUE, showWarnings = FALSE)
+  dir.create(file.path(tmp_dir, "word", "_rels"), recursive = TRUE, showWarnings = FALSE)
+  
+  document_xml <- paste0(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>',
+    word_paragraph_xml(caption, bold = FALSE, font_size = 16L),
+    '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/><w:tblLayout w:type="fixed"/><w:tblBorders>',
+    '<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
+    '<w:left w:val="nil"/><w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="nil"/>',
+    '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="nil"/>',
+    '</w:tblBorders><w:tblCellMar><w:top w:w="20" w:type="dxa"/><w:left w:w="25" w:type="dxa"/><w:bottom w:w="20" w:type="dxa"/><w:right w:w="25" w:type="dxa"/></w:tblCellMar></w:tblPr>',
+    header_group, header_sub, paste(rows, collapse = ""), '</w:tbl>',
+    '<w:p><w:pPr><w:spacing w:before="80" w:after="0"/></w:pPr><w:r><w:rPr><w:sz w:val="14"/></w:rPr><w:t>',
+    xml_escape(paste0("Note. Exact/Monte Carlo P values are from pegas::hw.test with B = ", HWE_MONTE_CARLO_REPS, "; these P exact values are used for inference. Red P exact values are significant after Bonferroni correction across all valid tests.")),
+    '</w:t></w:r></w:p>',
+    '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:pgMar w:top="360" w:right="360" w:bottom="360" w:left="360" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
+    '</w:body></w:document>'
+  )
+  
+  writeLines(c('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">', '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>', '<Default Extension="xml" ContentType="application/xml"/>', '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>', '</Types>'), file.path(tmp_dir, "[Content_Types].xml"), useBytes = TRUE)
+  writeLines(c('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">', '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>', '</Relationships>'), file.path(tmp_dir, "_rels", ".rels"), useBytes = TRUE)
+  writeLines(c('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'), file.path(tmp_dir, "word", "_rels", "document.xml.rels"), useBytes = TRUE)
+  writeLines(document_xml, file.path(tmp_dir, "word", "document.xml"), useBytes = TRUE)
+  
+  old_wd <- getwd()
+  on.exit(setwd(old_wd), add = TRUE)
+  setwd(tmp_dir)
+  if (file.exists(path)) unlink(path)
+  utils::zip(zipfile = path, files = list.files(tmp_dir, recursive = TRUE, all.files = TRUE, no.. = TRUE), flags = "-q")
+  if (!file.exists(path)) stop("Failed to create DOCX: ", path, call. = FALSE)
+  message_appendix("Saved Word DOCX: ", path)
+  invisible(path)
+}
+
 # ----------------------------
 # Main workflow
 # ----------------------------
@@ -776,46 +941,40 @@ hwe_long <- dplyr::bind_rows(hwe_overall, hwe_by_site) %>%
   arrange(factor(Scope, levels = c("Overall", "Site")), factor(Site, levels = c("All", site_levels)), Locus)
 
 hwe_wide <- format_hwe_wide(hwe_long, site_levels)
-hwe_display <- build_hwe_display_table(hwe_long, site_levels)
-hwe_display_table <- hwe_display$table
-hwe_display_significant <- hwe_display$significant
+hwe_c1 <- build_hwe_c1_table(hwe_wide, hwe_long, site_levels)
+hwe_c1_long <- hwe_c1$long
+hwe_c1_wide <- hwe_c1$wide
+hwe_c1_significant <- hwe_c1$significant
 
 hwe_note <- paste(
   "HWE exact p-values are from pegas::hw.test with", HWE_MONTE_CARLO_REPS,
   "Monte Carlo replicates. Chi-square values are approximate Pearson statistics computed from observed and expected genotype counts under HWE; exact/permutation p-values, not chi-square p-values, should be used for inference. Bonferroni significance is evaluated across all valid overall and site-by-locus tests at alpha =", ALPHA, "."
 )
 
-hwe_display_note <- paste(
-  "Compact thesis-display HWE table: each dataset/site cell reports X2, df, and the exact/Monte Carlo p-value from pegas::hw.test.",
-  "Exact/permutation p-values, not chi-square p-values, are used for inference.",
-  "Bold red cells are significant after Bonferroni correction across all valid overall and site-by-locus tests at alpha =",
-  ALPHA,
-  "."
-)
+hwe_c1_caption <- "Table C.1. Chi² test values for Hardy-Weinberg equilibrium for the whole dataset and by site. Values in red are significant after Bonferroni correction."
 
 hwe_csv <- file.path(APPENDIX_DIR, "appendix_hwe_wide.csv")
 hwe_xlsx <- file.path(APPENDIX_DIR, "appendix_hwe_wide.xlsx")
 hwe_docx <- file.path(APPENDIX_DIR, "appendix_hwe_wide.docx")
 hwe_long_csv <- file.path(APPENDIX_DIR, "appendix_hwe_long_source.csv")
-hwe_display_csv <- file.path(APPENDIX_DIR, "appendix_hwe_table_C1_display.csv")
-hwe_display_docx <- file.path(APPENDIX_DIR, "appendix_hwe_table_C1_display.docx")
+hwe_c1_long_csv <- file.path(HWE_APPENDIX_DIR, "Table_C1_HWE_long_check.csv")
+hwe_c1_wide_csv <- file.path(HWE_APPENDIX_DIR, "Table_C1_HWE_wide_check.csv")
+hwe_c1_display_csv <- file.path(APPENDIX_DIR, "appendix_hwe_table_C1_display.csv")
+hwe_c1_docx <- file.path(APPENDIX_DIR, "appendix_hwe_table_C1_display.docx")
 
 write_csv_out(hwe_wide, hwe_csv)
 write_csv_out(hwe_long, hwe_long_csv)
-write_csv_out(hwe_display_table, hwe_display_csv)
-write_xlsx_out(list(HWE_appendix_wide = hwe_wide, HWE_long_source = hwe_long), hwe_xlsx)
+write_csv_out(hwe_c1_long, hwe_c1_long_csv)
+write_csv_out(hwe_c1_wide, hwe_c1_wide_csv)
+write_csv_out(hwe_c1_wide, hwe_c1_display_csv)
+write_xlsx_out(list(HWE_appendix_wide = hwe_wide, HWE_long_source = hwe_long, HWE_C1_wide_check = hwe_c1_wide, HWE_C1_long_check = hwe_c1_long), hwe_xlsx)
 write_basic_docx(hwe_wide, hwe_docx, "Appendix C. Hardy-Weinberg equilibrium tests by locus and sampling site", hwe_note)
-write_basic_docx(
-  hwe_display_table,
-  hwe_display_docx,
-  "Table C.1. Hardy-Weinberg equilibrium tests by locus and sampling site",
-  hwe_display_note,
-  bold_matrix = hwe_display_significant,
-  red_matrix = hwe_display_significant,
-  cell_width = 900L,
-  font_size = 14L,
-  header_font_size = 14L,
-  margins = 360L
+write_hwe_c1_docx(
+  display_wide = hwe_c1_wide,
+  significant_matrix = hwe_c1_significant,
+  site_levels = site_levels,
+  path = hwe_c1_docx,
+  caption = hwe_c1_caption
 )
 
 # Allele-frequency table: clone-corrected site frequencies plus All_W and All_NW.
@@ -849,7 +1008,8 @@ provenance <- data.frame(
     "bonferroni_scope",
     "allele_frequency_weighted_overall",
     "allele_frequency_nonweighted_overall",
-    "output_directory"
+    "output_directory",
+    "hwe_table_c1_output_directory"
   ),
   value = c(
     "gi_mll",
@@ -862,7 +1022,8 @@ provenance <- data.frame(
     "Across all valid overall and site-by-locus HWE tests in this appendix table.",
     "All_W = allele copies for an allele across all individuals divided by total allele copies at that locus.",
     "All_NW = arithmetic mean of site-level allele frequencies across sites.",
-    APPENDIX_DIR
+    APPENDIX_DIR,
+    HWE_APPENDIX_DIR
   ),
   stringsAsFactors = FALSE
 )
@@ -872,5 +1033,5 @@ write_csv_out(provenance, provenance_csv)
 
 message_appendix("Completed appendix table generation.")
 message_appendix("HWE detailed outputs: ", hwe_csv, "; ", hwe_xlsx, "; ", hwe_docx)
-message_appendix("HWE compact display outputs: ", hwe_display_csv, "; ", hwe_display_docx)
+message_appendix("HWE Table C.1 display outputs: ", hwe_c1_long_csv, "; ", hwe_c1_wide_csv, "; ", hwe_c1_display_csv, "; ", hwe_c1_docx)
 message_appendix("Allele-frequency outputs: ", allele_csv, "; ", allele_xlsx, "; ", allele_docx)

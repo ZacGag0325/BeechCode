@@ -2,8 +2,10 @@
 ############################################################
 # Appendix-ready HWE and allele-frequency tables
 #
-# Creates two Daphnee-Bernier-style appendix tables:
+# Creates Daphnee-Bernier-style appendix tables:
 #   1) Hardy-Weinberg equilibrium by locus, overall and by site
+#      - full detailed verification table
+#      - compact thesis-display Word table like Appendix Table C.1
 #   2) Allele frequencies by locus/allele, by site plus weighted and
 #      non-weighted overall frequencies
 #
@@ -459,7 +461,7 @@ format_hwe_wide <- function(hwe_long, site_levels) {
     pivot_wider(
       names_from = Appendix_scope,
       values_from = c(N, chi_square, df, exact_p_value, bonferroni_p_value, significant_bonferroni, status),
-      names_glue = "{Appendix_scope}_{.value}"
+      names_glue = "{Appendix_scope}_{.metric}"
     )
   
   scope_levels <- c("All", site_levels)
@@ -470,6 +472,55 @@ format_hwe_wide <- function(hwe_long, site_levels) {
   wide %>%
     select(all_of(wanted)) %>%
     arrange(Locus)
+}
+
+
+format_hwe_p_value <- function(p) {
+  ifelse(
+    is.na(p) | !is.finite(p),
+    "--",
+    ifelse(p < 0.001, "<0.001", format(round(p, 3), nsmall = 3, trim = TRUE, scientific = FALSE))
+  )
+}
+
+format_hwe_stat_cell <- function(chi_square, df, exact_p_value) {
+  chi_txt <- ifelse(is.na(chi_square) | !is.finite(chi_square), "--", format(round(chi_square, 2), nsmall = 2, trim = TRUE, scientific = FALSE))
+  df_txt <- ifelse(is.na(df), "--", as.character(df))
+  p_txt <- format_hwe_p_value(exact_p_value)
+  paste0("X2=", chi_txt, "; df=", df_txt, "; p=", p_txt)
+}
+
+build_hwe_display_table <- function(hwe_long, site_levels) {
+  scope_levels <- c("All", site_levels)
+  
+  display_long <- hwe_long %>%
+    mutate(
+      Appendix_scope = ifelse(Scope == "Overall", "All", Site),
+      Display = format_hwe_stat_cell(chi_square, df, exact_p_value),
+      significant_bonferroni = !is.na(significant_bonferroni) & significant_bonferroni
+    ) %>%
+    filter(Appendix_scope %in% scope_levels) %>%
+    select(Locus, Appendix_scope, Display, significant_bonferroni)
+  
+  display_table <- display_long %>%
+    select(Locus, Appendix_scope, Display) %>%
+    pivot_wider(names_from = Appendix_scope, values_from = Display) %>%
+    select(any_of(c("Locus", scope_levels))) %>%
+    arrange(Locus)
+  
+  significant_wide <- display_long %>%
+    select(Locus, Appendix_scope, significant_bonferroni) %>%
+    pivot_wider(names_from = Appendix_scope, values_from = significant_bonferroni, values_fill = FALSE) %>%
+    right_join(display_table %>% select(Locus), by = "Locus") %>%
+    select(any_of(c("Locus", scope_levels))) %>%
+    arrange(match(Locus, display_table$Locus))
+  
+  significant_matrix <- as.matrix(significant_wide[, names(display_table), drop = FALSE])
+  significant_matrix[is.na(significant_matrix)] <- FALSE
+  significant_matrix[, "Locus"] <- FALSE
+  mode(significant_matrix) <- "logical"
+  
+  list(table = display_table, significant = significant_matrix)
 }
 
 # ----------------------------
@@ -558,17 +609,30 @@ xml_escape <- function(x) {
   x
 }
 
-word_cell_xml <- function(value, bold = FALSE) {
-  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
+word_cell_xml <- function(value, bold = FALSE, color = NULL, width = 1800L, font_size = 18L, shade = NULL) {
+  run_props <- paste0(
+    if (bold) "<w:b/>" else "",
+    if (!is.null(color) && nzchar(color)) paste0("<w:color w:val=\"", color, "\"/>") else "",
+    if (!is.null(font_size)) paste0("<w:sz w:val=\"", as.integer(font_size), "\"/>") else ""
+  )
+  run_props <- if (nzchar(run_props)) paste0("<w:rPr>", run_props, "</w:rPr>") else ""
+  shade_xml <- if (!is.null(shade) && nzchar(shade)) paste0("<w:shd w:fill=\"", shade, "\"/>") else ""
+  
   paste0(
-    "<w:tc><w:tcPr><w:tcW w:w=\"1800\" w:type=\"dxa\"/></w:tcPr><w:p><w:r>",
-    bold_xml, "<w:t>", xml_escape(value), "</w:t></w:r></w:p></w:tc>"
+    "<w:tc><w:tcPr><w:tcW w:w=\"", as.integer(width), "\" w:type=\"dxa\"/>", shade_xml,
+    "<w:tcMar><w:top w:w=\"40\" w:type=\"dxa\"/><w:left w:w=\"40\" w:type=\"dxa\"/><w:bottom w:w=\"40\" w:type=\"dxa\"/><w:right w:w=\"40\" w:type=\"dxa\"/></w:tcMar>",
+    "</w:tcPr><w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/></w:pPr><w:r>",
+    run_props, "<w:t>", xml_escape(value), "</w:t></w:r></w:p></w:tc>"
   )
 }
 
-word_paragraph_xml <- function(value, bold = FALSE) {
-  bold_xml <- if (bold) "<w:rPr><w:b/></w:rPr>" else ""
-  paste0("<w:p><w:r>", bold_xml, "<w:t>", xml_escape(value), "</w:t></w:r></w:p>")
+word_paragraph_xml <- function(value, bold = FALSE, font_size = 20L) {
+  run_props <- paste0(
+    if (bold) "<w:b/>" else "",
+    if (!is.null(font_size)) paste0("<w:sz w:val=\"", as.integer(font_size), "\"/>") else ""
+  )
+  run_props <- if (nzchar(run_props)) paste0("<w:rPr>", run_props, "</w:rPr>") else ""
+  paste0("<w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"80\"/></w:pPr><w:r>", run_props, "<w:t>", xml_escape(value), "</w:t></w:r></w:p>")
 }
 
 format_docx_df <- function(df) {
@@ -582,15 +646,43 @@ format_docx_df <- function(df) {
   out
 }
 
-write_basic_docx <- function(df, path, title, note) {
+write_basic_docx <- function(df,
+                             path,
+                             title,
+                             note,
+                             bold_matrix = NULL,
+                             red_matrix = NULL,
+                             cell_width = 1800L,
+                             font_size = 18L,
+                             header_font_size = 18L,
+                             margins = 720L) {
   dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
   df <- format_docx_df(df)
   df[] <- lapply(df, as.character)
   
-  header <- paste0("<w:tr>", paste(vapply(names(df), word_cell_xml, character(1), bold = TRUE), collapse = ""), "</w:tr>")
-  rows <- apply(df, 1, function(row) {
-    paste0("<w:tr>", paste(vapply(row, word_cell_xml, character(1)), collapse = ""), "</w:tr>")
-  })
+  if (is.null(bold_matrix)) bold_matrix <- matrix(FALSE, nrow = nrow(df), ncol = ncol(df), dimnames = list(NULL, names(df)))
+  if (is.null(red_matrix)) red_matrix <- matrix(FALSE, nrow = nrow(df), ncol = ncol(df), dimnames = list(NULL, names(df)))
+  bold_matrix <- as.matrix(bold_matrix[, names(df), drop = FALSE])
+  red_matrix <- as.matrix(red_matrix[, names(df), drop = FALSE])
+  
+  header <- paste0(
+    "<w:tr>",
+    paste(vapply(names(df), word_cell_xml, character(1), bold = TRUE, width = cell_width, font_size = header_font_size, shade = "D9EAF7"), collapse = ""),
+    "</w:tr>"
+  )
+  
+  rows <- vapply(seq_len(nrow(df)), function(i) {
+    cells <- vapply(seq_along(df), function(j) {
+      word_cell_xml(
+        df[[j]][i],
+        bold = isTRUE(bold_matrix[i, j]),
+        color = if (isTRUE(red_matrix[i, j])) "C00000" else NULL,
+        width = cell_width,
+        font_size = font_size
+      )
+    }, character(1))
+    paste0("<w:tr>", paste(cells, collapse = ""), "</w:tr>")
+  }, character(1))
   
   tmp_dir <- tempfile("appendix_docx_")
   dir.create(file.path(tmp_dir, "_rels"), recursive = TRUE, showWarnings = FALSE)
@@ -599,14 +691,15 @@ write_basic_docx <- function(df, path, title, note) {
   document_xml <- paste0(
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>',
-    word_paragraph_xml(title, bold = TRUE),
-    word_paragraph_xml(note),
-    '<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/><w:tblBorders>',
+    word_paragraph_xml(title, bold = TRUE, font_size = 22L),
+    word_paragraph_xml(note, font_size = 18L),
+    '<w:tbl><w:tblPr><w:tblStyle w:val="TableGrid"/><w:tblW w:w="0" w:type="auto"/><w:tblLayout w:type="fixed"/><w:tblBorders>',
     '<w:top w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:left w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
     '<w:bottom w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:right w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
     '<w:insideH w:val="single" w:sz="4" w:space="0" w:color="auto"/><w:insideV w:val="single" w:sz="4" w:space="0" w:color="auto"/>',
-    '</w:tblBorders></w:tblPr>', header, paste(rows, collapse = ""), '</w:tbl>',
-    '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:pgMar w:top="720" w:right="720" w:bottom="720" w:left="720" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
+    '</w:tblBorders><w:tblCellMar><w:top w:w="40" w:type="dxa"/><w:left w:w="40" w:type="dxa"/><w:bottom w:w="40" w:type="dxa"/><w:right w:w="40" w:type="dxa"/></w:tblCellMar></w:tblPr>',
+    header, paste(rows, collapse = ""), '</w:tbl>',
+    '<w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:pgMar w:top="', margins, '" w:right="', margins, '" w:bottom="', margins, '" w:left="', margins, '" w:header="360" w:footer="360" w:gutter="0"/></w:sectPr>',
     '</w:body></w:document>'
   )
   
@@ -671,21 +764,47 @@ hwe_long <- dplyr::bind_rows(hwe_overall, hwe_by_site) %>%
   arrange(factor(Scope, levels = c("Overall", "Site")), factor(Site, levels = c("All", site_levels)), Locus)
 
 hwe_wide <- format_hwe_wide(hwe_long, site_levels)
+hwe_display <- build_hwe_display_table(hwe_long, site_levels)
+hwe_display_table <- hwe_display$table
+hwe_display_significant <- hwe_display$significant
 
 hwe_note <- paste(
   "HWE exact p-values are from pegas::hw.test with", HWE_MONTE_CARLO_REPS,
   "Monte Carlo replicates. Chi-square values are approximate Pearson statistics computed from observed and expected genotype counts under HWE; exact/permutation p-values, not chi-square p-values, should be used for inference. Bonferroni significance is evaluated across all valid overall and site-by-locus tests at alpha =", ALPHA, "."
 )
 
+hwe_display_note <- paste(
+  "Compact thesis-display HWE table: each dataset/site cell reports X2, df, and the exact/Monte Carlo p-value from pegas::hw.test.",
+  "Exact/permutation p-values, not chi-square p-values, are used for inference.",
+  "Bold red cells are significant after Bonferroni correction across all valid overall and site-by-locus tests at alpha =",
+  ALPHA,
+  "."
+)
+
 hwe_csv <- file.path(APPENDIX_DIR, "appendix_hwe_wide.csv")
 hwe_xlsx <- file.path(APPENDIX_DIR, "appendix_hwe_wide.xlsx")
 hwe_docx <- file.path(APPENDIX_DIR, "appendix_hwe_wide.docx")
 hwe_long_csv <- file.path(APPENDIX_DIR, "appendix_hwe_long_source.csv")
+hwe_display_csv <- file.path(APPENDIX_DIR, "appendix_hwe_table_C1_display.csv")
+hwe_display_docx <- file.path(APPENDIX_DIR, "appendix_hwe_table_C1_display.docx")
 
 write_csv_out(hwe_wide, hwe_csv)
 write_csv_out(hwe_long, hwe_long_csv)
+write_csv_out(hwe_display_table, hwe_display_csv)
 write_xlsx_out(list(HWE_appendix_wide = hwe_wide, HWE_long_source = hwe_long), hwe_xlsx)
 write_basic_docx(hwe_wide, hwe_docx, "Appendix C. Hardy-Weinberg equilibrium tests by locus and sampling site", hwe_note)
+write_basic_docx(
+  hwe_display_table,
+  hwe_display_docx,
+  "Table C.1. Hardy-Weinberg equilibrium tests by locus and sampling site",
+  hwe_display_note,
+  bold_matrix = hwe_display_significant,
+  red_matrix = hwe_display_significant,
+  cell_width = 900L,
+  font_size = 14L,
+  header_font_size = 14L,
+  margins = 360L
+)
 
 # Allele-frequency table: clone-corrected site frequencies plus All_W and All_NW.
 allele_freq_table <- build_allele_frequency_table(gdf = gdf, loci = loci, site_vec = site_labels, site_levels = site_levels)
@@ -740,5 +859,6 @@ provenance_csv <- file.path(APPENDIX_DIR, "appendix_tables_provenance.csv")
 write_csv_out(provenance, provenance_csv)
 
 message_appendix("Completed appendix table generation.")
-message_appendix("HWE outputs: ", hwe_csv, "; ", hwe_xlsx, "; ", hwe_docx)
+message_appendix("HWE detailed outputs: ", hwe_csv, "; ", hwe_xlsx, "; ", hwe_docx)
+message_appendix("HWE compact display outputs: ", hwe_display_csv, "; ", hwe_display_docx)
 message_appendix("Allele-frequency outputs: ", allele_csv, "; ", allele_xlsx, "; ", allele_docx)

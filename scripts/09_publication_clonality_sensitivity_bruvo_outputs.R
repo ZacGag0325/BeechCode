@@ -44,6 +44,31 @@ BRUVO_FIG_PNG <- file.path(FIGURES_SUPP_DIR, "bruvo_distance_histogram_publicati
 BRUVO_FIG_PDF <- file.path(FIGURES_SUPP_DIR, "bruvo_distance_histogram_publication.pdf")
 BRUVO_SUMMARY_CSV <- file.path(TABLES_SUPP_DIR, "bruvo_distance_threshold_summary.csv")
 
+DIAMETER_FIG_PNG <- file.path(FIGURES_DIR, "sampled_stem_diameter_distribution_publication.png")
+DIAMETER_FIG_PDF <- file.path(FIGURES_DIR, "sampled_stem_diameter_distribution_publication.pdf")
+DIAMETER_TABLE_CSV <- file.path(TABLES_DIR, "sampled_stem_diameter_distribution_table.csv")
+DIAMETER_TABLE_DOCX <- file.path(TABLES_DIR, "sampled_stem_diameter_distribution_table.docx")
+
+NEAREST_NEIGHBOR_FIG_PNG <- file.path(FIGURES_DIR, "nearest_neighbor_distance_distribution_publication.png")
+NEAREST_NEIGHBOR_FIG_PDF <- file.path(FIGURES_DIR, "nearest_neighbor_distance_distribution_publication.pdf")
+NEAREST_NEIGHBOR_TABLE_CSV <- file.path(TABLES_DIR, "nearest_neighbor_distance_distribution_table.csv")
+NEAREST_NEIGHBOR_TABLE_DOCX <- file.path(TABLES_DIR, "nearest_neighbor_distance_distribution_table.docx")
+NEAREST_NEIGHBOR_SUMMARY_CSV <- file.path(TABLES_DIR, "nearest_neighbor_distance_summary.csv")
+
+SAMPLED_STEM_DIAMETER_VALUES_CSV <- file.path(TABLES_DIR, "sampled_stem_diameter_values.csv")
+SAMPLED_STEM_NEAREST_NEIGHBOR_PAIRS_CSV <- file.path(TABLES_DIR, "sampled_stem_nearest_neighbor_pairs.csv")
+SAMPLED_STEM_DESCRIPTIVE_SCRIPT <- file.path(PROJECT_ROOT, "scripts", "sampled_stem_descriptive_results.R")
+
+DIAMETER_CLASS_LEVELS <- c("1-2 cm", "2-5 cm", "5-10 cm", ">10 cm")
+DIAMETER_CLASS_LABELS <- c("1–2", "2–5", "5–10", ">10")
+EXPECTED_DIAMETER_COUNTS <- c(101L, 115L, 49L, 11L)
+EXPECTED_DIAMETER_PERCENT <- c(36.6, 41.7, 17.8, 4.0)
+
+NEAREST_NEIGHBOR_CLASS_LEVELS <- c("<1 m", "1-2 m", "2-5 m", ">5 m")
+NEAREST_NEIGHBOR_CLASS_LABELS <- c("<1", "1–2", "2–5", ">5")
+EXPECTED_NEAREST_NEIGHBOR_COUNTS <- c(59L, 66L, 88L, 65L)
+EXPECTED_NEAREST_NEIGHBOR_PERCENT <- c(21.2, 23.7, 31.7, 23.4)
+
 # -----------------------------------------------------------------------------
 # General helpers
 # -----------------------------------------------------------------------------
@@ -80,6 +105,12 @@ safe_mean <- function(x) {
   x <- suppressWarnings(as.numeric(x))
   if (length(x) == 0 || all(is.na(x))) return(NA_real_)
   mean(x, na.rm = TRUE)
+}
+
+safe_median <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) == 0 || all(is.na(x))) return(NA_real_)
+  stats::median(x, na.rm = TRUE)
 }
 
 round3 <- function(x) round(as.numeric(x), 3)
@@ -239,6 +270,311 @@ write_word_table <- function(df, path, title, note = NULL, left_align_cols = cha
   if (!file.exists(path)) stop(SCRIPT_TAG, " Word export was not created: ", path, call. = FALSE)
   message(SCRIPT_TAG, " Saved: ", path, " (", status, ")")
   invisible(path)
+}
+
+# -----------------------------------------------------------------------------
+# Publication-style helpers for field/sampling figures
+# -----------------------------------------------------------------------------
+publication_bar_theme <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      axis.title = element_text(size = 13),
+      axis.text = element_text(size = 11, color = "black"),
+      axis.line = element_line(linewidth = 0.35, color = "black"),
+      axis.ticks = element_line(linewidth = 0.35, color = "black"),
+      panel.border = element_blank(),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+coerce_numeric_publication <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "N/A", "NaN", "NULL", "null", "na")] <- NA_character_
+  x <- gsub(",", ".", x, fixed = TRUE)
+  x <- gsub("[^0-9eE+.-]+", "", x)
+  suppressWarnings(as.numeric(x))
+}
+
+format_count_percent_label <- function(count, percent) {
+  paste0(as.integer(count), "\n", format1(percent), "%")
+}
+
+check_expected_distribution <- function(observed_counts,
+                                        observed_percent,
+                                        expected_counts,
+                                        expected_percent,
+                                        context) {
+  counts_match <- identical(as.integer(observed_counts), as.integer(expected_counts))
+  percent_match <- identical(round1(observed_percent), round1(expected_percent))
+  matched <- isTRUE(counts_match && percent_match)
+  if (!matched) {
+    warning(
+      SCRIPT_TAG, " ", context, " distribution differs from draft expectations. ",
+      "Computed counts: ", paste(as.integer(observed_counts), collapse = ", "),
+      "; computed percentages: ", paste(format1(observed_percent), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  matched
+}
+
+ensure_sampled_stem_descriptive_outputs <- function(required_paths) {
+  missing_paths <- required_paths[!file.exists(required_paths)]
+  if (length(missing_paths) == 0) return(invisible(TRUE))
+  
+  if (!file.exists(SAMPLED_STEM_DESCRIPTIVE_SCRIPT)) {
+    stop(
+      SCRIPT_TAG, " Required sampled-stem output file(s) are missing and the generator script was not found.",
+      "\nMissing: ", paste(missing_paths, collapse = ", "),
+      "\nExpected generator: ", SAMPLED_STEM_DESCRIPTIVE_SCRIPT,
+      call. = FALSE
+    )
+  }
+  
+  message(
+    SCRIPT_TAG,
+    " Required sampled-stem output file(s) missing; running existing project script to generate them: ",
+    SAMPLED_STEM_DESCRIPTIVE_SCRIPT
+  )
+  generator_env <- new.env(parent = globalenv())
+  sys.source(SAMPLED_STEM_DESCRIPTIVE_SCRIPT, envir = generator_env)
+  
+  still_missing <- required_paths[!file.exists(required_paths)]
+  if (length(still_missing) > 0) {
+    stop(
+      SCRIPT_TAG, " Existing sampled-stem descriptive script completed, but required file(s) are still missing:",
+      "\n", paste(still_missing, collapse = "\n"),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+read_required_csv <- function(path, context) {
+  if (!file.exists(path)) {
+    stop(SCRIPT_TAG, " Missing required ", context, " CSV: ", path, call. = FALSE)
+  }
+  read.csv(path, stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+build_diameter_distribution_outputs <- function() {
+  ensure_sampled_stem_descriptive_outputs(c(SAMPLED_STEM_DIAMETER_VALUES_CSV))
+  diameter_values <- read_required_csv(SAMPLED_STEM_DIAMETER_VALUES_CSV, "sampled-stem diameter values")
+  
+  diameter_col <- pick_column(
+    diameter_values,
+    c("Diameter_cm", "DBH_cm", "Dhp_tige", "DHP", "DBH", "diameter", "diameter_cm", "stem_diameter", "stem_diameter_cm"),
+    label = "diameter column",
+    required = TRUE
+  )
+  
+  diameter_numeric <- coerce_numeric_publication(diameter_values[[diameter_col]])
+  diameter_clean <- data.frame(Diameter_cm = diameter_numeric, stringsAsFactors = FALSE) %>%
+    filter(!is.na(Diameter_cm), Diameter_cm >= 1) %>%
+    mutate(
+      Diameter_class = cut(
+        Diameter_cm,
+        breaks = c(1, 2, 5, 10, Inf),
+        labels = DIAMETER_CLASS_LEVELS,
+        include.lowest = TRUE,
+        right = FALSE
+      )
+    ) %>%
+    filter(!is.na(Diameter_class))
+  
+  if (nrow(diameter_clean) == 0) {
+    stop(SCRIPT_TAG, " No usable sampled-stem diameter values were found in: ", SAMPLED_STEM_DIAMETER_VALUES_CSV, call. = FALSE)
+  }
+  
+  # Build the class table with an explicit character-key skeleton instead of
+  # tidyr::complete() on factors. This avoids ordered-vs-unordered factor join
+  # errors when the source table was created by a different R/tidyverse version.
+  diameter_counts <- diameter_clean %>%
+    mutate(Diameter_class = as.character(Diameter_class)) %>%
+    count(Diameter_class, name = "Count")
+  
+  diameter_table <- data.frame(
+    Diameter_class = DIAMETER_CLASS_LEVELS,
+    `Diameter class (cm)` = DIAMETER_CLASS_LABELS,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ) %>%
+    left_join(diameter_counts, by = "Diameter_class") %>%
+    mutate(
+      Count = ifelse(is.na(Count), 0L, as.integer(Count)),
+      Percent = 100 * Count / sum(Count),
+      Percent = round1(Percent)
+    ) %>%
+    select(`Diameter class (cm)`, Count, Percent)
+  
+  diameter_expected_match <- check_expected_distribution(
+    observed_counts = diameter_table$Count,
+    observed_percent = diameter_table$Percent,
+    expected_counts = EXPECTED_DIAMETER_COUNTS,
+    expected_percent = EXPECTED_DIAMETER_PERCENT,
+    context = "sampled-stem diameter"
+  )
+  
+  write.csv(diameter_table, DIAMETER_TABLE_CSV, row.names = FALSE, na = "")
+  message(SCRIPT_TAG, " Saved: ", DIAMETER_TABLE_CSV)
+  
+  diameter_word_table <- diameter_table %>% mutate(Percent = format1(Percent))
+  write_word_table(
+    diameter_word_table,
+    DIAMETER_TABLE_DOCX,
+    title = "Sampled stem diameter distribution table",
+    note = "Note. Diameter classes are in centimeters. Percentages are based on stems retained for genetic/clonality analyses with usable diameter values.",
+    left_align_cols = "Diameter class (cm)"
+  )
+  
+  diameter_plot_df <- diameter_table %>%
+    mutate(
+      `Diameter class (cm)` = factor(`Diameter class (cm)`, levels = DIAMETER_CLASS_LABELS, ordered = TRUE),
+      label = format_count_percent_label(Count, Percent)
+    )
+  
+  diameter_plot <- ggplot(diameter_plot_df, aes(x = `Diameter class (cm)`, y = Count)) +
+    geom_col(width = 0.72, fill = "grey35") +
+    geom_text(aes(label = label), vjust = -0.25, lineheight = 0.9, size = 3.5) +
+    scale_y_continuous(
+      limits = c(0, max(diameter_plot_df$Count, na.rm = TRUE) * 1.18),
+      expand = expansion(mult = c(0, 0.03))
+    ) +
+    labs(x = "Stem diameter class (cm)", y = "Number of sampled stems") +
+    publication_bar_theme()
+  
+  ggsave(DIAMETER_FIG_PNG, diameter_plot, width = 6.5, height = 4, dpi = 320, bg = "white")
+  ggsave(DIAMETER_FIG_PDF, diameter_plot, width = 6.5, height = 4, bg = "white")
+  message(SCRIPT_TAG, " Saved: ", DIAMETER_FIG_PNG)
+  message(SCRIPT_TAG, " Saved: ", DIAMETER_FIG_PDF)
+  
+  list(
+    values = diameter_clean,
+    table = diameter_table,
+    plot = diameter_plot,
+    expected_match = diameter_expected_match,
+    source = SAMPLED_STEM_DIAMETER_VALUES_CSV
+  )
+}
+
+build_nearest_neighbor_distribution_outputs <- function() {
+  ensure_sampled_stem_descriptive_outputs(c(SAMPLED_STEM_NEAREST_NEIGHBOR_PAIRS_CSV))
+  nearest_values <- read_required_csv(SAMPLED_STEM_NEAREST_NEIGHBOR_PAIRS_CSV, "sampled-stem nearest-neighbor pairs")
+  
+  distance_col <- pick_column(
+    nearest_values,
+    c("nearest_neighbor_distance_m", "nearest_neighbour_distance_m", "distance_m", "nearest_distance_m"),
+    label = "nearest-neighbor distance column",
+    required = TRUE
+  )
+  
+  nearest_clean <- nearest_values %>%
+    mutate(nearest_neighbor_distance_m = coerce_numeric_publication(.data[[distance_col]])) %>%
+    filter(!is.na(nearest_neighbor_distance_m), nearest_neighbor_distance_m >= 0) %>%
+    mutate(
+      Distance_class = cut(
+        nearest_neighbor_distance_m,
+        breaks = c(0, 1, 2, 5, Inf),
+        labels = NEAREST_NEIGHBOR_CLASS_LEVELS,
+        include.lowest = TRUE,
+        right = FALSE
+      )
+    ) %>%
+    filter(!is.na(Distance_class))
+  
+  if (nrow(nearest_clean) == 0) {
+    stop(SCRIPT_TAG, " No usable nearest-neighbor distances were found in: ", SAMPLED_STEM_NEAREST_NEIGHBOR_PAIRS_CSV, call. = FALSE)
+  }
+  
+  # Build the class table with an explicit character-key skeleton instead of
+  # tidyr::complete() on factors. This avoids ordered-vs-unordered factor join
+  # errors when the source table was created by a different R/tidyverse version.
+  nearest_counts <- nearest_clean %>%
+    mutate(Distance_class = as.character(Distance_class)) %>%
+    count(Distance_class, name = "Count")
+  
+  nearest_table <- data.frame(
+    Distance_class = NEAREST_NEIGHBOR_CLASS_LEVELS,
+    `Nearest-neighbor distance class (m)` = NEAREST_NEIGHBOR_CLASS_LABELS,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  ) %>%
+    left_join(nearest_counts, by = "Distance_class") %>%
+    mutate(
+      Count = ifelse(is.na(Count), 0L, as.integer(Count)),
+      Percent = 100 * Count / sum(Count),
+      Percent = round1(Percent)
+    ) %>%
+    select(`Nearest-neighbor distance class (m)`, Count, Percent)
+  
+  nearest_expected_match <- check_expected_distribution(
+    observed_counts = nearest_table$Count,
+    observed_percent = nearest_table$Percent,
+    expected_counts = EXPECTED_NEAREST_NEIGHBOR_COUNTS,
+    expected_percent = EXPECTED_NEAREST_NEIGHBOR_PERCENT,
+    context = "nearest-neighbor distance"
+  )
+  
+  nearest_summary <- data.frame(
+    total_georeferenced_stems = nrow(nearest_clean),
+    mean_nearest_neighbor_distance_m = safe_mean(nearest_clean$nearest_neighbor_distance_m),
+    median_nearest_neighbor_distance_m = safe_median(nearest_clean$nearest_neighbor_distance_m),
+    n_within_2m = sum(nearest_clean$nearest_neighbor_distance_m <= 2, na.rm = TRUE),
+    percent_within_2m = 100 * sum(nearest_clean$nearest_neighbor_distance_m <= 2, na.rm = TRUE) / nrow(nearest_clean),
+    expected_distribution_match = nearest_expected_match,
+    stringsAsFactors = FALSE
+  ) %>%
+    mutate(
+      mean_nearest_neighbor_distance_m = round3(mean_nearest_neighbor_distance_m),
+      median_nearest_neighbor_distance_m = round3(median_nearest_neighbor_distance_m),
+      percent_within_2m = round1(percent_within_2m)
+    )
+  
+  write.csv(nearest_table, NEAREST_NEIGHBOR_TABLE_CSV, row.names = FALSE, na = "")
+  write.csv(nearest_summary, NEAREST_NEIGHBOR_SUMMARY_CSV, row.names = FALSE, na = "")
+  message(SCRIPT_TAG, " Saved: ", NEAREST_NEIGHBOR_TABLE_CSV)
+  message(SCRIPT_TAG, " Saved: ", NEAREST_NEIGHBOR_SUMMARY_CSV)
+  
+  nearest_word_table <- nearest_table %>% mutate(Percent = format1(Percent))
+  write_word_table(
+    nearest_word_table,
+    NEAREST_NEIGHBOR_TABLE_DOCX,
+    title = "Nearest-neighbor distance distribution table",
+    note = "Note. Nearest-neighbor distances are in meters and were calculated among georeferenced sampled stems within sites using the existing project sampled-stem descriptive workflow.",
+    left_align_cols = "Nearest-neighbor distance class (m)"
+  )
+  
+  nearest_plot_df <- nearest_table %>%
+    mutate(
+      `Nearest-neighbor distance class (m)` = factor(`Nearest-neighbor distance class (m)`, levels = NEAREST_NEIGHBOR_CLASS_LABELS, ordered = TRUE),
+      label = format_count_percent_label(Count, Percent)
+    )
+  
+  nearest_plot <- ggplot(nearest_plot_df, aes(x = `Nearest-neighbor distance class (m)`, y = Count)) +
+    geom_col(width = 0.72, fill = "grey35") +
+    geom_text(aes(label = label), vjust = -0.25, lineheight = 0.9, size = 3.5) +
+    scale_y_continuous(
+      limits = c(0, max(nearest_plot_df$Count, na.rm = TRUE) * 1.18),
+      expand = expansion(mult = c(0, 0.03))
+    ) +
+    labs(x = "Nearest-neighbor distance class (m)", y = "Number of sampled stems") +
+    publication_bar_theme()
+  
+  ggsave(NEAREST_NEIGHBOR_FIG_PNG, nearest_plot, width = 6.5, height = 4, dpi = 320, bg = "white")
+  ggsave(NEAREST_NEIGHBOR_FIG_PDF, nearest_plot, width = 6.5, height = 4, bg = "white")
+  message(SCRIPT_TAG, " Saved: ", NEAREST_NEIGHBOR_FIG_PNG)
+  message(SCRIPT_TAG, " Saved: ", NEAREST_NEIGHBOR_FIG_PDF)
+  
+  list(
+    values = nearest_clean,
+    table = nearest_table,
+    summary = nearest_summary,
+    plot = nearest_plot,
+    expected_match = nearest_expected_match,
+    source = SAMPLED_STEM_NEAREST_NEIGHBOR_PAIRS_CSV
+  )
 }
 
 # -----------------------------------------------------------------------------
@@ -501,6 +837,15 @@ compute_diversity_overall <- function(gobj, dataset_label) {
 }
 
 # -----------------------------------------------------------------------------
+# Main-text field/sampling figures requested for the publication figure set
+# -----------------------------------------------------------------------------
+message(SCRIPT_TAG, " Building sampled stem diameter distribution figure...")
+diameter_outputs <- build_diameter_distribution_outputs()
+
+message(SCRIPT_TAG, " Building nearest-neighbor distance distribution figure...")
+nearest_neighbor_outputs <- build_nearest_neighbor_distribution_outputs()
+
+# -----------------------------------------------------------------------------
 # 1) Publication-ready clonality repeated-stems percentage figure
 # -----------------------------------------------------------------------------
 message(SCRIPT_TAG, " Building clonality repeated-stems percentage figure from final MLL assignments...")
@@ -732,12 +1077,42 @@ cat(SCRIPT_TAG, " threshold used = ", BRUVO_MLL_THRESHOLD, "\n", sep = "")
 cat(SCRIPT_TAG, " total pairwise comparisons = ", length(bruvo_values), "\n", sep = "")
 cat(SCRIPT_TAG, " pairwise distances <= threshold = ", threshold_n, " (", sprintf("%.3f%%", threshold_pct), ")\n", sep = "")
 cat(SCRIPT_TAG, " diagnostic MLL count matches final MLL count = ", bruvo_match, "\n", sep = "")
+
+cat("\n", SCRIPT_TAG, " Sampled stem diameter console check\n", sep = "")
+cat(SCRIPT_TAG, " total stems with diameter values = ", nrow(diameter_outputs$values), "\n", sep = "")
+for (i in seq_len(nrow(diameter_outputs$table))) {
+  cat(
+    SCRIPT_TAG, " ", diameter_outputs$table$`Diameter class (cm)`[i], " cm = ",
+    diameter_outputs$table$Count[i], " (", format1(diameter_outputs$table$Percent[i]), "%)\n",
+    sep = ""
+  )
+}
+cat(SCRIPT_TAG, " diameter distribution matches draft expected values = ", diameter_outputs$expected_match, "\n", sep = "")
+
+cat("\n", SCRIPT_TAG, " Nearest-neighbor console check\n", sep = "")
+cat(SCRIPT_TAG, " total georeferenced stems = ", nearest_neighbor_outputs$summary$total_georeferenced_stems, "\n", sep = "")
+cat(SCRIPT_TAG, " mean nearest-neighbor distance = ", sprintf("%.2f m", nearest_neighbor_outputs$summary$mean_nearest_neighbor_distance_m), "\n", sep = "")
+cat(SCRIPT_TAG, " median nearest-neighbor distance = ", sprintf("%.2f m", nearest_neighbor_outputs$summary$median_nearest_neighbor_distance_m), "\n", sep = "")
+for (i in seq_len(nrow(nearest_neighbor_outputs$table))) {
+  cat(
+    SCRIPT_TAG, " ", nearest_neighbor_outputs$table$`Nearest-neighbor distance class (m)`[i], " m = ",
+    nearest_neighbor_outputs$table$Count[i], " (", format1(nearest_neighbor_outputs$table$Percent[i]), "%)\n",
+    sep = ""
+  )
+}
+cat(SCRIPT_TAG, " stems with nearest neighbor within 2 m = ", nearest_neighbor_outputs$summary$n_within_2m, " (", format1(nearest_neighbor_outputs$summary$percent_within_2m), "%)\n", sep = "")
+cat(SCRIPT_TAG, " nearest-neighbor distribution matches draft expected values = ", nearest_neighbor_outputs$expected_match, "\n", sep = "")
 cat(SCRIPT_TAG, " All publication outputs complete.\n", sep = "")
 
 invisible(list(
+  diameter_table = diameter_outputs$table,
+  nearest_neighbor_table = nearest_neighbor_outputs$table,
+  nearest_neighbor_summary = nearest_neighbor_outputs$summary,
   clonality_site_table = clonality_site_table,
   sensitivity_table = sensitivity_table,
   bruvo_summary = bruvo_summary,
+  diameter_plot = diameter_outputs$plot,
+  nearest_neighbor_plot = nearest_neighbor_outputs$plot,
   clonality_plot = clonality_plot,
   bruvo_plot = bruvo_plot
 ))

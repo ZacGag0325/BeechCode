@@ -461,8 +461,20 @@ format_hwe_wide <- function(hwe_long, site_levels) {
     pivot_wider(
       names_from = Appendix_scope,
       values_from = c(N, chi_square, df, exact_p_value, bonferroni_p_value, significant_bonferroni, status),
-      names_glue = "{Appendix_scope}_{.metric}"
+      names_sep = "__"
     )
+  
+  # tidyr names generated from multiple values_from columns are usually
+  # metric__scope (for example, chi_square__S1). Rename them to the
+  # appendix-friendly scope_metric order (for example, S1_chi_square)
+  # without relying on glue placeholders.
+  wide_names <- names(wide)
+  value_cols <- wide_names[wide_names != "Locus"]
+  renamed_value_cols <- vapply(value_cols, function(nm) {
+    parts <- strsplit(nm, "__", fixed = TRUE)[[1]]
+    if (length(parts) == 2) paste(parts[2], parts[1], sep = "_") else nm
+  }, character(1))
+  names(wide)[match(value_cols, names(wide))] <- renamed_value_cols
   
   scope_levels <- c("All", site_levels)
   metric_levels <- c("N", "chi_square", "df", "exact_p_value", "bonferroni_p_value", "significant_bonferroni", "status")

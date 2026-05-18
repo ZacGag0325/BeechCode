@@ -60,14 +60,16 @@ SAMPLED_STEM_NEAREST_NEIGHBOR_PAIRS_CSV <- file.path(TABLES_DIR, "sampled_stem_n
 SAMPLED_STEM_DESCRIPTIVE_SCRIPT <- file.path(PROJECT_ROOT, "scripts", "sampled_stem_descriptive_results.R")
 
 DIAMETER_CLASS_LEVELS <- c("1-2 cm", "2-5 cm", "5-10 cm", ">10 cm")
-DIAMETER_CLASS_LABELS <- c("1-2", "2-5", "5-10", ">10")
+DIAMETER_CLASS_LABELS <- c("1–2", "2–5", "5–10", ">10")
 EXPECTED_DIAMETER_COUNTS <- c(101L, 115L, 49L, 11L)
 EXPECTED_DIAMETER_PERCENT <- c(36.6, 41.7, 17.8, 4.0)
 
-NEAREST_NEIGHBOR_CLASS_LEVELS <- c("<1 m", "1-2 m", "2-5 m", ">5 m")
-NEAREST_NEIGHBOR_CLASS_LABELS <- c("<1", "1-2", "2-5", ">5")
-EXPECTED_NEAREST_NEIGHBOR_COUNTS <- c(59L, 66L, 88L, 65L)
-EXPECTED_NEAREST_NEIGHBOR_PERCENT <- c(21.2, 23.7, 31.7, 23.4)
+NEAREST_NEIGHBOR_CLASS_LEVELS_TO_8M <- c("0-2 m", "2-4 m", "4-6 m", "6-8 m")
+NEAREST_NEIGHBOR_CLASS_LABELS_TO_8M <- c("0–2", "2–4", "4–6", "6–8")
+NEAREST_NEIGHBOR_CLASS_LEVELS_OVER_8M <- c(NEAREST_NEIGHBOR_CLASS_LEVELS_TO_8M, ">8 m")
+NEAREST_NEIGHBOR_CLASS_LABELS_OVER_8M <- c(NEAREST_NEIGHBOR_CLASS_LABELS_TO_8M, ">8")
+EXPECTED_NEAREST_NEIGHBOR_COUNTS <- NULL
+EXPECTED_NEAREST_NEIGHBOR_PERCENT <- NULL
 
 # -----------------------------------------------------------------------------
 # General helpers
@@ -297,8 +299,8 @@ coerce_numeric_publication <- function(x) {
   suppressWarnings(as.numeric(x))
 }
 
-format_count_percent_label <- function(count, percent) {
-  paste0(as.integer(count), "\n", format1(percent), "%")
+format_count_label <- function(count) {
+  as.character(as.integer(count))
 }
 
 check_expected_distribution <- function(observed_counts,
@@ -306,6 +308,7 @@ check_expected_distribution <- function(observed_counts,
                                         expected_counts,
                                         expected_percent,
                                         context) {
+  if (is.null(expected_counts) || is.null(expected_percent)) return(NA)
   counts_match <- identical(as.integer(observed_counts), as.integer(expected_counts))
   percent_match <- identical(round1(observed_percent), round1(expected_percent))
   matched <- isTRUE(counts_match && percent_match)
@@ -432,14 +435,14 @@ build_diameter_distribution_outputs <- function() {
   diameter_plot_df <- diameter_table %>%
     mutate(
       `Diameter class (cm)` = factor(`Diameter class (cm)`, levels = DIAMETER_CLASS_LABELS, ordered = TRUE),
-      label = format_count_percent_label(Count, Percent)
+      label = format_count_label(Count)
     )
   
   diameter_plot <- ggplot(diameter_plot_df, aes(x = `Diameter class (cm)`, y = Count)) +
     geom_col(width = 0.72, fill = "grey35") +
-    geom_text(aes(label = label), vjust = -0.25, lineheight = 0.9, size = 3.5) +
+    geom_text(aes(label = label), vjust = -0.25, size = 3.5) +
     scale_y_continuous(
-      limits = c(0, max(diameter_plot_df$Count, na.rm = TRUE) * 1.18),
+      limits = c(0, max(diameter_plot_df$Count, na.rm = TRUE) * 1.12),
       expand = expansion(mult = c(0, 0.03))
     ) +
     labs(x = "Stem diameter class (cm)", y = "Number of sampled stems") +
@@ -470,16 +473,29 @@ build_nearest_neighbor_distribution_outputs <- function() {
     required = TRUE
   )
   
-  nearest_clean <- nearest_values %>%
-    mutate(nearest_neighbor_distance_m = coerce_numeric_publication(.data[[distance_col]])) %>%
+  nearest_distance_numeric <- coerce_numeric_publication(nearest_values[[distance_col]])
+  has_distances_over_8m <- any(nearest_distance_numeric > 8, na.rm = TRUE)
+  nearest_class_levels <- if (has_distances_over_8m) {
+    NEAREST_NEIGHBOR_CLASS_LEVELS_OVER_8M
+  } else {
+    NEAREST_NEIGHBOR_CLASS_LEVELS_TO_8M
+  }
+  nearest_class_labels <- if (has_distances_over_8m) {
+    NEAREST_NEIGHBOR_CLASS_LABELS_OVER_8M
+  } else {
+    NEAREST_NEIGHBOR_CLASS_LABELS_TO_8M
+  }
+  
+  nearest_clean <- data.frame(nearest_neighbor_distance_m = nearest_distance_numeric, stringsAsFactors = FALSE) %>%
     filter(!is.na(nearest_neighbor_distance_m), nearest_neighbor_distance_m >= 0) %>%
     mutate(
-      Distance_class = cut(
-        nearest_neighbor_distance_m,
-        breaks = c(0, 1, 2, 5, Inf),
-        labels = NEAREST_NEIGHBOR_CLASS_LEVELS,
-        include.lowest = TRUE,
-        right = FALSE
+      Distance_class = dplyr::case_when(
+        nearest_neighbor_distance_m < 2 ~ "0-2 m",
+        nearest_neighbor_distance_m < 4 ~ "2-4 m",
+        nearest_neighbor_distance_m < 6 ~ "4-6 m",
+        nearest_neighbor_distance_m <= 8 ~ "6-8 m",
+        has_distances_over_8m & nearest_neighbor_distance_m > 8 ~ ">8 m",
+        TRUE ~ NA_character_
       )
     ) %>%
     filter(!is.na(Distance_class))
@@ -496,8 +512,8 @@ build_nearest_neighbor_distribution_outputs <- function() {
     count(Distance_class, name = "Count")
   
   nearest_table <- data.frame(
-    Distance_class = NEAREST_NEIGHBOR_CLASS_LEVELS,
-    `Nearest-neighbor distance class (m)` = NEAREST_NEIGHBOR_CLASS_LABELS,
+    Distance_class = nearest_class_levels,
+    `Nearest-neighbor distance class (m)` = nearest_class_labels,
     stringsAsFactors = FALSE,
     check.names = FALSE
   ) %>%
@@ -548,15 +564,15 @@ build_nearest_neighbor_distribution_outputs <- function() {
   
   nearest_plot_df <- nearest_table %>%
     mutate(
-      `Nearest-neighbor distance class (m)` = factor(`Nearest-neighbor distance class (m)`, levels = NEAREST_NEIGHBOR_CLASS_LABELS, ordered = TRUE),
-      label = format_count_percent_label(Count, Percent)
+      `Nearest-neighbor distance class (m)` = factor(`Nearest-neighbor distance class (m)`, levels = nearest_class_labels, ordered = TRUE),
+      label = format_count_label(Count)
     )
   
   nearest_plot <- ggplot(nearest_plot_df, aes(x = `Nearest-neighbor distance class (m)`, y = Count)) +
     geom_col(width = 0.72, fill = "grey35") +
-    geom_text(aes(label = label), vjust = -0.25, lineheight = 0.9, size = 3.5) +
+    geom_text(aes(label = label), vjust = -0.25, size = 3.5) +
     scale_y_continuous(
-      limits = c(0, max(nearest_plot_df$Count, na.rm = TRUE) * 1.18),
+      limits = c(0, max(nearest_plot_df$Count, na.rm = TRUE) * 1.12),
       expand = expansion(mult = c(0, 0.03))
     ) +
     labs(x = "Nearest-neighbor distance class (m)", y = "Number of sampled stems") +
@@ -875,16 +891,13 @@ write_word_table(
 )
 
 clonality_plot_df <- clonality_site_table %>%
-  mutate(
-    Site = factor(Site, levels = EXPECTED_SITE_LABELS, ordered = TRUE),
-    label = ifelse(Repeated_percent > 0, paste0(format1(Repeated_percent), "%"), NA_character_)
-  )
+  mutate(Site = factor(Site, levels = EXPECTED_SITE_LABELS, ordered = TRUE))
 
 clonality_plot <- ggplot(clonality_plot_df, aes(x = Site, y = Repeated_percent)) +
   geom_col(width = 0.72, fill = "grey35") +
-  geom_text(aes(label = label), vjust = -0.35, size = 3.6, na.rm = TRUE) +
   scale_y_continuous(
-    limits = c(0, max(15, max(clonality_plot_df$Repeated_percent, na.rm = TRUE) * 1.25)),
+    limits = c(0, 100),
+    breaks = c(0, 25, 50, 75, 100),
     expand = expansion(mult = c(0, 0.03))
   ) +
   labs(x = "Site", y = "Repeated stems (%)") +

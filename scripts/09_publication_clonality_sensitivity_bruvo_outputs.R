@@ -299,9 +299,6 @@ coerce_numeric_publication <- function(x) {
   suppressWarnings(as.numeric(x))
 }
 
-format_count_label <- function(count) {
-  as.character(as.integer(count))
-}
 
 check_expected_distribution <- function(observed_counts,
                                         observed_percent,
@@ -321,6 +318,11 @@ check_expected_distribution <- function(observed_counts,
     )
   }
   matched
+}
+
+format_distribution_match <- function(match_value, unchecked_message = "not checked") {
+  if (length(match_value) == 0 || is.na(match_value)) return(unchecked_message)
+  as.character(isTRUE(match_value))
 }
 
 ensure_sampled_stem_descriptive_outputs <- function(required_paths) {
@@ -433,14 +435,10 @@ build_diameter_distribution_outputs <- function() {
   )
   
   diameter_plot_df <- diameter_table %>%
-    mutate(
-      `Diameter class (cm)` = factor(`Diameter class (cm)`, levels = DIAMETER_CLASS_LABELS, ordered = TRUE),
-      label = format_count_label(Count)
-    )
+    mutate(`Diameter class (cm)` = factor(`Diameter class (cm)`, levels = DIAMETER_CLASS_LABELS, ordered = TRUE))
   
   diameter_plot <- ggplot(diameter_plot_df, aes(x = `Diameter class (cm)`, y = Count)) +
     geom_col(width = 0.72, fill = "grey35") +
-    geom_text(aes(label = label), vjust = -0.25, size = 3.5) +
     scale_y_continuous(
       limits = c(0, max(diameter_plot_df$Count, na.rm = TRUE) * 1.12),
       expand = expansion(mult = c(0, 0.03))
@@ -539,7 +537,10 @@ build_nearest_neighbor_distribution_outputs <- function() {
     median_nearest_neighbor_distance_m = safe_median(nearest_clean$nearest_neighbor_distance_m),
     n_within_2m = sum(nearest_clean$nearest_neighbor_distance_m <= 2, na.rm = TRUE),
     percent_within_2m = 100 * sum(nearest_clean$nearest_neighbor_distance_m <= 2, na.rm = TRUE) / nrow(nearest_clean),
-    expected_distribution_match = nearest_expected_match,
+    expected_distribution_match = format_distribution_match(
+      nearest_expected_match,
+      unchecked_message = "not checked; nearest-neighbor classes updated to 2-m bins"
+    ),
     stringsAsFactors = FALSE
   ) %>%
     mutate(
@@ -563,14 +564,10 @@ build_nearest_neighbor_distribution_outputs <- function() {
   )
   
   nearest_plot_df <- nearest_table %>%
-    mutate(
-      `Nearest-neighbor distance class (m)` = factor(`Nearest-neighbor distance class (m)`, levels = nearest_class_labels, ordered = TRUE),
-      label = format_count_label(Count)
-    )
+    mutate(`Nearest-neighbor distance class (m)` = factor(`Nearest-neighbor distance class (m)`, levels = nearest_class_labels, ordered = TRUE))
   
   nearest_plot <- ggplot(nearest_plot_df, aes(x = `Nearest-neighbor distance class (m)`, y = Count)) +
     geom_col(width = 0.72, fill = "grey35") +
-    geom_text(aes(label = label), vjust = -0.25, size = 3.5) +
     scale_y_continuous(
       limits = c(0, max(nearest_plot_df$Count, na.rm = TRUE) * 1.12),
       expand = expansion(mult = c(0, 0.03))
@@ -1100,7 +1097,13 @@ for (i in seq_len(nrow(diameter_outputs$table))) {
     sep = ""
   )
 }
-cat(SCRIPT_TAG, " diameter distribution matches draft expected values = ", diameter_outputs$expected_match, "\n", sep = "")
+cat(
+  SCRIPT_TAG,
+  " diameter distribution matches draft expected values = ",
+  format_distribution_match(diameter_outputs$expected_match),
+  "\n",
+  sep = ""
+)
 
 cat("\n", SCRIPT_TAG, " Nearest-neighbor console check\n", sep = "")
 cat(SCRIPT_TAG, " total georeferenced stems = ", nearest_neighbor_outputs$summary$total_georeferenced_stems, "\n", sep = "")
@@ -1114,7 +1117,16 @@ for (i in seq_len(nrow(nearest_neighbor_outputs$table))) {
   )
 }
 cat(SCRIPT_TAG, " stems with nearest neighbor within 2 m = ", nearest_neighbor_outputs$summary$n_within_2m, " (", format1(nearest_neighbor_outputs$summary$percent_within_2m), "%)\n", sep = "")
-cat(SCRIPT_TAG, " nearest-neighbor distribution matches draft expected values = ", nearest_neighbor_outputs$expected_match, "\n", sep = "")
+cat(
+  SCRIPT_TAG,
+  " nearest-neighbor distribution matches draft expected values = ",
+  format_distribution_match(
+    nearest_neighbor_outputs$expected_match,
+    unchecked_message = "not checked; nearest-neighbor classes updated to 2-m bins"
+  ),
+  "\n",
+  sep = ""
+)
 cat(SCRIPT_TAG, " All publication outputs complete.\n", sep = "")
 
 invisible(list(

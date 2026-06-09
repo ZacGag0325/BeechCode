@@ -175,12 +175,12 @@ df_method <- df %>%
 # 8) Define EN/FR dictionaries -------------------------------------------------
 method_levels_en <- c(
   "Excavation - Morphologie du collet et lien racinaire",
-  "Excavation - Morphologie du collet",
-  "Excavation - Lien racinaire entre individus",
-  "Excavation - Non explicite",
-  "Lien racinaire - Racine de surface",
-  "Proximité des individus",
-  "Identification génétique"
+  "Excavation + collar morphology",
+  "Excavation + root connection between individuals",
+  "Excavation, method not specified",
+  "Root connection / surface root",
+  "Spatial proximity between individuals",
+  "Genetic identification"
 )
 
 method_labels_fr <- c(

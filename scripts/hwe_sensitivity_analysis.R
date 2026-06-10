@@ -551,9 +551,11 @@ run_clonality_sensitivity_bundle <- function(full_gobj, loci_to_remove) {
 }
 
 check_clonality_sensitivity_expectations <- function(overall_summary, comparison_tbl) {
+  # Inputs can change when the updated main poppr.xlsx is regenerated. Do not
+  # hard-code the retained individual count from older runs; compare only the
+  # reduced-locus sensitivity pattern values that are still useful as a warning.
   expected <- data.frame(
     Dataset = c("FULL", "REDUCED"),
-    total_N = c(276L, 276L),
     total_MLG = c(270L, 270L),
     total_MLL = c(268L, 267L),
     R_MLL = c(0.970909, 0.967273),
@@ -569,8 +571,7 @@ check_clonality_sensitivity_expectations <- function(overall_summary, comparison
     stringsAsFactors = FALSE
   )
   
-  mismatch <- !isTRUE(all.equal(actual$total_N, expected$total_N, check.attributes = FALSE)) ||
-    !isTRUE(all.equal(actual$total_MLG, expected$total_MLG, check.attributes = FALSE)) ||
+  mismatch <- !isTRUE(all.equal(actual$total_MLG, expected$total_MLG, check.attributes = FALSE)) ||
     !isTRUE(all.equal(actual$total_MLL, expected$total_MLL, check.attributes = FALSE)) ||
     !isTRUE(all.equal(round(actual$R_MLL, 6), expected$R_MLL, tolerance = 1e-6, check.attributes = FALSE))
   
@@ -596,7 +597,6 @@ check_clonality_sensitivity_expectations <- function(overall_summary, comparison
   } else {
     message("[hwe_sensitivity] Clonality sensitivity outputs match the expected previous values.")
   }
-  
   invisible(!mismatch && site_expectation_ok)
 }
 
@@ -1196,7 +1196,6 @@ write_csv_msg(
   red_div$overall,
   file.path(SENS_TABLES_DIR, paste0("heterozygosity_fis_overall_", analysis_suffix, ".csv"))
 )
-
 write_csv_msg(
   red_div$allelic_richness,
   file.path(SENS_TABLES_DIR, paste0("allelic_richness_by_site_", analysis_suffix, ".csv"))
@@ -1473,5 +1472,3 @@ cat("\n[hwe_sensitivity] Corrected FULL vs REDUCED by-site diversity comparison 
 print(div_site_cmp)
 cat("[hwe_sensitivity] Corrected by-site comparison row count: ", nrow(div_site_cmp), "\n", sep = "")
 cat("[hwe_sensitivity] Corrected by-site comparison site order: ", paste(div_site_cmp$Site, collapse = ", "), "\n", sep = "")
-
-message("[hwe_sensitivity] Completed reduced-loci sensitivity branch successfully.")

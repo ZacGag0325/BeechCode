@@ -149,57 +149,51 @@ df <- df %>%
   attach_site_lookup(site_lookup, "Data extraction sheet")
 
 # 7) Recode method categories --------------------------------------------------
+# Raw method labels are normalized into stable internal keys first. Plot-specific
+# English and French labels are then applied from dictionaries so factor levels
+# cannot mix languages.
+method_dictionary <- tribble(
+  ~method_key, ~method_label_en, ~method_label_fr,
+  "excavation_collar_root", "Excavation + collar morphology + root connection", "Excavation + morphologie du collet + lien racinaire",
+  "excavation_collar", "Excavation + collar morphology", "Excavation + morphologie du collet",
+  "excavation_root", "Excavation + root connection between individuals", "Excavation + lien racinaire entre individus",
+  "excavation_unspecified", "Excavation, method not specified", "Excavation, méthode non explicite",
+  "root_surface", "Root connection / surface root", "Lien racinaire / racine de surface",
+  "spatial_proximity", "Spatial proximity between individuals", "Proximité entre individus",
+  "genetic_identification", "Genetic identification", "Identification génétique"
+)
+
+method_levels <- method_dictionary$method_key
+method_labels_en <- setNames(method_dictionary$method_label_en, method_dictionary$method_key)
+method_labels_fr <- setNames(method_dictionary$method_label_fr, method_dictionary$method_key)
+
 df_method <- df %>%
   mutate(
     Method_Category_clean_lower = str_to_lower(str_squish(Method_Category)),
-    Method_Category_clean = case_when(
+    Method_Category_key = case_when(
       str_detect(Method_Category_clean_lower, "excavation") &
-        str_detect(Method_Category_clean_lower, "morphologie") &
-        str_detect(Method_Category_clean_lower, "lien racinaire") ~ "Excavation - Morphologie du collet et lien racinaire",
+        str_detect(Method_Category_clean_lower, "morphologie|morphology|collet|collar") &
+        str_detect(Method_Category_clean_lower, "lien racinaire|root connection|root link|racinaire") ~ "excavation_collar_root",
       str_detect(Method_Category_clean_lower, "excavation") &
-        str_detect(Method_Category_clean_lower, "morphologie") ~ "Excavation - Morphologie du collet",
+        str_detect(Method_Category_clean_lower, "morphologie|morphology|collet|collar") ~ "excavation_collar",
       str_detect(Method_Category_clean_lower, "excavation") &
-        str_detect(Method_Category_clean_lower, "lien racinaire") ~ "Excavation - Lien racinaire entre individus",
+        str_detect(Method_Category_clean_lower, "lien racinaire|root connection|root link|racinaire") ~ "excavation_root",
       str_detect(Method_Category_clean_lower, "excavation") &
-        str_detect(Method_Category_clean_lower, "non explicite") ~ "Excavation - Non explicite",
-      str_detect(Method_Category_clean_lower, "lien racinaire") &
-        str_detect(Method_Category_clean_lower, "racine de surface") ~ "Lien racinaire - Racine de surface",
-      str_detect(Method_Category_clean_lower, "proximité|proximite") ~ "Proximité des individus",
-      str_detect(Method_Category_clean_lower, "identification génétique|identification genetique|génétique|genetique") ~ "Identification génétique",
+        str_detect(Method_Category_clean_lower, "non explicite|not specified|unspecified|method not specified") ~ "excavation_unspecified",
+      str_detect(Method_Category_clean_lower, "lien racinaire|root connection|root link|racinaire") &
+        str_detect(Method_Category_clean_lower, "racine de surface|surface root") ~ "root_surface",
+      str_detect(Method_Category_clean_lower, "proximité|proximite|proximity|spatial") ~ "spatial_proximity",
+      str_detect(Method_Category_clean_lower, "identification génétique|identification genetique|génétique|genetique|genetic") ~ "genetic_identification",
       TRUE ~ NA_character_
-    )
+    ),
+    Method_Category_key = factor(Method_Category_key, levels = method_levels)
   ) %>%
-  filter(!is.na(Method_Category_clean)) %>%
+  filter(!is.na(Method_Category_key)) %>%
   attach_site_lookup(site_lookup, "method category data")
-
-# 8) Define EN/FR dictionaries -------------------------------------------------
-method_levels_en <- c(
-  "Excavation - Morphologie du collet et lien racinaire",
-  "Excavation + collar morphology",
-  "Excavation + root connection between individuals",
-  "Excavation, method not specified",
-  "Root connection / surface root",
-  "Spatial proximity between individuals",
-  "Genetic identification"
-)
-
-method_labels_fr <- c(
-  "Excavation - Morphologie du collet et lien racinaire" = "Excavation - Morphologie du collet et lien racinaire",
-  "Excavation - Morphologie du collet" = "Excavation - Morphologie du collet",
-  "Excavation - Lien racinaire entre individus" = "Excavation - Lien racinaire entre individus",
-  "Excavation - Non explicite" = "Excavation - Non explicite",
-  "Lien racinaire - Racine de surface" = "Lien racinaire - Racine de surface",
-  "Proximité des individus" = "Proximité des individus",
-  "Identification génétique" = "Identification génétique"
-)
-
-# Apply ordering for method categories
-df_method <- df_method %>%
-  mutate(Method_Category_clean = factor(Method_Category_clean, levels = method_levels_en))
 
 # 9) Count data for method plot ------------------------------------------------
 summary_df <- df_method %>%
-  count(Method_Category_clean)
+  count(Method_Category_key, name = "n")
 
 print(summary_df)
 
@@ -227,14 +221,20 @@ theme_pub <- theme_classic(base_size = 22) +
   )
 
 # 10) Method stacked bar plot (EN + FR) ----------------------------------------
+summary_df_en <- summary_df %>%
+  mutate(
+    Method_Category_label = recode(as.character(Method_Category_key), !!!method_labels_en),
+    Method_Category_label = factor(Method_Category_label, levels = unname(method_labels_en[method_levels]))
+  )
+
 # English (main plot without legend)
-p_method_en <- ggplot(summary_df, aes(x = Method_Category_clean, y = n)) +
+p_method_en <- ggplot(summary_df_en, aes(x = Method_Category_label, y = n)) +
   geom_col(fill = bar_fill, color = NA, width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = count_label_size, color = "black") +
   coord_flip() +
-  expand_limits(y = max(summary_df$n, na.rm = TRUE) * 1.15 + 0.3) +
+  expand_limits(y = max(summary_df_en$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(
-    x = "Method category",
+    x = "Method used to identify clones",
     y = "Number of studies",
     title = NULL
   ) +
@@ -253,26 +253,19 @@ ggsave(
 
 # Separate method legends are omitted because all method bars use the same presentation color.
 
-# French (translate visible plotted labels)
 summary_df_fr <- summary_df %>%
   mutate(
-    Method_Category_clean_fr = recode(as.character(Method_Category_clean), !!!method_labels_fr)
+    Method_Category_label = recode(as.character(Method_Category_key), !!!method_labels_fr),
+    Method_Category_label = factor(Method_Category_label, levels = unname(method_labels_fr[method_levels]))
   )
 
-method_levels_fr <- unname(method_labels_fr[method_levels_en])
-
-summary_df_fr <- summary_df_fr %>%
-  mutate(
-    Method_Category_clean_fr = factor(Method_Category_clean_fr, levels = method_levels_fr)
-  )
-
-p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Category_clean_fr, y = n)) +
+p_method_fr <- ggplot(summary_df_fr, aes(x = Method_Category_label, y = n)) +
   geom_col(fill = bar_fill, color = NA, width = 0.75) +
   geom_text(aes(label = n), hjust = -0.15, size = count_label_size, color = "black") +
   coord_flip() +
   expand_limits(y = max(summary_df_fr$n, na.rm = TRUE) * 1.15 + 0.3) +
   labs(
-    x = "Catégorie de méthode",
+    x = "Méthode utilisée pour identifier les clones",
     y = "Nombre d’études",
     title = NULL
   ) +

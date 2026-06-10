@@ -13,7 +13,7 @@
 #
 # Microsatellite clone-correction policy:
 # - gi = full dataset for clonality and individual-level diagnostics.
-#   Individuals with >35% missing allele data are removed from gi immediately
+#   Individuals with >35% missing loci are removed from gi immediately
 #   after import and before any clone detection or downstream analysis.
 # - gi_mll = clone-corrected dataset based on MLLs defined from Bruvo distance.
 # - Exact MLG assignments are retained alongside MLL assignments in df_ids.
@@ -51,9 +51,11 @@ setwd(PROJECT_ROOT)
 
 OBJ_DIR <- file.path(PROJECT_ROOT, "outputs", "v1", "objects")
 TABLES_SUPP_DIR <- file.path(PROJECT_ROOT, "outputs", "tables", "supplementary")
+QC_DIR <- file.path(PROJECT_ROOT, "outputs", "qc")
 MICROCHECKER_DIR <- file.path(PROJECT_ROOT, "data", "derived")
 dir.create(OBJ_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(TABLES_SUPP_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(QC_DIR, recursive = TRUE, showWarnings = FALSE)
 dir.create(MICROCHECKER_DIR, recursive = TRUE, showWarnings = FALSE)
 
 resolve_col <- function(df, choices) {
@@ -294,23 +296,37 @@ select_genotype_source <- function(scanned, canonical_ids_norm) {
   cands <- Filter(function(x) {
     !is.na(x$summary$id_col) && x$summary$n_paired_loci >= 2
   }, scanned)
-  
   if (length(cands) == 0) {
     stop("[00_master_pipeline] Could not find genotype table with paired allele columns in workbook sources.")
   }
   
-  score <- function(x) {
-    ids <- normalize_id(x$df[[x$summary$id_col]])
-    ids <- ids[nzchar(ids)]
-    match_n <- sum(ids %in% canonical_ids_norm)
-    b <- tolower(basename(x$path))
-    s <- 0
-    if (needs_readxl(x$path)) s <- s + 20
-    if (grepl("poppr|geno|genotype|microsat", b)) s <- s + 10
-    match_n * 1000 + x$summary$n_paired_loci * 10 + s
-  }
+  preferred_path <- normalizePath(file.path(PROJECT_ROOT, "data", "raw", "poppr.xlsx"), winslash = "/", mustWork = FALSE)
+  preferred <- Filter(function(x) {
+    normalizePath(x$path, winslash = "/", mustWork = FALSE) == preferred_path &&
+      !is.na(x$sheet) && identical(x$sheet, "Genotypes-Indiv.")
+  }, cands)
   
-  best <- cands[[which.max(vapply(cands, score, numeric(1)))]]
+  if (length(preferred) > 0) {
+    best <- preferred[[1]]
+    message("[00_master_pipeline] Using required updated main genotype workbook: data/raw/poppr.xlsx / Genotypes-Indiv.")
+  } else {
+    warning(
+      "[00_master_pipeline] Required updated main genotype source data/raw/poppr.xlsx sheet Genotypes-Indiv. was not found; ",
+      "falling back to source scoring among available genotype tables.",
+      call. = FALSE
+    )
+    score <- function(x) {
+      ids <- normalize_id(x$df[[x$summary$id_col]])
+      ids <- ids[nzchar(ids)]
+      match_n <- sum(ids %in% canonical_ids_norm)
+      b <- tolower(basename(x$path))
+      s <- 0
+      if (needs_readxl(x$path)) s <- s + 20
+      if (grepl("poppr|geno|genotype|microsat", b)) s <- s + 10
+      match_n * 1000 + x$summary$n_paired_loci * 10 + s
+    }
+    best <- cands[[which.max(vapply(cands, score, numeric(1)))]]
+  }
   
   message("[00_master_pipeline] Chosen genotype source file: ", best$path)
   message("[00_master_pipeline] Chosen genotype source sheet: ", ifelse(is.na(best$sheet), "<file>", best$sheet))
@@ -341,7 +357,6 @@ build_genind_from_table <- function(tbl, table_summary, canonical_ids_norm, id_t
   n_matched <- sum(in_canonical)
   n_excluded <- sum(!in_canonical)
   excluded_examples <- unique(ids_raw[!in_canonical])
-  
   tbl <- tbl[in_canonical, , drop = FALSE]
   ids_raw <- ids_raw[in_canonical]
   ids_norm <- ids_norm[in_canonical]
@@ -450,18 +465,59 @@ calculate_individual_missingness <- function(tbl, table_summary, ids_raw) {
     m1 <- is_missing_allele(tbl[[c1]])
     m2 <- is_missing_allele(tbl[[c2]])
     missing_allele_count <- missing_allele_count + as.integer(m1) + as.integer(m2)
-    missing_locus_count <- missing_locus_count + as.integer(m1 | m2)
+    # A locus is counted as missing only when both paired allele columns are missing.
+    missing_locus_count <- missing_locus_count + as.integer(m1 & m2)
   }
   
   data.frame(
     ind_id = ids_raw,
     missing_allele_count = missing_allele_count,
     total_alleles_expected = total_alleles_expected,
-    percent_missing = missing_allele_count / total_alleles_expected,
+    percent_missing = missing_locus_count / length(paired_loci),
+    percent_missing_allele_data = missing_allele_count / total_alleles_expected,
     missing_locus_count = missing_locus_count,
     total_loci = length(paired_loci),
     stringsAsFactors = FALSE
   )
+}
+
+is_ldf_n6_sample <- function(ind_id, site) {
+  id_chr <- toupper(ifelse(is.na(ind_id), "", as.character(ind_id)))
+  site_chr <- toupper(ifelse(is.na(site), "", as.character(site)))
+  site_chr == "N6" | grepl("LDF", site_chr, fixed = TRUE) | grepl("LDF", id_chr, fixed = TRUE)
+}
+
+write_missingness_qc_outputs <- function(missingness_tbl, sites_before, remove_idx, threshold, qc_dir = QC_DIR) {
+  dir.create(qc_dir, recursive = TRUE, showWarnings = FALSE)
+  ids <- missingness_tbl$ind_id
+  retained_idx <- !remove_idx
+  ldf_n6 <- is_ldf_n6_sample(ids, sites_before)
+  removed_ids <- ids[remove_idx]
+  retained_ldf_n6_ids <- ids[retained_idx & ldf_n6]
+  removed_ldf_n6_ids <- ids[remove_idx & ldf_n6]
+  summary_tbl <- data.frame(
+    total_individuals_before_filtering = length(ids),
+    total_individuals_retained = sum(retained_idx),
+    total_individuals_removed = sum(remove_idx),
+    missingness_threshold_used = threshold,
+    removed_sample_ids = paste(removed_ids, collapse = ";"),
+    retained_ldf_n6_sample_ids = paste(retained_ldf_n6_ids, collapse = ";"),
+    removed_ldf_n6_sample_ids = paste(removed_ldf_n6_ids, collapse = ";"),
+    stringsAsFactors = FALSE
+  )
+  write.csv(summary_tbl, file.path(qc_dir, "main_missingness_filter_summary.csv"), row.names = FALSE)
+  site_before_tbl <- as.data.frame(table(sites_before), stringsAsFactors = FALSE)
+  names(site_before_tbl) <- c("site", "n_before_filtering")
+  site_after_tbl <- as.data.frame(table(sites_before[retained_idx]), stringsAsFactors = FALSE)
+  names(site_after_tbl) <- c("site", "n_after_filtering")
+  site_tbl <- merge(site_before_tbl, site_after_tbl, by = "site", all.x = TRUE, sort = TRUE)
+  site_tbl$n_after_filtering[is.na(site_tbl$n_after_filtering)] <- 0L
+  site_tbl$n_before_filtering <- as.integer(site_tbl$n_before_filtering)
+  site_tbl$n_after_filtering <- as.integer(site_tbl$n_after_filtering)
+  site_tbl$n_removed <- site_tbl$n_before_filtering - site_tbl$n_after_filtering
+  site_tbl$is_ldf_n6 <- is_ldf_n6_sample("", site_tbl$site)
+  write.csv(site_tbl, file.path(qc_dir, "site_sample_sizes_after_filtering.csv"), row.names = FALSE)
+  invisible(list(summary = summary_tbl, site_sizes = site_tbl))
 }
 
 apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_ALLELE_FILTER_THRESHOLD, output_dir = TABLES_SUPP_DIR) {
@@ -471,7 +527,7 @@ apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_A
   if (!is.data.frame(missingness_tbl) || nrow(missingness_tbl) != adegenet::nInd(gi)) {
     stop("[00_master_pipeline] Missingness table must be a data.frame aligned to all individuals in gi.")
   }
-  required_cols <- c("ind_id", "percent_missing", "missing_allele_count", "total_alleles_expected")
+  required_cols <- c("ind_id", "percent_missing", "missing_locus_count", "total_loci")
   if (!all(required_cols %in% names(missingness_tbl))) {
     stop("[00_master_pipeline] Missingness table is missing required columns: ",
          paste(setdiff(required_cols, names(missingness_tbl)), collapse = ", "))
@@ -489,8 +545,7 @@ apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_A
   }
   if (any(!is.finite(missingness_tbl$percent_missing))) {
     stop("[00_master_pipeline] Non-finite per-individual missing-data proportions detected.")
-  }
-  
+  }  
   remove_idx <- missingness_tbl$percent_missing > threshold
   retained_n <- sum(!remove_idx)
   removed_n <- sum(remove_idx)
@@ -506,16 +561,25 @@ apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_A
   removed_tbl <- data.frame(
     individual_id = missingness_tbl$ind_id[remove_idx],
     site = as.character(adegenet::pop(gi))[remove_idx],
+    missing_locus_count = missingness_tbl$missing_locus_count[remove_idx],
+    total_loci = missingness_tbl$total_loci[remove_idx],
     percent_missing = round(missingness_tbl$percent_missing[remove_idx] * 100, 2),
     removed_threshold = threshold * 100,
     stringsAsFactors = FALSE
   )
   removed_tbl <- removed_tbl[order(-removed_tbl$percent_missing, removed_tbl$site, removed_tbl$individual_id), , drop = FALSE]
   
-  removed_file <- file.path(output_dir, "individuals_removed_missing_gt35pct_allele_data.csv")
+  removed_file <- file.path(output_dir, "individuals_removed_missing_gt35pct_loci.csv")
   write.csv(removed_tbl, removed_file, row.names = FALSE)
+  qc_outputs <- write_missingness_qc_outputs(
+    missingness_tbl = missingness_tbl,
+    sites_before = as.character(adegenet::pop(gi)),
+    remove_idx = remove_idx,
+    threshold = threshold,
+    qc_dir = QC_DIR
+  )
   
-  cat("[00_master_pipeline] Missing-data filter (>35% missing allele data; applied before clonality):\n")
+  cat("[00_master_pipeline] Missing-data filter (>35% missing loci; applied before clonality):\n")
   cat("[00_master_pipeline] Individuals before filtering: ", adegenet::nInd(gi), "\n", sep = "")
   cat("[00_master_pipeline] Individuals removed: ", removed_n, "\n", sep = "")
   cat("[00_master_pipeline] Individuals retained: ", retained_n, "\n", sep = "")
@@ -531,6 +595,14 @@ apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_A
     cat("[00_master_pipeline] IDs removed: none\n")
   }
   cat("[00_master_pipeline] Removed-individual table saved to: ", removed_file, "\n", sep = "")
+  cat("[00_master_pipeline] QC summary saved to: ", file.path(QC_DIR, "main_missingness_filter_summary.csv"), "\n", sep = "")
+  cat("[00_master_pipeline] Site sample sizes saved to: ", file.path(QC_DIR, "site_sample_sizes_after_filtering.csv"), "\n", sep = "")
+  if (retained_n != 278L) {
+    warning(
+      "Updated poppr.xlsx did not produce 278 retained individuals at the 35% missingness threshold. Check outputs/qc/updated_poppr_missingness_check.csv.",
+      call. = FALSE
+    )
+  }
   
   gi_filtered <- gi[!remove_idx, , drop = TRUE]
   if (adegenet::nInd(gi_filtered) != retained_n) {
@@ -550,6 +622,7 @@ apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_A
     removed_ids = removed_tbl$individual_id,
     threshold = threshold,
     output_file = removed_file,
+    qc_outputs = qc_outputs,
     n_before = adegenet::nInd(gi),
     n_removed = removed_n,
     n_retained = retained_n
@@ -622,83 +695,48 @@ format_allele_to_3digits <- function(x) {
 detect_loci_spec <- function(tbl, id_col, pop_col) {
   protected_cols <- c(id_col, pop_col)
   protected_cols <- protected_cols[!is.na(protected_cols)]
+  nms <- setdiff(names(tbl), protected_cols)
   
-  candidate_cols <- setdiff(names(tbl), protected_cols)
-  allele_cols <- candidate_cols[grepl("(_|\\.)[12]$", candidate_cols, perl = TRUE)]
-  if ((length(allele_cols) %% 2) != 0) {
-    stop("[00_master_pipeline] Detected an odd number of allele columns (", length(allele_cols), "). Each locus must have exactly two allele columns.")
-  }
-  if (length(allele_cols) > 0) {
-    loci <- sub("(_|\\.)[12]$", "", allele_cols, perl = TRUE)
-    loci_tbl <- split(allele_cols, loci)
-    missing_pairs <- names(loci_tbl)[vapply(loci_tbl, function(cols) {
-      has1 <- any(grepl("(_|\\.)1$", cols, perl = TRUE))
-      has2 <- any(grepl("(_|\\.)2$", cols, perl = TRUE))
-      !(has1 && has2)
-    }, logical(1))]
-    
-    if (length(missing_pairs) > 0) {
-      stop("[00_master_pipeline] Some loci are missing one of the required allele columns (_1/_2 or .1/.2): ",
-           paste(head(missing_pairs, 20), collapse = ", "))
-    }
-    
-    ordered_loci <- unique(loci)
-    paired_tbl <- data.frame(
-      locus = ordered_loci,
-      a1_col = vapply(ordered_loci, function(loc) {
-        cols <- loci_tbl[[loc]]
-        cols[grepl("(_|\\.)1$", cols, perl = TRUE)][1]
-      }, character(1)),
-      a2_col = vapply(ordered_loci, function(loc) {
-        cols <- loci_tbl[[loc]]
-        cols[grepl("(_|\\.)2$", cols, perl = TRUE)][1]
-      }, character(1)),
-      stringsAsFactors = FALSE
-    )
-    return(list(kind = "paired", spec = paired_tbl))
+  allele_1 <- grep("(_|\\.)1$", nms, perl = TRUE, value = TRUE)
+  allele_2 <- grep("(_|\\.)2$", nms, perl = TRUE, value = TRUE)
+  loci1 <- sub("(_|\\.)1$", "", allele_1, perl = TRUE)
+  loci2 <- sub("(_|\\.)2$", "", allele_2, perl = TRUE)
+  loci <- sort(intersect(loci1, loci2))
+  
+  if (length(loci) == 0) {
+    stop("[00_master_pipeline] No paired allele columns were found for Genepop export.")
   }
   
-  single_cols <- candidate_cols[!grepl("(_|\\.)[12]$", candidate_cols, perl = TRUE)]
-  if (length(single_cols) == 0) {
-    stop("[00_master_pipeline] Could not detect genotype locus columns for Micro-Checker Genepop export.")
+  locus_pattern <- function(loc, suffix) {
+    paste0("^", gsub("([\\W])", "\\\\\\1", loc, perl = TRUE), "(_|\\\\.)", suffix, "$")
   }
   
-  looks_like_single_genotype <- function(x) {
-    x_chr <- trimws(as.character(x))
-    x_chr <- x_chr[nzchar(x_chr) & !(tolower(x_chr) %in% c("na", "n/a", "null", ".", "-", "?", "000000", "0", "-9"))]
-    if (length(x_chr) == 0) return(FALSE)
-    x_chr <- gsub("\\s+", "", x_chr, perl = TRUE)
-    patt <- "^[0-9]{1,3}[/|:;,._ -][0-9]{1,3}$|^[0-9]{6}$"
-    mean(grepl(patt, x_chr, perl = TRUE)) >= 0.8
-  }
-  
-  locus_like <- vapply(single_cols, function(col) looks_like_single_genotype(tbl[[col]]), logical(1))
-  single_loci <- single_cols[locus_like]
-  
-  if (length(single_loci) == 0) {
-    stop("[00_master_pipeline] Could not detect paired allele columns or single-column genotype loci.")
-  }
-  
-  list(
-    kind = "single",
-    spec = data.frame(
-      locus = single_loci,
-      geno_col = single_loci,
-      stringsAsFactors = FALSE
-    )
+  spec <- data.frame(
+    locus = loci,
+    a1_col = vapply(loci, function(loc) grep(locus_pattern(loc, "1"), names(tbl), perl = TRUE, value = TRUE)[1], character(1)),
+    a2_col = vapply(loci, function(loc) grep(locus_pattern(loc, "2"), names(tbl), perl = TRUE, value = TRUE)[1], character(1)),
+    stringsAsFactors = FALSE
   )
+  list(kind = "paired", spec = spec)
 }
 
 sanitize_genepop_id <- function(x) {
-  id <- trimws(as.character(x))
-  id <- gsub("[[:cntrl:]]", "", id)
-  id <- gsub(",", "_", id, fixed = TRUE)
-  id <- gsub("[[:space:]]+", "_", id, perl = TRUE)
-  id <- gsub("[^A-Za-z0-9_.-]", "_", id, perl = TRUE)
-  id <- gsub("_+", "_", id, perl = TRUE)
-  id <- gsub("^_+|_+$", "", id, perl = TRUE)
-  id[!nzchar(id)] <- "IND"
-  id
+  x <- trimws(as.character(x))
+  x[is.na(x) | !nzchar(x)] <- "sample"
+  x <- gsub(",", "_", x, fixed = TRUE)
+  x <- gsub("\\s+", "_", x)
+  x
+}
+
+make_unique_ids <- function(x) {
+  make.unique(x, sep = "_")
+}
+
+build_genepop_code_from_pair <- function(a1, a2) {
+  if (is_missing_allele_value(a1) || is_missing_allele_value(a2)) {
+    return("000000")
+  }
+  paste0(format_allele_to_3digits(a1), format_allele_to_3digits(a2))
 }
 
 parse_single_genotype_to_6digits <- function(x) {
@@ -706,126 +744,56 @@ parse_single_genotype_to_6digits <- function(x) {
     return("000000")
   }
   x_chr <- trimws(as.character(x))
-  x_chr <- gsub("\\s+", "", x_chr, perl = TRUE)
-  if (grepl("^[0-9]{6}$", x_chr)) {
-    return(x_chr)
+  parts <- unlist(strsplit(x_chr, "[/|:[:space:]-]+"))
+  parts <- parts[nzchar(parts)]
+  
+  if (length(parts) == 2) {
+    return(paste0(format_allele_to_3digits(parts[1]), format_allele_to_3digits(parts[2])))
   }
-  split_vals <- strsplit(x_chr, "[/|:;,._ -]", perl = TRUE)[[1]]
-  split_vals <- split_vals[nzchar(split_vals)]
-  if (length(split_vals) != 2) {
-    return("000000")
+  
+  x_digits <- gsub("[^0-9]", "", x_chr)
+  if (nchar(x_digits) == 6) {
+    return(x_digits)
   }
-  if (is_missing_allele_value(split_vals[1]) || is_missing_allele_value(split_vals[2])) {
-    return("000000")
-  }
-  paste0(
-    format_allele_to_3digits(split_vals[1]),
-    format_allele_to_3digits(split_vals[2])
-  )
+  
+  stop("[00_master_pipeline] Could not parse single-column genotype value for Genepop export: '", x_chr, "'.")
 }
 
-build_genepop_code_from_pair <- function(a1, a2) {
-  if (is_missing_allele_value(a1) || is_missing_allele_value(a2)) {
-    return("000000")
+format_microchecker_title_line <- function(title_line) {
+  title_line <- trimws(as.character(title_line)[1])
+  if (is.na(title_line) || !nzchar(title_line)) {
+    title_line <- "My Microsatellite Data - MICROC"
   }
-  paste0(
-    format_allele_to_3digits(a1),
-    format_allele_to_3digits(a2)
-  )
-}
-
-make_unique_ids <- function(ids) {
-  out <- ids
-  dup_groups <- split(seq_along(out), out)
-  for (g in dup_groups) {
-    if (length(g) <= 1) next
-    out[g] <- paste0(out[g], "_", seq_along(g))
-  }
-  out
+  gsub("\r|\n", " ", title_line)
 }
 
 build_genepop_lines <- function(title_line, locus_names, out_tbl) {
   lines <- c(title_line, locus_names)
   pop_order <- unique(out_tbl$pop)
-  for (p in pop_order) {
-    lines <- c(lines, "Pop")
-    sub <- out_tbl[out_tbl$pop == p, , drop = FALSE]
-    for (r in seq_len(nrow(sub))) {
-      geno_str <- paste(sub[r, locus_names, drop = TRUE], collapse = " ")
-      lines <- c(lines, paste0(sub$ind_id[r], ", ", geno_str))
+  
+  for (pp in pop_order) {
+    lines <- c(lines, "POP")
+    rows <- which(out_tbl$pop == pp)
+    for (i in rows) {
+      geno <- as.character(out_tbl[i, locus_names, drop = TRUE])
+      lines <- c(lines, paste0(out_tbl$ind_id[i], ", ", paste(geno, collapse = " ")))
     }
   }
+  
   lines
 }
 
-format_microchecker_title_line <- function(raw_title = "My Microsatellite Data - MICROC") {
-  title_clean <- trimws(as.character(raw_title))
-  title_clean <- gsub('"', "", title_clean, fixed = TRUE)
-  title_clean
-}
-
-validate_microchecker_genepop_lines <- function(lines, locus_names, title_line) {
-  if (length(lines) < (length(locus_names) + 2)) {
-    stop("[00_master_pipeline] Genepop validation failed: file content is too short.")
+validate_microchecker_genepop_lines <- function(genepop_lines, locus_names, title_line) {
+  if (length(genepop_lines) < length(locus_names) + 2) {
+    stop("[00_master_pipeline] Genepop export validation failed: output is too short.")
   }
-  
-  if (!identical(lines[1], title_line)) {
-    stop("[00_master_pipeline] Genepop validation failed: first line must exactly equal title line.")
+  if (!identical(genepop_lines[1], title_line)) {
+    stop("[00_master_pipeline] Genepop export validation failed: title line mismatch.")
   }
-  if (grepl("\t", lines[1], fixed = TRUE)) {
-    stop("[00_master_pipeline] Genepop validation failed: title line must not contain tabs.")
+  if (!any(toupper(genepop_lines) == "POP")) {
+    stop("[00_master_pipeline] Genepop export validation failed: no POP blocks found.")
   }
-  
-  expected_locus_lines <- lines[seq_len(length(locus_names)) + 1]
-  if (!identical(expected_locus_lines, locus_names)) {
-    stop("[00_master_pipeline] Genepop validation failed: locus lines do not match expected locus order.")
-  }
-  if (any(grepl(",", expected_locus_lines, fixed = TRUE))) {
-    stop("[00_master_pipeline] Genepop validation failed: locus lines must not contain commas.")
-  }
-  
-  data_lines <- lines[-seq_len(length(locus_names) + 1)]
-  if (length(data_lines) == 0 || !any(data_lines == "Pop")) {
-    stop("[00_master_pipeline] Genepop validation failed: at least one 'Pop' line is required.")
-  }
-  
-  expected_locus_count <- NA_integer_
-  for (ln in data_lines) {
-    if (identical(ln, "Pop")) next
-    if (grepl("^Pop\\S", ln)) {
-      stop("[00_master_pipeline] Genepop validation failed: population separators must be exactly 'Pop'. Bad line: ", ln)
-    }
-    if (grepl("\t", ln, fixed = TRUE)) {
-      stop("[00_master_pipeline] Genepop validation failed: tabs are not allowed in data lines.")
-    }
-    if (grepl("^\\s|\\s$", ln, perl = TRUE)) {
-      stop("[00_master_pipeline] Genepop validation failed: no leading/trailing spaces are allowed in data lines. Bad line: ", ln)
-    }
-    if (length(gregexpr(",", ln, fixed = TRUE)[[1]]) != 1) {
-      stop("[00_master_pipeline] Genepop validation failed: each individual line must contain exactly one comma. Bad line: ", ln)
-    }
-    if (!grepl("^[^,]+, [0-9]{6}( [0-9]{6})*$", ln, perl = TRUE)) {
-      stop("[00_master_pipeline] Genepop validation failed: each individual line must follow 'ID, 000000 ...' with one space separators. Bad line: ", ln)
-    }
-    split_line <- strsplit(ln, ", ", fixed = TRUE)[[1]]
-    if (length(split_line) != 2) {
-      stop("[00_master_pipeline] Genepop validation failed: each individual line must follow 'ID, code code ...'. Bad line: ", ln)
-    }
-    geno_codes <- strsplit(split_line[2], " ", fixed = TRUE)[[1]]
-    if (length(geno_codes) != length(locus_names)) {
-      stop("[00_master_pipeline] Genepop validation failed: genotype count does not match locus count. Bad line: ", ln)
-    }
-    if (!all(grepl("^[0-9]{6}$", geno_codes))) {
-      stop("[00_master_pipeline] Genepop validation failed: each locus code must be exactly 6 digits. Bad line: ", ln)
-    }
-    if (is.na(expected_locus_count)) {
-      expected_locus_count <- length(geno_codes)
-    } else if (!identical(length(geno_codes), expected_locus_count)) {
-      stop("[00_master_pipeline] Genepop validation failed: inconsistent number of loci across individuals. Bad line: ", ln)
-    }
-  }
-  
-  TRUE
+  invisible(TRUE)
 }
 
 write_microchecker_genepop_export <- function(tbl,
@@ -969,7 +937,6 @@ write_microchecker_genepop_export <- function(tbl,
   ))
 }
 
-
 build_objects <- function() {
   scanned <- scan_sources()
   
@@ -999,7 +966,7 @@ build_objects <- function() {
   # Publication-defensible QC step:
   # calculate per-individual missingness from the original paired allele
   # columns (2 alleles per locus), then remove only those individuals whose
-  # missing allele proportion is strictly greater than 35% before clonality.
+  # missing locus proportion is strictly greater than 35% before clonality.
   missing_filter <- apply_missing_data_filter(
     gi = gi_unfiltered,
     missingness_tbl = built$missingness,
@@ -1027,9 +994,12 @@ build_objects <- function() {
   df_ids <- data.frame(
     ind_id = gi_ids,
     Site = as.character(adegenet::pop(gi)),
+    missing_locus_count = retained_missingness$missing_locus_count,
+    total_loci = retained_missingness$total_loci,
+    percent_missing_loci = retained_missingness$percent_missing,
     missing_allele_count = retained_missingness$missing_allele_count,
     total_alleles_expected = retained_missingness$total_alleles_expected,
-    percent_missing_allele_data = retained_missingness$percent_missing,
+    percent_missing_allele_data = retained_missingness$percent_missing_allele_data,
     missing_data_filter_threshold = missing_filter$threshold,
     MLG = mll_build$mlg_labels,
     MLL = mll_build$mll_labels,
@@ -1068,7 +1038,7 @@ build_objects <- function() {
             paste(head(missing_in_gi_before_filter, 20), collapse = ", "))
   }
   message("[00_master_pipeline] Individuals removed for >", MISSING_ALLELE_FILTER_THRESHOLD * 100,
-          "% missing allele data: ", missing_filter$n_removed)
+          "% missing loci: ", missing_filter$n_removed)
   message("[00_master_pipeline] Canonical metadata IDs absent from final filtered gi: ", length(missing_in_gi_after_filter))
   if (length(missing_in_gi_after_filter) > 0) {
     message("[00_master_pipeline] Final absent ID examples (up to 20): ",

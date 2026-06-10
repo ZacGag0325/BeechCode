@@ -152,6 +152,35 @@ gi_mll <- readRDS(file.path(OBJ_DIR, "gi_mll.rds"))
 df_ids <- readRDS(file.path(OBJ_DIR, "df_ids.rds"))
 meta   <- readRDS(file.path(OBJ_DIR, "meta.rds"))
 
+qc_summary_file <- file.path(PROJECT_ROOT, "outputs", "qc", "main_missingness_filter_summary.csv")
+if (!file.exists(qc_summary_file)) {
+  warning(
+    "[_load_objects] Missing outputs/qc/main_missingness_filter_summary.csv. ",
+    "Run scripts/00_master_pipeline.R to regenerate canonical objects from the updated poppr.xlsx before downstream analyses.",
+    call. = FALSE
+  )
+} else {
+  qc_summary <- tryCatch(read.csv(qc_summary_file, stringsAsFactors = FALSE), error = function(e) NULL)
+  if (!is.null(qc_summary) && nrow(qc_summary) > 0 && "total_individuals_retained" %in% names(qc_summary)) {
+    expected_n <- suppressWarnings(as.integer(qc_summary$total_individuals_retained[1]))
+    if (is.finite(expected_n) && adegenet::nInd(gi) != expected_n) {
+      warning(
+        "[_load_objects] Loaded gi.rds has nInd=", adegenet::nInd(gi),
+        " but QC summary reports retained n=", expected_n,
+        ". Run scripts/00_master_pipeline.R to regenerate objects from the updated poppr.xlsx.",
+        call. = FALSE
+      )
+    }
+  }
+}
+if (!("percent_missing_loci" %in% names(df_ids))) {
+  warning(
+    "[_load_objects] df_ids.rds does not contain percent_missing_loci. ",
+    "It may be an older object from before the updated missing-locus filter; run scripts/00_master_pipeline.R.",
+    call. = FALSE
+  )
+}
+
 df_ids_cols <- resolve_df_ids_columns(df_ids, context = "[_load_objects]", require = TRUE)
 validate_columns(df_ids, c(df_ids_cols$id_col, df_ids_cols$site_col), df_name = "[_load_objects] df_ids")
 if (anyDuplicated(normalize_id(df_ids[[df_ids_cols$id_col]]))) {

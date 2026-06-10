@@ -345,7 +345,7 @@ build_genind <- function(geno_raw, locus_pairs) {
   
   for (i in seq_len(nrow(locus_pairs))) {
     locus <- locus_pairs$locus[i]
-    locus_safe <- ifelse(locus == "FS1-15F", "FS1.15F", locus)
+    locus_safe <- janitor::make_clean_names(locus)
     a1 <- str_trim(as.character(geno_raw[[locus_pairs$allele_1_col[i]]]))
     a2 <- str_trim(as.character(geno_raw[[locus_pairs$allele_2_col[i]]]))
     miss <- is_missing_allele(a1) | is_missing_allele(a2)

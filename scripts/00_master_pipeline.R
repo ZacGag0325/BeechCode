@@ -558,16 +558,28 @@ apply_missing_data_filter <- function(gi, missingness_tbl, threshold = MISSING_A
     )
   }
   
-  removed_tbl <- data.frame(
-    individual_id = missingness_tbl$ind_id[remove_idx],
-    site = as.character(adegenet::pop(gi))[remove_idx],
-    missing_locus_count = missingness_tbl$missing_locus_count[remove_idx],
-    total_loci = missingness_tbl$total_loci[remove_idx],
-    percent_missing = round(missingness_tbl$percent_missing[remove_idx] * 100, 2),
-    removed_threshold = threshold * 100,
-    stringsAsFactors = FALSE
-  )
-  removed_tbl <- removed_tbl[order(-removed_tbl$percent_missing, removed_tbl$site, removed_tbl$individual_id), , drop = FALSE]
+  if (removed_n > 0) {
+    removed_tbl <- data.frame(
+      individual_id = missingness_tbl$ind_id[remove_idx],
+      site = as.character(adegenet::pop(gi))[remove_idx],
+      missing_locus_count = missingness_tbl$missing_locus_count[remove_idx],
+      total_loci = missingness_tbl$total_loci[remove_idx],
+      percent_missing = round(missingness_tbl$percent_missing[remove_idx] * 100, 2),
+      removed_threshold = rep(threshold * 100, removed_n),
+      stringsAsFactors = FALSE
+    )
+    removed_tbl <- removed_tbl[order(-removed_tbl$percent_missing, removed_tbl$site, removed_tbl$individual_id), , drop = FALSE]
+  } else {
+    removed_tbl <- data.frame(
+      individual_id = character(0),
+      site = character(0),
+      missing_locus_count = integer(0),
+      total_loci = integer(0),
+      percent_missing = numeric(0),
+      removed_threshold = numeric(0),
+      stringsAsFactors = FALSE
+    )
+  }
   
   removed_file <- file.path(output_dir, "individuals_removed_missing_gt35pct_loci.csv")
   write.csv(removed_tbl, removed_file, row.names = FALSE)

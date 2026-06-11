@@ -443,15 +443,23 @@ write_word_table <- function(results) {
 }
 
 save_plot_both <- function(plot, basename, width = 7, height = 5) {
-  ggplot2::ggsave(file.path(OUTPUT_DIR, paste0(basename, ".pdf")), plot, width = width, height = height, device = cairo_pdf)
-  ggplot2::ggsave(file.path(OUTPUT_DIR, paste0(basename, ".png")), plot, width = width, height = height, dpi = 300)
+  dir.create(OUTPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+  pdf_file <- file.path(OUTPUT_DIR, paste0(basename, ".pdf"))
+  png_file <- file.path(OUTPUT_DIR, paste0(basename, ".png"))
+  
+  ggplot2::ggsave(pdf_file, plot, width = width, height = height, device = "pdf")
+  ggplot2::ggsave(png_file, plot, width = width, height = height, dpi = 300)
+  
+  c(pdf_file, png_file)
 }
 
 make_figures <- function(results) {
-  plot_data <- results %>% mutate(
-    connection_observed = factor(connection_observed, levels = c("yes", "no", "unclear")),
-    clone_call = factor(clone_call, levels = c("clone", "not_clone", "uncertain"))
-  )
+  plot_data <- results %>%
+    filter(!is.na(bruvo_distance)) %>%
+    mutate(
+      connection_observed = factor(connection_observed, levels = c("yes", "no", "unclear")),
+      clone_call = factor(clone_call, levels = c("clone", "not_clone", "uncertain"))
+    )
   
   theme_exc <- theme_bw(base_size = 12) +
     theme(panel.grid.minor = element_blank(), legend.position = "right")
@@ -461,30 +469,35 @@ make_figures <- function(results) {
     scale_x_discrete(drop = FALSE) +
     labs(x = "Field-observed underground connection", y = "Number of excavated pairs", fill = "Genetic result") +
     theme_exc
-  save_plot_both(fig1, "excavation_connection_vs_clone_call")
+  figure_files <- save_plot_both(fig1, "excavation_connection_vs_clone_call")
   
   fig2 <- ggplot(plot_data, aes(x = connection_observed, y = bruvo_distance)) +
     geom_point(aes(color = clone_call), position = position_jitter(width = 0.08, height = 0), size = 2.5, alpha = 0.85) +
     scale_x_discrete(drop = FALSE) +
     labs(x = "Field-observed underground connection", y = "Bruvo distance", color = "Genetic result") +
     theme_exc
-  enough_for_boxplot <- plot_data %>% filter(!is.na(bruvo_distance)) %>% count(connection_observed) %>% filter(n >= 2) %>% nrow() > 0
+  enough_for_boxplot <- plot_data %>% count(connection_observed) %>% filter(n >= 2) %>% nrow() > 0
   if (enough_for_boxplot) {
     fig2 <- fig2 + geom_boxplot(aes(group = connection_observed), width = 0.45, alpha = 0.25, outlier.shape = NA)
   }
-  save_plot_both(fig2, "excavation_bruvo_distance_by_connection")
+  figure_files <- c(figure_files, save_plot_both(fig2, "excavation_bruvo_distance_by_connection"))
   
   fig3 <- ggplot(plot_data, aes(x = distance_m, y = bruvo_distance, color = connection_observed, shape = connection_observed)) +
     geom_point(size = 2.7, alpha = 0.85) +
     labs(x = "Physical distance between stems (m)", y = "Bruvo distance", color = "Connection", shape = "Connection") +
     theme_exc
-  save_plot_both(fig3, "excavation_bruvo_distance_by_physical_distance")
+  figure_files <- c(figure_files, save_plot_both(fig3, "excavation_bruvo_distance_by_physical_distance"))
   
   fig4 <- ggplot(plot_data, aes(x = clone_call, y = distance_m, color = connection_observed)) +
     geom_point(position = position_jitter(width = 0.08, height = 0), size = 2.7, alpha = 0.85) +
     labs(x = "Clone call", y = "Physical distance between stems (m)", color = "Connection") +
     theme_exc
-  save_plot_both(fig4, "excavation_clone_call_by_distance")
+  figure_files <- c(figure_files, save_plot_both(fig4, "excavation_clone_call_by_distance"))
+  
+  cat("\n[excavation_validation] Figure files written:\n")
+  cat(paste0("- ", figure_files, collapse = "\n"), "\n", sep = "")
+  
+  invisible(figure_files)
 }
 
 write_summaries <- function(results) {

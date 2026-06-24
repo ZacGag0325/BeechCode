@@ -11,10 +11,41 @@ library(tibble)
 # Paths
 # -----------------------------
 
-scopus_dir <- file.path("data", "lit_review", "scopus_exports")
-screening_dir <- file.path("data", "lit_review", "screening")
-coding_dir <- file.path("data", "lit_review", "coding")
-output_table_dir <- file.path("outputs", "lit_review", "tables")
+get_script_path <- function() {
+  frame_files <- map_chr(sys.frames(), ~ {
+    ofile <- .x$ofile
+    if (is.null(ofile)) {
+      NA_character_
+    } else {
+      as.character(ofile)[1]
+    }
+  })
+  frame_files <- frame_files[!is.na(frame_files) & frame_files != ""]
+  
+  if (length(frame_files) > 0) {
+    return(normalizePath(frame_files[length(frame_files)], winslash = "/", mustWork = FALSE))
+  }
+  
+  command_file <- commandArgs(trailingOnly = FALSE)
+  file_arg <- command_file[str_detect(command_file, "^--file=")]
+  if (length(file_arg) > 0) {
+    return(normalizePath(str_remove(file_arg[1], "^--file="), winslash = "/", mustWork = FALSE))
+  }
+  
+  NA_character_
+}
+
+script_path <- get_script_path()
+project_root <- if (!is.na(script_path)) {
+  normalizePath(file.path(dirname(script_path), "..", ".."), winslash = "/", mustWork = FALSE)
+} else {
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+}
+
+scopus_dir <- file.path(project_root, "data", "lit_review", "scopus_exports")
+screening_dir <- file.path(project_root, "data", "lit_review", "screening")
+coding_dir <- file.path(project_root, "data", "lit_review", "coding")
+output_table_dir <- file.path(project_root, "outputs", "lit_review", "tables")
 
 walk(
   c(scopus_dir, screening_dir, coding_dir, output_table_dir),
@@ -48,6 +79,10 @@ print_scopus_diagnostics <- function() {
   found_files <- list.files(scopus_dir, full.names = FALSE, all.files = FALSE)
   
   message("Current working directory: ", normalizePath(getwd(), winslash = "/", mustWork = FALSE))
+  if (!is.na(script_path)) {
+    message("Script path: ", script_path)
+  }
+  message("Project root used by script: ", project_root)
   message(
     "Expected Scopus folder path: ",
     normalizePath(scopus_dir, winslash = "/", mustWork = FALSE)

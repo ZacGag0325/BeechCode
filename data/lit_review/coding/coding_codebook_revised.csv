@@ -1,0 +1,21 @@
+field,allowed_value_or_score,description
+root_treatment_score,0,Root suckering / clonality not mentioned.
+root_treatment_score,1,Brief mention only.
+root_treatment_score,2,Discussed as background/context.
+root_treatment_score,3,"Framed as important, common, dominant, or problematic."
+root_treatment_score,4,Empirically measured.
+root_treatment_score,5,Genetically or physically validated.
+seed_treatment_score,0,Seed recruitment not mentioned.
+seed_treatment_score,1,Brief mention only.
+seed_treatment_score,2,Discussed as background/context.
+seed_treatment_score,3,"Framed as important, common, dominant, or limiting."
+seed_treatment_score,4,Empirically measured.
+seed_treatment_score,5,Genetically/parentage-validated sexual recruitment.
+main_regeneration_frame,free text,"Coder summary of whether the article frames regeneration mainly as root suckering/clonality, seed recruitment, both, neither, or uncertain."
+root_terms_present,yes/no/unclear,"Whether root suckering, sprouting, clonal, proliferation, ramet, genet, or equivalent root-origin terms appear."
+seed_terms_present,yes/no/unclear,"Whether seed, seedling, sexual recruitment, parentage, germination, mast, or equivalent seed-origin terms appear."
+does_article_assume_suckering,yes/no/unclear,Whether the article assumes stems/regeneration are suckers without validation.
+does_article_distinguish_seed_vs_sucker,yes/no/unclear,Whether the article explicitly separates seed-origin and sucker-origin regeneration.
+compares_seed_and_sucker,yes/no/unclear,Whether the article compares seed recruitment with root suckering/clonal regeneration.
+genetic_validation,yes/no/unclear,"Whether genetic, parentage, marker, or clonality analyses validate origin."
+physical_validation,yes/no/unclear,"Whether excavation, root tracing, or direct physical evidence validates origin."

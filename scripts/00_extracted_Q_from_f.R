@@ -7,21 +7,51 @@
 suppressPackageStartupMessages(library(here))
 
 FALLBACK_ROOT <- file.path(path.expand("~"), "Desktop", "BeechCode")
-candidate_root <- here::here()
 
-if (dir.exists(file.path(candidate_root, "data", "raw"))) {
-  PROJECT_ROOT <- candidate_root
-} else if (dir.exists(file.path(FALLBACK_ROOT, "data", "raw"))) {
-  PROJECT_ROOT <- FALLBACK_ROOT
-  setwd(PROJECT_ROOT)
-} else {
+normalize_root_candidate <- function(path) {
+  vapply(path, function(one_path) {
+    one_path <- normalizePath(one_path, mustWork = FALSE)
+    # If R/here accidentally gives the .Rproj path as the root, step back to the
+    # containing project directory before appending data/ or outputs/ paths.
+    if (grepl("\\.Rproj(/|$)", one_path, ignore.case = TRUE)) {
+      rproj_path <- sub("^(.*?\\.Rproj)(/.*)?$", "\\1", one_path, ignore.case = TRUE)
+      one_path <- dirname(rproj_path)
+    }
+    one_path
+  }, character(1), USE.NAMES = FALSE)
+}
+
+find_project_root_for_extractor <- function() {
+  source_file <- tryCatch(normalizePath(sys.frames()[[1]]$ofile, mustWork = FALSE), error = function(e) NA_character_)
+  candidates <- c(
+    if (!is.na(source_file)) dirname(dirname(source_file)) else character(0),
+    FALLBACK_ROOT,
+    getwd(),
+    here::here()
+  )
+  candidates <- unique(normalize_root_candidate(candidates))
+  
+  for (candidate in candidates) {
+    if (grepl("\\.Rproj$", basename(candidate), ignore.case = TRUE)) next
+    if (dir.exists(file.path(candidate, "data", "raw")) ||
+        file.exists(file.path(candidate, "scripts", "00_extract_Q_from_f.R")) ||
+        file.exists(file.path(candidate, "scripts", "00_extracted_Q_from_f.R"))) {
+      return(candidate)
+    }
+  }
+  
   stop(
     "Can't find project root.\n",
-    "Expected to find a folder with data/raw.\n\n",
-    "Tried:\n  - ", candidate_root, "\n  - ", FALLBACK_ROOT, "\n\n",
-    "Fix: open your BeechCode.Rproj OR change FALLBACK_ROOT to your actual folder."
+    "Expected a folder containing data/raw or the BeechCode scripts directory.\n\n",
+    "Tried:\n  - ", paste(candidates, collapse = "\n  - "), "\n\n",
+    "Fix: open your BeechCode.Rproj, source this script from inside the project, ",
+    "or change FALLBACK_ROOT to your actual folder.",
+    call. = FALSE
   )
 }
+
+PROJECT_ROOT <- find_project_root_for_extractor()
+setwd(PROJECT_ROOT)
 
 OUTPUTS_DIR <- file.path(PROJECT_ROOT, "outputs")
 RUN_TAG <- "v1"

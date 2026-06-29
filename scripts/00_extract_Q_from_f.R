@@ -1,8 +1,8 @@
 ############################################################
 # 00_extract_Q_from_f.R  (BeechCode)
 # Batch extract Q matrices from STRUCTURE *_f files (mac-safe)
-# Input:  outputs/v1/structure_runs/STRUCTURE_ZG_HEG-results/**/_f
-# Output: outputs/v1/structure_runs/Q_extracted/*.Q  + summary CSV
+# Input:  configured STRUCTURE run folder, e.g. data/structure/HEG_ZG_run2/**/_f
+# Output: data/structure/Q_Files_2/*.Q  + summary CSV
 ############################################################
 
 ### 0) PROJECT ROOT + PATHS (ROBUST) ----
@@ -29,19 +29,36 @@ OUTPUTS_DIR <- file.path(PROJECT_ROOT, "outputs")
 RUN_TAG <- "v1"
 RUN_OUT <- file.path(OUTPUTS_DIR, RUN_TAG)
 
-STRUCTURE_RUNS_DIR <- file.path(RUN_OUT, "structure_runs")
-RESULTS_DIR <- file.path(STRUCTURE_RUNS_DIR, "STRUCTURE_ZG_HEG-results")
+STRUCTURE_RUN_NAME <- "HEG_ZG_run2"
+Q_FOLDER_NAME <- "Q_Files_2"
 
-if (!dir.exists(RESULTS_DIR)) {
-  stop("RESULTS_DIR not found:\n  ", RESULTS_DIR,
-       "\n\nCheck spelling/case in Finder and update RESULTS_DIR if needed.")
+STRUCTURE_RUNS_DIR <- file.path(RUN_OUT, "structure_runs")
+
+find_structure_results_dir <- function(structure_run_name = STRUCTURE_RUN_NAME) {
+  candidates <- c(
+    file.path(PROJECT_ROOT, "data", "structure", structure_run_name),
+    file.path(PROJECT_ROOT, "outputs", "v1", "structure_runs", structure_run_name)
+  )
+  hit <- candidates[dir.exists(candidates)]
+  if (length(hit) == 0) {
+    stop(
+      "Could not find configured STRUCTURE results folder for run '", structure_run_name, "'.\n",
+      "Looked for:\n  - ", paste(candidates, collapse = "\n  - "),
+      call. = FALSE
+    )
+  }
+  hit[1]
 }
 
 message("Project root: ", PROJECT_ROOT)
-message("Using RESULTS_DIR: ", RESULTS_DIR)
+message("Configured STRUCTURE_RUN_NAME: ", STRUCTURE_RUN_NAME)
+message("Configured Q_FOLDER_NAME: ", Q_FOLDER_NAME)
+
+RESULTS_DIR <- find_structure_results_dir()
+message("Using raw STRUCTURE folder: ", RESULTS_DIR)
 
 # Where extracted Q files will go
-Q_OUT_DIR <- file.path(STRUCTURE_RUNS_DIR, "Q_extracted")
+Q_OUT_DIR <- file.path(PROJECT_ROOT, "data", "structure", Q_FOLDER_NAME)
 dir.create(Q_OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 message("Q files will be written to: ", Q_OUT_DIR)
 
@@ -132,7 +149,7 @@ guess_K_from_name <- function(f) {
 
 ### 2) Find *_f files ----
 f_files <- list.files(RESULTS_DIR, recursive = TRUE, full.names = TRUE, pattern = "_f$")
-message("Found ", length(f_files), " *_f files")
+message("Found ", length(f_files), " *_f files in raw STRUCTURE folder")
 
 if (length(f_files) == 0) {
   stop("No files ending in '_f' found under:\n  ", RESULTS_DIR)
@@ -200,6 +217,9 @@ if (ok_count > 0) {
   tab <- sort(table(results$K_detected[results$ok]))
   message("Counts per K (detected from Q matrices):")
   print(tab)
+  row_tab <- sort(table(results$n_inds[results$ok]))
+  message("Detected Q row counts across successful files:")
+  print(row_tab)
 }
 
 message("All extracted Q files are in: ", Q_OUT_DIR)

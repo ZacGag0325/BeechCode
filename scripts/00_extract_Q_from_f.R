@@ -11,13 +11,15 @@ suppressPackageStartupMessages(library(here))
 FALLBACK_ROOT <- file.path(path.expand("~"), "Desktop", "BeechCode")
 
 normalize_root_candidate <- function(path) {
-  path <- normalizePath(path, mustWork = FALSE)
-  # If R/here accidentally gives the .Rproj path as the root, step back to the
-  # containing project directory before appending data/ or outputs/ paths.
-  if (grepl("\\.Rproj$", basename(path), ignore.case = TRUE)) {
-    path <- dirname(path)
-  }
-  path
+  vapply(path, function(one_path) {
+    one_path <- normalizePath(one_path, mustWork = FALSE)
+    # If R/here accidentally gives the .Rproj path as the root, step back to the
+    # containing project directory before appending data/ or outputs/ paths.
+    if (grepl("\\.Rproj$", basename(one_path), ignore.case = TRUE)) {
+      one_path <- dirname(one_path)
+    }
+    one_path
+  }, character(1), USE.NAMES = FALSE)
 }
 
 find_project_root_for_extractor <- function() {

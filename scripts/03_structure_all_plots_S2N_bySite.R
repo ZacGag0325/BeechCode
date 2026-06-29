@@ -48,6 +48,25 @@ suppressPackageStartupMessages({
 
 source("scripts/_load_objects.R")
 
+STRUCTURE_Q_FOLDER_NAME <- "Q_Files_2"
+STRUCTURE_RESULTS_FOLDER_NAME <- "HEG_ZG_run2"
+
+find_structure_results_dir <- function(structure_results_folder_name = STRUCTURE_RESULTS_FOLDER_NAME) {
+  candidates <- c(
+    file.path(PROJECT_ROOT, "data", "structure", structure_results_folder_name),
+    file.path(PROJECT_ROOT, "outputs", "v1", "structure_runs", structure_results_folder_name)
+  )
+  hit <- candidates[dir.exists(candidates)]
+  if (length(hit) == 0) {
+    message(
+      "[03_structure] Configured raw STRUCTURE folder not found for '",
+      structure_results_folder_name,
+      "'. Looked for: ", paste(candidates, collapse = " | ")
+    )
+    return(NA_character_)
+  }
+  hit[1]
+}
 
 cluster_colors <- c(
   Q1 = "#1b9e77",
@@ -1137,13 +1156,15 @@ load_ids_order_from_raw <- function() {
 }
 
 extract_structure_order_from_results <- function() {
-  res_dir <- file.path(PROJECT_ROOT, "data", "structure", "STRUCTURE_ZG_HEG-results")
-  if (!dir.exists(res_dir)) {
+  res_dir <- find_structure_results_dir()
+  if (is.na(res_dir) || !dir.exists(res_dir)) {
     return(list(ids = character(0), pop = integer(0), source = "STRUCTURE results (missing)"))
   }
+  message("[03_structure] Using raw STRUCTURE folder for individual order: ", res_dir)
   
-  files <- list.files(res_dir, full.names = TRUE)
+  files <- list.files(res_dir, recursive = TRUE, full.names = TRUE, pattern = "_f$")
   files <- files[file.info(files)$isdir %in% FALSE]
+  message("[03_structure] Found ", length(files), " raw STRUCTURE _f files for individual-order recovery")
   if (length(files) == 0) {
     return(list(ids = character(0), pop = integer(0), source = "STRUCTURE results (empty)"))
   }
@@ -1181,14 +1202,8 @@ extract_structure_order_from_results <- function() {
 # ----------------------------
 # 2) Q file discovery
 # ----------------------------
-find_q_files <- function() {
-  q_root <- file.path(PROJECT_ROOT, "data", "structure", "Q_Files")
-  if (!dir.exists(q_root)) {
-    q_root_alt <- file.path(PROJECT_ROOT, "data", "structure", "Q_files")
-    if (dir.exists(q_root_alt)) q_root <- q_root_alt
-  }
-  
-  message("[03_structure] Searching folder: ", q_root)
+find_q_files <- function(q_root = file.path(PROJECT_ROOT, "data", "structure", STRUCTURE_Q_FOLDER_NAME)) {
+  message("[03_structure] Reading Q files from configured folder: ", q_root)
   
   if (!dir.exists(q_root)) {
     return(list(root = q_root, files = character(0), ignored = character(0)))
@@ -1223,6 +1238,7 @@ ids_order_raw <- load_ids_order_from_raw()
 ids_results <- extract_structure_order_from_results()
 
 scan <- find_q_files()
+message("[03_structure] Found ", length(scan$files), " Q candidate files/runs")
 if (length(scan$ignored) > 0) message("[03_structure] Ignored helper files: ", length(scan$ignored))
 
 if (length(scan$files) == 0) {
@@ -1231,6 +1247,8 @@ if (length(scan$files) == 0) {
 } else {
   parsed_candidates <- list()
   run_inventory <- list()
+  detected_k_values <- integer(0)
+  detected_row_counts <- integer(0)
   
   for (f in scan$files) {
     meta_name <- extract_k_run(f)
@@ -1250,6 +1268,8 @@ if (length(scan$files) == 0) {
     
     q_mat <- parsed$matrix
     K_detected <- ncol(q_mat)
+    detected_k_values <- c(detected_k_values, K_detected)
+    detected_row_counts <- c(detected_row_counts, nrow(q_mat))
     K_final <- if (!is.na(meta_name$K)) meta_name$K else K_detected
     if (!is.na(meta_name$K) && meta_name$K != K_detected) K_final <- K_detected
     
@@ -1299,6 +1319,11 @@ if (length(scan$files) == 0) {
         mad = row_dev
       )
     }
+  }
+  
+  if (length(detected_k_values) > 0) {
+    message("[03_structure] Detected K values among parsed Q files: ", paste(sort(unique(detected_k_values)), collapse = ", "))
+    message("[03_structure] Detected Q row counts among parsed Q files: ", paste(sort(unique(detected_row_counts)), collapse = ", "))
   }
   
   if (length(run_inventory) > 0) {

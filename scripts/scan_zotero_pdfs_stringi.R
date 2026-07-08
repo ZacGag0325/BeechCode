@@ -42,8 +42,20 @@ library(stringr)
 
 script_path <- tryCatch(normalizePath(sys.frame(1)$ofile, mustWork = TRUE), error = function(e) NA_character_)
 
-ancestor_dirs <- function(path) {
+normalize_start_dir <- function(path) {
   path <- normalizePath(path, mustWork = FALSE)
+  
+  # If R/RStudio hands us a file path, such as BeechCode.Rproj or this script,
+  # start from its containing folder rather than treating the file as a folder.
+  if (file.exists(path) && !dir.exists(path)) {
+    path <- dirname(path)
+  }
+  
+  path
+}
+
+ancestor_dirs <- function(path) {
+  path <- normalize_start_dir(path)
   dirs <- character(0)
   
   repeat {
@@ -65,13 +77,14 @@ find_repo_root <- function() {
   }
   
   candidate_roots <- unique(unlist(purrr::map(candidate_starts, ancestor_dirs)))
+  candidate_roots <- candidate_roots[!grepl("\\.Rproj$", candidate_roots)]
   matches <- candidate_roots[file.exists(file.path(candidate_roots, "data/lit_review"))]
   
   if (length(matches) > 0) {
     return(matches[[1]])
   }
   
-  normalizePath(getwd(), mustWork = FALSE)
+  normalize_start_dir(getwd())
 }
 
 repo_root <- find_repo_root()
@@ -142,9 +155,9 @@ term_groups <- list(
 )
 
 escape_regex <- function(x) {
-  # stringi does not export a regex-escape helper in all installed versions,
-  # so escape regex metacharacters locally before building the term pattern.
-  stringr::str_replace_all(x, "([][{}()+*^$|\\.?])", "\\\\\\1")
+  # stringi/stringr regex escaping differs across installed versions. Use base R
+  # with PCRE here so term-pattern construction works consistently.
+  gsub("([][{}()+*^$|\\.?])", "\\\\\\1", x, perl = TRUE)
 }
 
 make_regex <- function(terms) {

@@ -1,8 +1,12 @@
 # Scan exported Zotero PDFs for beech regeneration, root suckering,
 # clonality, seed recruitment, validation, disease, and management terms.
 #
-# Run from the root of the BeechCode repository with:
+# Run from the BeechCode repository with:
 # source("scripts/lit_review/scan_zotero_pdfs_stringi.R")
+#
+# If you copy this file to scripts/scan_zotero_pdfs_stringi.R, it will also
+# try to find the repository root from the script location so relative paths
+# still resolve correctly.
 #
 # IMPORTANT: All scores and yes/no fields created here are automatic
 # suggestions for triage only. They must be manually verified against the
@@ -36,15 +40,60 @@ library(tibble)
 library(readr)
 library(stringr)
 
-zotero_pdf_dir <- "data/lit_review/Beech_zotero_export"
-output_dir <- "outputs/lit_review"
+script_path <- tryCatch(normalizePath(sys.frame(1)$ofile, mustWork = TRUE), error = function(e) NA_character_)
+
+ancestor_dirs <- function(path) {
+  path <- normalizePath(path, mustWork = FALSE)
+  dirs <- character(0)
+  
+  repeat {
+    dirs <- c(dirs, path)
+    parent <- dirname(path)
+    if (identical(parent, path)) {
+      break
+    }
+    path <- parent
+  }
+  
+  unique(dirs)
+}
+
+find_repo_root <- function() {
+  candidate_starts <- c(getwd())
+  if (!is.na(script_path)) {
+    candidate_starts <- c(candidate_starts, dirname(script_path))
+  }
+  
+  candidate_roots <- unique(unlist(purrr::map(candidate_starts, ancestor_dirs)))
+  matches <- candidate_roots[file.exists(file.path(candidate_roots, "data/lit_review"))]
+  
+  if (length(matches) > 0) {
+    return(matches[[1]])
+  }
+  
+  normalizePath(getwd(), mustWork = FALSE)
+}
+
+repo_root <- find_repo_root()
+path_from_root <- function(...) file.path(repo_root, ...)
+
+zotero_pdf_dir_options <- c(
+  path_from_root("data/lit_review/Beech_zotero_export"),
+  path_from_root("data/lit_review/Beech_Zotero_export")
+)
+zotero_pdf_dir <- zotero_pdf_dir_options[dir.exists(zotero_pdf_dir_options)][1]
+if (is.na(zotero_pdf_dir)) {
+  zotero_pdf_dir <- zotero_pdf_dir_options[[1]]
+}
+
+output_dir <- path_from_root("outputs/lit_review")
 pdf_scan_dir <- file.path(output_dir, "pdf_scans")
 hits_output_path <- file.path(pdf_scan_dir, "beech_pdf_stringi_hits.csv")
 priority_output_path <- file.path(pdf_scan_dir, "beech_pdf_coding_priorities.csv")
 
 # Keep the codebook path explicit so users can compare these suggested fields
 # with the manual coding definitions while reviewing results.
-codebook_path <- "data/lit_review/coding/coding_codebook_revised.csv"
+codebook_path <- path_from_root("data/lit_review/coding/coding_codebook_revised.csv")
 
 if (!file.exists(codebook_path)) {
   warning("Codebook not found at: ", codebook_path, call. = FALSE)
@@ -92,8 +141,14 @@ term_groups <- list(
   )
 )
 
+escape_regex <- function(x) {
+  # stringi does not export a regex-escape helper in all installed versions,
+  # so escape regex metacharacters locally before building the term pattern.
+  stringr::str_replace_all(x, "([][{}()+*^$|\\.?])", "\\\\\\1")
+}
+
 make_regex <- function(terms) {
-  paste0("\\b(", paste(stringi::stri_escape_regex(terms), collapse = "|"), ")\\b")
+  paste0("\\b(", paste(escape_regex(terms), collapse = "|"), ")\\b")
 }
 
 term_patterns <- purrr::map_chr(term_groups, make_regex)

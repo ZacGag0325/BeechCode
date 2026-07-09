@@ -87,10 +87,20 @@ pdf_scan_dir <- file.path(output_dir, "pdf_scans")
 hits_output_path <- file.path(pdf_scan_dir, "beech_pdf_stringi_hits.csv")
 priority_output_path <- file.path(pdf_scan_dir, "beech_pdf_coding_priorities.csv")
 summary_output_path <- file.path(pdf_scan_dir, "beech_pdf_text_mining_summary.csv")
+individual_term_counts_output_path <- file.path(pdf_scan_dir, "beech_pdf_individual_term_counts_long.csv")
+term_group_frequency_output_path <- file.path(pdf_scan_dir, "beech_pdf_term_group_frequency_summary.csv")
+individual_term_frequency_output_path <- file.path(pdf_scan_dir, "beech_pdf_individual_term_frequency_summary.csv")
 
 # pdftools/Poppler can print non-fatal PDF repair/font diagnostics while still
 # extracting text successfully. Set to FALSE if you need to debug one PDF.
 suppress_pdf_diagnostics <- TRUE
+
+# Frequency counts are useful for comparing text emphasis across the corpus, but
+# raw mention counts are not the same as evidence strength. Long papers naturally
+# have more opportunities to mention a term, so normalized counts per 10,000 words
+# should be considered. Generic terms such as "seedling" indicate broad
+# regeneration language, not confirmed seed-origin regeneration. All automatic
+# results must be manually verified before use in the memoire/paper.
 
 codebook_path <- path_from_root("data/lit_review/coding/coding_codebook_revised.csv")
 if (!file.exists(codebook_path)) {
@@ -232,6 +242,23 @@ count_hits <- function(text, pattern) {
   as.integer(stringi::stri_count_regex(text, pattern, opts_regex = stringi::stri_opts_regex(case_insensitive = TRUE)))
 }
 
+count_words <- function(text) {
+  if (is.na(text) || !nzchar(text)) return(0L)
+  as.integer(stringi::stri_count_regex(text, "\\S+"))
+}
+
+hits_per_10k <- function(hits, word_count) {
+  if (is.na(hits) || is.na(word_count) || word_count <= 0) return(NA_real_)
+  hits / word_count * 10000
+}
+
+frequency_flag <- function(lhs, rhs, operator = c("greater", "less")) {
+  operator <- match.arg(operator)
+  if (is.na(lhs) || is.na(rhs)) return("unclear")
+  if (operator == "greater") return(ifelse(lhs > rhs, "yes", "no"))
+  ifelse(lhs < rhs, "yes", "no")
+}
+
 first_snippet <- function(text, pattern, context_chars = 100L) {
   if (is.na(text) || !nzchar(text)) return(NA_character_)
   location <- stringi::stri_locate_first_regex(text, pattern, opts_regex = stringi::stri_opts_regex(case_insensitive = TRUE))
@@ -284,11 +311,32 @@ if (length(pdf_files) == 0) warning("No PDFs found under: ", zotero_pdf_dir, cal
 scan_one_pdf <- function(pdf_path) {
   extracted <- safe_extract_pdf_text(pdf_path)
   text <- extracted$text
+  word_count <- count_words(text)
   
   hit_counts <- purrr::imap(term_patterns, ~ count_hits(text, .x))
   snippets <- purrr::imap(term_patterns, ~ first_snippet(text, .x))
   root_measurement_hits <- count_hits(text, root_measurement_pattern)
   clonality_context_hits <- count_hits(text, clonality_context_pattern)
+  root_or_clonal_hits <- hit_counts$root_suckering + hit_counts$clonality
+  
+  individual_term_count_rows[[pdf_path]] <<- purrr::imap_dfr(
+    term_groups,
+    function(terms, term_group_name) {
+      purrr::map_dfr(terms, function(term) {
+        term_hits <- count_hits(text, make_regex(term))
+        tibble(
+          pdf_file = basename(pdf_path),
+          pdf_path = pdf_path,
+          term_group = term_group_name,
+          term = term,
+          term_hits = term_hits,
+          term_hits_per_10k_words = hits_per_10k(term_hits, word_count),
+          word_count = word_count,
+          text_extracted = extracted$text_extracted
+        )
+      })
+    }
+  )
   
   root_suckering_discussed_suggested <- suggest_yes_no(hit_counts$root_suckering > 0)
   root_suckering_measured_suggested <- suggest_root_measured(hit_counts$root_suckering, root_measurement_hits)
@@ -338,8 +386,10 @@ scan_one_pdf <- function(pdf_path) {
     text_extracted = extracted$text_extracted,
     extraction_error = extracted$extraction_error,
     n_characters = ifelse(is.na(text), 0L, stringi::stri_length(text)),
+    word_count = word_count,
     root_suckering_hits = hit_counts$root_suckering,
     clonality_hits = hit_counts$clonality,
+    root_or_clonal_hits = root_or_clonal_hits,
     clonality_context_hits = clonality_context_hits,
     broad_seedling_regeneration_hits = hit_counts$broad_seedling_regeneration,
     explicit_seed_origin_hits = hit_counts$explicit_seed_origin,
@@ -349,6 +399,23 @@ scan_one_pdf <- function(pdf_path) {
     root_measurement_context_hits = root_measurement_hits,
     bbd_hits = hit_counts$bbd,
     management_disturbance_hits = hit_counts$management_disturbance,
+    root_suckering_hits_per_10k_words = hits_per_10k(hit_counts$root_suckering, word_count),
+    clonality_hits_per_10k_words = hits_per_10k(hit_counts$clonality, word_count),
+    root_or_clonal_hits_per_10k_words = hits_per_10k(root_or_clonal_hits, word_count),
+    broad_seedling_regeneration_hits_per_10k_words = hits_per_10k(hit_counts$broad_seedling_regeneration, word_count),
+    explicit_seed_origin_hits_per_10k_words = hits_per_10k(hit_counts$explicit_seed_origin, word_count),
+    distinguish_origin_hits_per_10k_words = hits_per_10k(hit_counts$distinguish_origin, word_count),
+    genetic_validation_hits_per_10k_words = hits_per_10k(hit_counts$genetic_validation, word_count),
+    physical_validation_hits_per_10k_words = hits_per_10k(hit_counts$physical_validation, word_count),
+    root_to_explicit_seed_ratio = dplyr::case_when(
+      is.na(root_or_clonal_hits) || is.na(hit_counts$explicit_seed_origin) ~ NA_real_,
+      hit_counts$explicit_seed_origin == 0 && root_or_clonal_hits > 0 ~ Inf,
+      hit_counts$explicit_seed_origin == 0 && root_or_clonal_hits == 0 ~ NA_real_,
+      TRUE ~ root_or_clonal_hits / hit_counts$explicit_seed_origin
+    ),
+    root_to_explicit_seed_ratio_denominator_zero = hit_counts$explicit_seed_origin == 0,
+    root_more_frequent_than_seed_origin = frequency_flag(root_or_clonal_hits, hit_counts$explicit_seed_origin, "greater"),
+    seed_origin_more_frequent_than_root = frequency_flag(root_or_clonal_hits, hit_counts$explicit_seed_origin, "less"),
     root_suckering_discussed_suggested = root_suckering_discussed_suggested,
     root_suckering_measured_suggested = root_suckering_measured_suggested,
     clonality_discussed_suggested = clonality_discussed_suggested,
@@ -380,10 +447,14 @@ scan_one_pdf <- function(pdf_path) {
 }
 
 empty_scan_results <- tibble(
-  pdf_file = character(), pdf_path = character(), text_extracted = logical(), extraction_error = character(), n_characters = integer(),
-  root_suckering_hits = integer(), clonality_hits = integer(), clonality_context_hits = integer(), broad_seedling_regeneration_hits = integer(),
+  pdf_file = character(), pdf_path = character(), text_extracted = logical(), extraction_error = character(), n_characters = integer(), word_count = integer(),
+  root_suckering_hits = integer(), clonality_hits = integer(), root_or_clonal_hits = integer(), clonality_context_hits = integer(), broad_seedling_regeneration_hits = integer(),
   explicit_seed_origin_hits = integer(), distinguish_origin_hits = integer(), genetic_validation_hits = integer(), physical_validation_hits = integer(),
   root_measurement_context_hits = integer(), bbd_hits = integer(), management_disturbance_hits = integer(),
+  root_suckering_hits_per_10k_words = double(), clonality_hits_per_10k_words = double(), root_or_clonal_hits_per_10k_words = double(),
+  broad_seedling_regeneration_hits_per_10k_words = double(), explicit_seed_origin_hits_per_10k_words = double(), distinguish_origin_hits_per_10k_words = double(),
+  genetic_validation_hits_per_10k_words = double(), physical_validation_hits_per_10k_words = double(), root_to_explicit_seed_ratio = double(),
+  root_to_explicit_seed_ratio_denominator_zero = logical(), root_more_frequent_than_seed_origin = character(), seed_origin_more_frequent_than_root = character(),
   root_suckering_discussed_suggested = character(), root_suckering_measured_suggested = character(), clonality_discussed_suggested = character(),
   seedling_regeneration_discussed_suggested = character(), explicit_seed_origin_discussed_suggested = character(), distinguishes_seed_vs_sucker_suggested = character(),
   genetic_validation_suggested = character(), physical_validation_suggested = character(), main_framing_suggested = character(),
@@ -395,23 +466,162 @@ empty_scan_results <- tibble(
   management_disturbance_snippet = character(), best_snippet = character()
 )
 
+individual_term_count_rows <- list()
+
 pdf_scan_results <- if (length(pdf_files) == 0) empty_scan_results else purrr::map_dfr(pdf_files, scan_one_pdf)
+
+individual_term_counts_long <- if (length(individual_term_count_rows) == 0) {
+  tibble(
+    pdf_file = character(),
+    pdf_path = character(),
+    term_group = character(),
+    term = character(),
+    term_hits = integer(),
+    term_hits_per_10k_words = double(),
+    word_count = integer(),
+    text_extracted = logical()
+  )
+} else {
+  dplyr::bind_rows(individual_term_count_rows)
+}
+
+total_corpus_words <- sum(pdf_scan_results$word_count, na.rm = TRUE)
+corpus_per_10k <- function(hits) hits_per_10k(hits, total_corpus_words)
+
+term_group_count_columns <- c(
+  root_suckering = "root_suckering_hits",
+  clonality = "clonality_hits",
+  root_or_clonal = "root_or_clonal_hits",
+  broad_seedling_regeneration = "broad_seedling_regeneration_hits",
+  explicit_seed_origin = "explicit_seed_origin_hits",
+  distinguish_origin = "distinguish_origin_hits",
+  genetic_validation = "genetic_validation_hits",
+  physical_validation = "physical_validation_hits",
+  bbd = "bbd_hits",
+  management_disturbance = "management_disturbance_hits"
+)
+
+term_group_counts_long <- purrr::imap_dfr(
+  term_group_count_columns,
+  function(column_name, term_group_name) {
+    tibble(
+      pdf_file = pdf_scan_results$pdf_file,
+      pdf_path = pdf_scan_results$pdf_path,
+      word_count = pdf_scan_results$word_count,
+      text_extracted = pdf_scan_results$text_extracted,
+      term_group = term_group_name,
+      term_hits = pdf_scan_results[[column_name]]
+    )
+  }
+)
+
+term_group_frequency_summary <- term_group_counts_long |>
+  dplyr::group_by(term_group) |>
+  dplyr::summarise(
+    total_hits = sum(term_hits, na.rm = TRUE),
+    total_hits_per_10k_words = corpus_per_10k(total_hits),
+    number_of_pdfs_with_at_least_one_hit = sum(term_hits > 0, na.rm = TRUE),
+    percent_of_pdfs_with_at_least_one_hit = ifelse(length(pdf_files) > 0, number_of_pdfs_with_at_least_one_hit / length(pdf_files) * 100, NA_real_),
+    mean_hits_per_pdf = mean(term_hits, na.rm = TRUE),
+    median_hits_per_pdf = stats::median(term_hits, na.rm = TRUE),
+    max_hits_in_one_pdf = max(term_hits, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+individual_term_frequency_summary <- individual_term_counts_long |>
+  dplyr::group_by(term_group, term) |>
+  dplyr::summarise(
+    total_hits = sum(term_hits, na.rm = TRUE),
+    total_hits_per_10k_words = corpus_per_10k(total_hits),
+    number_of_pdfs_with_at_least_one_hit = sum(term_hits > 0, na.rm = TRUE),
+    percent_of_pdfs_with_at_least_one_hit = ifelse(length(pdf_files) > 0, number_of_pdfs_with_at_least_one_hit / length(pdf_files) * 100, NA_real_),
+    mean_hits_per_pdf = mean(term_hits, na.rm = TRUE),
+    median_hits_per_pdf = stats::median(term_hits, na.rm = TRUE),
+    max_hits_in_one_pdf = max(term_hits, na.rm = TRUE),
+    .groups = "drop"
+  )
 
 manual_coding_priorities <- pdf_scan_results |>
   dplyr::select(
-    pdf_file, pdf_path, text_extracted, n_characters, suggested_priority,
+    pdf_file, pdf_path, text_extracted, n_characters, word_count, suggested_priority,
     suggested_root_treatment_score, suggested_seed_treatment_score,
     root_suckering_discussed_suggested, root_suckering_measured_suggested,
     clonality_discussed_suggested, seedling_regeneration_discussed_suggested,
     explicit_seed_origin_discussed_suggested, distinguishes_seed_vs_sucker_suggested,
     genetic_validation_suggested, physical_validation_suggested, main_framing_suggested,
-    root_suckering_hits, clonality_hits, clonality_context_hits,
+    root_suckering_hits, clonality_hits, root_or_clonal_hits, clonality_context_hits,
     broad_seedling_regeneration_hits, explicit_seed_origin_hits, distinguish_origin_hits,
     genetic_validation_hits, physical_validation_hits, root_measurement_context_hits,
-    bbd_hits, management_disturbance_hits, best_snippet
+    bbd_hits, management_disturbance_hits,
+    root_suckering_hits_per_10k_words, clonality_hits_per_10k_words, root_or_clonal_hits_per_10k_words,
+    broad_seedling_regeneration_hits_per_10k_words, explicit_seed_origin_hits_per_10k_words, distinguish_origin_hits_per_10k_words,
+    genetic_validation_hits_per_10k_words, physical_validation_hits_per_10k_words, root_to_explicit_seed_ratio,
+    root_to_explicit_seed_ratio_denominator_zero, root_more_frequent_than_seed_origin, seed_origin_more_frequent_than_root,
+    best_snippet
   )
 
 count_yes <- function(column) sum(column == "yes", na.rm = TRUE)
+
+total_root_suckering_hits <- sum(pdf_scan_results$root_suckering_hits, na.rm = TRUE)
+total_clonality_hits <- sum(pdf_scan_results$clonality_hits, na.rm = TRUE)
+total_root_or_clonal_hits <- sum(pdf_scan_results$root_or_clonal_hits, na.rm = TRUE)
+total_explicit_seed_origin_hits <- sum(pdf_scan_results$explicit_seed_origin_hits, na.rm = TRUE)
+total_broad_seedling_regeneration_hits <- sum(pdf_scan_results$broad_seedling_regeneration_hits, na.rm = TRUE)
+total_distinguish_origin_hits <- sum(pdf_scan_results$distinguish_origin_hits, na.rm = TRUE)
+corpus_root_to_explicit_seed_ratio <- dplyr::case_when(
+  total_explicit_seed_origin_hits == 0 && total_root_or_clonal_hits > 0 ~ Inf,
+  total_explicit_seed_origin_hits == 0 && total_root_or_clonal_hits == 0 ~ NA_real_,
+  TRUE ~ total_root_or_clonal_hits / total_explicit_seed_origin_hits
+)
+
+frequency_summary_metrics <- tibble(
+  metric = c(
+    "total_root_suckering_hits",
+    "total_clonality_hits",
+    "total_root_or_clonal_hits",
+    "total_explicit_seed_origin_hits",
+    "total_broad_seedling_regeneration_hits",
+    "total_distinguish_origin_hits",
+    "root_or_clonal_hits_per_10k_words",
+    "explicit_seed_origin_hits_per_10k_words",
+    "broad_seedling_regeneration_hits_per_10k_words",
+    "corpus_root_to_explicit_seed_ratio",
+    "number_pdfs_root_more_frequent_than_seed_origin",
+    "number_pdfs_seed_origin_more_frequent_than_root",
+    "number_pdfs_equal_root_and_seed_origin_frequency"
+  ),
+  value = c(
+    total_root_suckering_hits,
+    total_clonality_hits,
+    total_root_or_clonal_hits,
+    total_explicit_seed_origin_hits,
+    total_broad_seedling_regeneration_hits,
+    total_distinguish_origin_hits,
+    corpus_per_10k(total_root_or_clonal_hits),
+    corpus_per_10k(total_explicit_seed_origin_hits),
+    corpus_per_10k(total_broad_seedling_regeneration_hits),
+    corpus_root_to_explicit_seed_ratio,
+    sum(pdf_scan_results$root_more_frequent_than_seed_origin == "yes", na.rm = TRUE),
+    sum(pdf_scan_results$seed_origin_more_frequent_than_root == "yes", na.rm = TRUE),
+    sum(pdf_scan_results$root_or_clonal_hits == pdf_scan_results$explicit_seed_origin_hits, na.rm = TRUE)
+  ),
+  interpretation = c(
+    "Total raw mentions of root-suckering terms across all extracted PDFs.",
+    "Total raw mentions of clonality terms across all extracted PDFs.",
+    "Total raw mentions of root-suckering plus clonality terms across all extracted PDFs.",
+    "Total raw mentions of explicit seed-origin / sexual regeneration terms across all extracted PDFs.",
+    "Total raw mentions of broad seedling/sapling/regeneration terms across all extracted PDFs.",
+    "Total raw mentions of terms that suggest distinguishing seed-origin stems from root suckers.",
+    "Normalized corpus frequency for root/clonal terms per 10,000 extracted words.",
+    "Normalized corpus frequency for explicit seed-origin terms per 10,000 extracted words.",
+    "Normalized corpus frequency for broad seedling/regeneration terms per 10,000 extracted words.",
+    "Total root/clonal hits divided by total explicit seed-origin hits.",
+    "Number of PDFs where root/clonal terms are more frequent than explicit seed-origin terms.",
+    "Number of PDFs where explicit seed-origin terms are more frequent than root/clonal terms.",
+    "Number of PDFs where root/clonal and explicit seed-origin hit counts are equal."
+  )
+)
+
 summary_metrics <- tibble(
   metric = c(
     "total_pdfs", "pdfs_successfully_extracted", "root_suckering_discussed_yes",
@@ -449,11 +659,14 @@ main_framing_counts <- pdf_scan_results |>
   dplyr::mutate(metric = paste0("main_framing_", main_framing_suggested), interpretation = "Number of PDFs assigned to this automatic main framing category.") |>
   dplyr::select(metric, value, interpretation)
 
-text_mining_summary <- dplyr::bind_rows(summary_metrics, main_framing_counts)
+text_mining_summary <- dplyr::bind_rows(summary_metrics, frequency_summary_metrics, main_framing_counts)
 
 readr::write_csv(pdf_scan_results, hits_output_path, na = "")
 readr::write_csv(manual_coding_priorities, priority_output_path, na = "")
 readr::write_csv(text_mining_summary, summary_output_path, na = "")
+readr::write_csv(individual_term_counts_long, individual_term_counts_output_path, na = "")
+readr::write_csv(term_group_frequency_summary, term_group_frequency_output_path, na = "")
+readr::write_csv(individual_term_frequency_summary, individual_term_frequency_output_path, na = "")
 
 priority_counts <- pdf_scan_results |> dplyr::count(suggested_priority, name = "n")
 main_framing_summary <- pdf_scan_results |> dplyr::count(main_framing_suggested, name = "n")
@@ -474,7 +687,20 @@ message("Suggested priority counts:")
 if (nrow(priority_counts) == 0) message("  none") else purrr::pwalk(priority_counts, ~ message("  ", ..1, ": ", ..2))
 message("Main framing counts:")
 if (nrow(main_framing_summary) == 0) message("  none") else purrr::pwalk(main_framing_summary, ~ message("  ", ..1, ": ", ..2))
+message("\nFrequency comparison:")
+message("  Total root/clonal mentions: ", total_root_or_clonal_hits)
+message("  Total explicit seed-origin mentions: ", total_explicit_seed_origin_hits)
+message("  Total broad seedling/regeneration mentions: ", total_broad_seedling_regeneration_hits)
+message("  Root/clonal mentions per 10,000 words: ", round(corpus_per_10k(total_root_or_clonal_hits), 3))
+message("  Explicit seed-origin mentions per 10,000 words: ", round(corpus_per_10k(total_explicit_seed_origin_hits), 3))
+message("  Broad seedling/regeneration mentions per 10,000 words: ", round(corpus_per_10k(total_broad_seedling_regeneration_hits), 3))
+message("  Corpus root-to-explicit-seed ratio: ", round(corpus_root_to_explicit_seed_ratio, 3))
+message("  PDFs where root/clonal terms are more frequent than explicit seed-origin terms: ", sum(pdf_scan_results$root_more_frequent_than_seed_origin == "yes", na.rm = TRUE))
+message("  PDFs where explicit seed-origin terms are more frequent than root/clonal terms: ", sum(pdf_scan_results$seed_origin_more_frequent_than_root == "yes", na.rm = TRUE))
 message("Full hit output: ", hits_output_path)
 message("Manual coding priority output: ", priority_output_path)
 message("Text-mining summary output: ", summary_output_path)
-message("\nWarning: this is text-mining triage, not final evidence. Manually verify all suggested fields against the articles.")
+message("Individual term counts output: ", individual_term_counts_output_path)
+message("Term group frequency summary output: ", term_group_frequency_output_path)
+message("Individual term frequency summary output: ", individual_term_frequency_output_path)
+message("\nWarning: this is text-mining triage, not final evidence. Raw mention counts are not evidence strength; normalized counts help adjust for paper length; generic seedling terms are broad regeneration only. Manually verify all suggested fields before using them in the memoire/paper.")

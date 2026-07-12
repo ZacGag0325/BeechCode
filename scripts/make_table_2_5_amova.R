@@ -16,14 +16,14 @@
 # - outputs/tables/table_2_5_amova.docx
 ############################################################
 
-suppressPackageStartupMessages({
+suppressWarnings(suppressPackageStartupMessages({
   library(dplyr)
   library(flextable)
   library(officer)
   library(readr)
   library(stringr)
   library(tibble)
-})
+}))
 
 # ----------------------------
 # Project-root and path helpers
@@ -239,16 +239,6 @@ dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
 
 readr::write_csv(final_table, OUTPUT_CSV, na = "")
 
-note_text <- paste(
-  "Note. AMOVA was performed on the clone-corrected dataset (N = 268).",
-  "The site-level model tested differentiation among the 12 study sites.",
-  "The hierarchical model tested differentiation between southern and northern regions, among sites within regions, among individuals within sites, and within individuals.",
-  "Significance was assessed using 999 permutations.",
-  "Negative variance components can occur when differentiation among groups is effectively zero and were interpreted as no regional genetic structure."
-)
-
-title_text <- "Table 2.5. Analysis of molecular variance (AMOVA) of clone-corrected American beech (Fagus grandifolia Ehrh.) genotypes."
-
 ft <- flextable(final_table) %>%
   theme_booktabs() %>%
   fontsize(size = 10, part = "all") %>%
@@ -259,9 +249,21 @@ ft <- flextable(final_table) %>%
   autofit()
 
 doc <- read_docx() %>%
-  body_add_par(title_text, style = "Normal") %>%
+  body_add_par(
+    "Table 2.5. Analysis of molecular variance (AMOVA) of clone-corrected American beech (Fagus grandifolia Ehrh.) genotypes.",
+    style = "Normal"
+  ) %>%
   body_add_flextable(ft) %>%
-  body_add_par(note_text, style = "Normal")
+  body_add_par(
+    paste(
+      "Note. AMOVA was performed on the clone-corrected dataset (N = 268).",
+      "The site-level model tested differentiation among the 12 study sites.",
+      "The hierarchical model tested differentiation between southern and northern regions, among sites within regions, among individuals within sites, and within individuals.",
+      "Significance was assessed using 999 permutations.",
+      "Negative variance components can occur when differentiation among groups is effectively zero and were interpreted as no regional genetic structure."
+    ),
+    style = "Normal"
+  )
 
 print(doc, target = OUTPUT_DOCX)
 

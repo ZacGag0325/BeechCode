@@ -97,7 +97,7 @@ run_amova_model <- function(gi_use, strata_df, model_formula, model_label, group
   amova_fit <- poppr::poppr.amova(gi_use, model_formula)
   
   randtest_fit <- tryCatch(
-    ade4::randtest(amova_fit, nrepet = 999),
+    ade4::randtest(amova_fit, nrepet = 9999),
     error = function(e) {
       warning("[04_amova] randtest failed for ", model_label, ": ", conditionMessage(e))
       NULL
@@ -131,7 +131,7 @@ run_amova_model <- function(gi_use, strata_df, model_formula, model_label, group
       component = NA_character_,
       statistic = NA_real_,
       p_value = NA_real_,
-      permutations = 999,
+      permutations = 9999,
       grouping_source = grouping_source,
       n_individuals_used = adegenet::nInd(gi_use),
       n_groups_used = dplyr::n_distinct(strata_df$Site),
@@ -158,7 +158,7 @@ run_amova_model <- function(gi_use, strata_df, model_formula, model_label, group
       component = comp_names[seq_len(n_comp)],
       statistic = obs_vec[seq_len(n_comp)],
       p_value = p_vec[seq_len(n_comp)],
-      permutations = 999,
+      permutations = 9999,
       grouping_source = grouping_source,
       n_individuals_used = adegenet::nInd(gi_use),
       n_groups_used = dplyr::n_distinct(strata_df$Site),

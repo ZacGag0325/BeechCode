@@ -102,10 +102,17 @@ score_candidate <- function(path, statistic = c("jost", "fst")) {
   statistic <- match.arg(statistic)
   score <- 0
   haystack <- tolower(basename(path))
+  path_text <- tolower(path)
   obj <- tryCatch(read_candidate(path), error = function(e) NULL)
   if (is.data.frame(obj)) haystack <- paste(haystack, tolower(paste(names(obj), collapse = " ")))
   
   score <- score + 2 * str_count(haystack, "pairwise|population differentiation|differentiation")
+  # Down-rank sensitivity/comparison summaries: their filenames may contain
+  # "differentiation", "Jost", or "FST", but they are not the pairwise 12 x 12
+  # result tables needed for Appendix H.
+  if (str_detect(path_text, "comparison|comparisons|full_vs|nosuspect|no_suspect|sensitivity")) {
+    score <- score - 20
+  }
   if (statistic == "jost") {
     score <- score + 5 * str_count(haystack, "jost|jost_d|dest|d_est")
     score <- score - 3 * str_count(haystack, "fst|weir|cockerham")
@@ -123,8 +130,29 @@ select_input_file <- function(statistic) {
   }
   scored <- tibble(path = candidates, score = vapply(candidates, score_candidate, numeric(1), statistic = statistic)) |>
     arrange(desc(score), path)
-  selected <- scored |> filter(score > 0) |> slice(1) |> pull(path)
-  if (length(selected) == 0) {
+  
+  # Do not select a file based on keywords alone. Try candidates in score order
+  # and accept only the first file that can actually be parsed and validated as
+  # a complete pairwise matrix for the requested statistic. This prevents
+  # high-scoring comparison summaries from being misidentified as pairwise
+  # Jost's D or FST inputs.
+  attempted <- character(0)
+  positive_candidates <- scored |> filter(score > 0)
+  if (nrow(positive_candidates) > 0) {
+    for (candidate_path in positive_candidates$path) {
+      parsed <- tryCatch({
+        mat <- read_pairwise_matrix(candidate_path, statistic)
+        validate_pairwise_matrix(mat, toupper(statistic))
+        TRUE
+      }, error = function(e) {
+        attempted <<- c(attempted, paste0(candidate_path, " -- ", conditionMessage(e)))
+        FALSE
+      })
+      if (isTRUE(parsed)) return(candidate_path)
+    }
+  }
+  
+  if (length(attempted) == 0) {
     stop(
       "[appendix_H] Could not identify a suitable ", statistic, " file. Searched CSV/RDS files under: ",
       paste(SEARCH_DIRS, collapse = ", "),
@@ -132,7 +160,13 @@ select_input_file <- function(statistic) {
       call. = FALSE
     )
   }
-  selected
+  
+  stop(
+    "[appendix_H] Candidate files were found for ", statistic,
+    ", but none could be parsed and validated as a complete 12-site pairwise matrix. Attempted:\n- ",
+    paste(attempted, collapse = "\n- "),
+    call. = FALSE
+  )
 }
 
 # ----------------------------

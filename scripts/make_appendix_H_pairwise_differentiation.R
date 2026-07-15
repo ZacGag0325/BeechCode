@@ -176,6 +176,9 @@ standardize_site <- function(x) {
   raw <- toupper(trimws(as.character(x)))
   raw[is.na(raw)] <- ""
   
+  raw <- str_replace_all(raw, "SOUTH\\s*0?([1-6])", "S\\1")
+  raw <- str_replace_all(raw, "NORTH\\s*0?([1-6])", "N\\1")
+  
   # Prefer an explicit site token anywhere in the label (e.g., "Site S1",
   # "S1 clone-corrected", "pop_N03"). If no token is found, fall back to
   # cleaning the whole string below.
@@ -191,6 +194,24 @@ standardize_site <- function(x) {
   out <- str_replace(out, "^S0([1-6])$", "S\\1")
   out <- str_replace(out, "^N0([1-6])$", "N\\1")
   out
+}
+
+extract_site_tokens <- function(x) {
+  raw <- toupper(trimws(as.character(x)))
+  raw[is.na(raw)] <- ""
+  raw <- str_replace_all(raw, "SOUTH\\s*0?([1-6])", "S\\1")
+  raw <- str_replace_all(raw, "NORTH\\s*0?([1-6])", "N\\1")
+  matches <- str_extract_all(raw, "(^|[^A-Z0-9])([SN]0?[1-6])(?=[^A-Z0-9]|$)")
+  lapply(matches, function(m) {
+    tokens <- str_match(m, "([SN]0?[1-6])")[, 2]
+    tokens <- str_replace(tokens, "^S0([1-6])$", "S\\1")
+    tokens <- str_replace(tokens, "^N0([1-6])$", "N\\1")
+    tokens[tokens %in% EXPECTED_SITES]
+  })
+}
+
+parse_pairwise_value <- function(x) {
+  suppressWarnings(readr::parse_number(as.character(x), na = c("", "NA", "NaN", "—", "-", "NULL")))
 }
 
 find_long_columns <- function(df, statistic) {
@@ -242,13 +263,49 @@ find_long_columns <- function(df, statistic) {
   # population_1, population_2, value.
   if (is.na(value) && !any(is.na(c(pop1, pop2)))) {
     excluded <- c(pop1, pop2)
-    numeric_candidates <- which(map_lgl(df, ~ !all(is.na(suppressWarnings(as.numeric(.x))))))
+    numeric_candidates <- which(map_lgl(df, ~ !all(is.na(parse_pairwise_value(.x)))))
     numeric_candidates <- setdiff(numeric_candidates, excluded)
     if (length(numeric_candidates) == 1) value <- numeric_candidates[1]
   }
   
   if (any(is.na(c(pop1, pop2, value)))) return(NULL)
   list(pop1 = nm[pop1], pop2 = nm[pop2], value = nm[value])
+}
+
+find_pair_column <- function(df) {
+  token_counts <- vapply(df, function(col) {
+    tokens <- extract_site_tokens(col)
+    sum(vapply(tokens, length, integer(1)) >= 2)
+  }, integer(1))
+  pair_columns <- which(token_counts > 0)
+  if (length(pair_columns) == 0) return(NULL)
+  pair_columns[order(token_counts[pair_columns], decreasing = TRUE)][1]
+}
+
+find_value_column <- function(df, statistic, excluded = integer(0)) {
+  nm <- names(df)
+  clean <- tolower(str_replace_all(nm, "[^A-Za-z0-9]+", "_"))
+  clean <- str_replace_all(clean, "^_|_$", "")
+  compact <- str_replace_all(clean, "_", "")
+  value_patterns <- if (statistic == "jost") {
+    c("jost", "jostd", "jost_d", "josts_d", "josts", "dest", "d_est")
+  } else {
+    c("fst", "f_st", "wc_fst", "weir", "cockerham", "theta")
+  }
+  
+  candidates <- which(map_lgl(seq_along(clean), function(i) {
+    any(str_detect(clean[i], value_patterns)) ||
+      any(str_detect(compact[i], value_patterns)) ||
+      (statistic == "jost" && clean[i] %in% c("d", "value")) ||
+      (statistic == "fst" && clean[i] %in% c("value"))
+  }))
+  candidates <- setdiff(candidates, excluded)
+  if (length(candidates) > 0) return(candidates[1])
+  
+  numeric_candidates <- which(map_lgl(df, ~ !all(is.na(parse_pairwise_value(.x)))))
+  numeric_candidates <- setdiff(numeric_candidates, excluded)
+  if (length(numeric_candidates) == 1) return(numeric_candidates[1])
+  NA_integer_
 }
 
 matrix_from_square <- function(df) {
@@ -273,10 +330,23 @@ matrix_from_square <- function(df) {
 
 matrix_from_long <- function(df, statistic) {
   cols <- find_long_columns(df, statistic)
-  if (is.null(cols)) return(NULL)
-  long <- df |>
-    transmute(pop1 = standardize_site(.data[[cols$pop1]]), pop2 = standardize_site(.data[[cols$pop2]]), value = suppressWarnings(as.numeric(.data[[cols$value]]))) |>
-    filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES)
+  if (!is.null(cols)) {
+    long <- df |>
+      transmute(pop1 = standardize_site(.data[[cols$pop1]]), pop2 = standardize_site(.data[[cols$pop2]]), value = parse_pairwise_value(.data[[cols$value]])) |>
+      filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES)
+  } else {
+    pair_col <- find_pair_column(df)
+    if (is.null(pair_col)) return(NULL)
+    value_col <- find_value_column(df, statistic, excluded = pair_col)
+    if (is.na(value_col)) return(NULL)
+    pair_tokens <- extract_site_tokens(df[[pair_col]])
+    long <- tibble(
+      pop1 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 1) tokens[1] else NA_character_, character(1)),
+      pop2 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 2) tokens[2] else NA_character_, character(1)),
+      value = parse_pairwise_value(df[[value_col]])
+    ) |>
+      filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES)
+  }
   mat <- matrix(NA_real_, length(EXPECTED_SITES), length(EXPECTED_SITES), dimnames = list(EXPECTED_SITES, EXPECTED_SITES))
   if (nrow(long) == 0) return(NULL)
   for (i in seq_len(nrow(long))) {

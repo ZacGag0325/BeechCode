@@ -173,22 +173,80 @@ select_input_file <- function(statistic) {
 # Site-label standardization and matrix conversion
 # ----------------------------
 standardize_site <- function(x) {
-  x <- toupper(trimws(as.character(x)))
-  x <- str_replace_all(x, "[^A-Z0-9]", "")
-  x <- str_replace(x, "^SITE", "")
-  x <- str_replace(x, "^POP", "")
-  x <- str_replace(x, "^S0([1-6])$", "S\\1")
-  x <- str_replace(x, "^N0([1-6])$", "N\\1")
-  x
+  raw <- toupper(trimws(as.character(x)))
+  raw[is.na(raw)] <- ""
+  
+  # Prefer an explicit site token anywhere in the label (e.g., "Site S1",
+  # "S1 clone-corrected", "pop_N03"). If no token is found, fall back to
+  # cleaning the whole string below.
+  token <- str_match(raw, "(^|[^A-Z0-9])([SN]0?[1-6])([^A-Z0-9]|$)")[, 3]
+  cleaned <- str_replace_all(raw, "[^A-Z0-9]", "")
+  cleaned <- str_replace(cleaned, "^SITE", "")
+  cleaned <- str_replace(cleaned, "^POPULATION", "")
+  cleaned <- str_replace(cleaned, "^POP", "")
+  cleaned <- str_replace(cleaned, "^S0([1-6])$", "S\\1")
+  cleaned <- str_replace(cleaned, "^N0([1-6])$", "N\\1")
+  
+  out <- ifelse(!is.na(token), token, cleaned)
+  out <- str_replace(out, "^S0([1-6])$", "S\\1")
+  out <- str_replace(out, "^N0([1-6])$", "N\\1")
+  out
 }
 
 find_long_columns <- function(df, statistic) {
   nm <- names(df)
-  clean <- tolower(str_replace_all(nm, "[^a-z0-9]+", "_"))
-  pop1 <- which(clean %in% c("population1", "pop1", "site1", "site_a", "from", "row", "population_a", "pop_a"))[1]
-  pop2 <- which(clean %in% c("population2", "pop2", "site2", "site_b", "to", "column", "col", "population_b", "pop_b"))[1]
-  value_patterns <- if (statistic == "jost") c("jost", "jost_d", "dest", "d_est", "value") else c("fst", "f_st", "weir", "cockerham", "value")
-  value <- which(map_lgl(clean, ~ any(str_detect(.x, value_patterns))))[1]
+  clean <- tolower(str_replace_all(nm, "[^A-Za-z0-9]+", "_"))
+  clean <- str_replace_all(clean, "^_|_$", "")
+  compact <- str_replace_all(clean, "_", "")
+  
+  pop1_candidates <- c(
+    "population1", "population_1", "pop1", "pop_1", "site1", "site_1",
+    "site_a", "site_i", "pop_a", "pop_i", "population_a", "population_i",
+    "from", "row", "var1", "x"
+  )
+  pop2_candidates <- c(
+    "population2", "population_2", "pop2", "pop_2", "site2", "site_2",
+    "site_b", "site_j", "pop_b", "pop_j", "population_b", "population_j",
+    "to", "column", "col", "var2", "y"
+  )
+  
+  pop1 <- which(clean %in% pop1_candidates | compact %in% pop1_candidates)[1]
+  pop2 <- which(clean %in% pop2_candidates | compact %in% pop2_candidates)[1]
+  
+  # If column names are non-standard, identify the two columns whose values look
+  # most like the expected site labels after standardization.
+  if (is.na(pop1) || is.na(pop2)) {
+    site_like_counts <- vapply(df, function(col) sum(standardize_site(col) %in% EXPECTED_SITES, na.rm = TRUE), integer(1))
+    site_like <- which(site_like_counts > 0)
+    if (length(site_like) >= 2) {
+      ordered_site_like <- site_like[order(site_like_counts[site_like], decreasing = TRUE)]
+      pop1 <- ordered_site_like[1]
+      pop2 <- ordered_site_like[2]
+    }
+  }
+  
+  value_patterns <- if (statistic == "jost") {
+    c("jost", "jostd", "jost_d", "josts_d", "josts", "dest", "d_est")
+  } else {
+    c("fst", "f_st", "wc_fst", "weir", "cockerham", "theta")
+  }
+  value <- which(map_lgl(seq_along(clean), function(i) {
+    any(str_detect(clean[i], value_patterns)) ||
+      any(str_detect(compact[i], value_patterns)) ||
+      (statistic == "jost" && clean[i] %in% c("d", "value")) ||
+      (statistic == "fst" && clean[i] %in% c("value"))
+  }))[1]
+  
+  # If there is only one numeric value column after the two population columns,
+  # use it as a final fallback. This covers simple long tables such as
+  # population_1, population_2, value.
+  if (is.na(value) && !any(is.na(c(pop1, pop2)))) {
+    excluded <- c(pop1, pop2)
+    numeric_candidates <- which(map_lgl(df, ~ !all(is.na(suppressWarnings(as.numeric(.x))))))
+    numeric_candidates <- setdiff(numeric_candidates, excluded)
+    if (length(numeric_candidates) == 1) value <- numeric_candidates[1]
+  }
+  
   if (any(is.na(c(pop1, pop2, value)))) return(NULL)
   list(pop1 = nm[pop1], pop2 = nm[pop2], value = nm[value])
 }
@@ -220,6 +278,7 @@ matrix_from_long <- function(df, statistic) {
     transmute(pop1 = standardize_site(.data[[cols$pop1]]), pop2 = standardize_site(.data[[cols$pop2]]), value = suppressWarnings(as.numeric(.data[[cols$value]]))) |>
     filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES)
   mat <- matrix(NA_real_, length(EXPECTED_SITES), length(EXPECTED_SITES), dimnames = list(EXPECTED_SITES, EXPECTED_SITES))
+  if (nrow(long) == 0) return(NULL)
   for (i in seq_len(nrow(long))) {
     mat[long$pop1[i], long$pop2[i]] <- long$value[i]
     mat[long$pop2[i], long$pop1[i]] <- long$value[i]
@@ -234,7 +293,12 @@ read_pairwise_matrix <- function(path, statistic) {
   mat <- matrix_from_square(obj)
   if (is.null(mat)) mat <- matrix_from_long(obj, statistic)
   if (is.null(mat)) {
-    stop("[appendix_H] Could not parse ", statistic, " input as either a square matrix or long pairwise table: ", path, call. = FALSE)
+    stop(
+      "[appendix_H] Could not parse ", statistic,
+      " input as either a square matrix or long pairwise table: ", path,
+      ". Available columns: ", paste(names(obj), collapse = ", "),
+      call. = FALSE
+    )
   }
   mat[EXPECTED_SITES, EXPECTED_SITES, drop = FALSE]
 }

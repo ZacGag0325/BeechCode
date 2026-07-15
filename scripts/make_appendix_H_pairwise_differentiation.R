@@ -2,27 +2,40 @@
 # Appendix H Table H.1: Pairwise genetic differentiation
 # among 12 American beech (Fagus grandifolia Ehrh.) sites.
 #
-# This script formats existing clone-corrected microsatellite
-# pairwise differentiation outputs only. It does not recalculate
-# Jost's D or Weir and Cockerham's FST.
+# This script recomputes site-level pairwise Jost's D and
+# Weir & Cockerham's FST from the final clone-corrected
+# microsatellite dataset used by the thesis workflow.
+#
+# IMPORTANT:
+# - Do not use outputs/tables/pairwise_jostD_long.csv for Appendix H.
+#   That file can contain repeated within-site comparisons and is not
+#   guaranteed to be a complete site-level 12 x 12 table.
+# - The canonical clone-corrected object is gi_mll, loaded via
+#   scripts/_load_objects.R from outputs/v1/objects/gi_mll.rds.
 ############################################################
 
 suppressWarnings(suppressPackageStartupMessages({
-  required_packages <- c("dplyr", "flextable", "officer", "purrr", "readr", "stringr", "tibble")
+  required_packages <- c(
+    "adegenet", "dplyr", "flextable", "hierfstat", "mmod",
+    "officer", "poppr", "readr", "tibble"
+  )
   missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
   if (length(missing_packages) > 0) {
     stop(
       "[appendix_H] Missing required package(s): ", paste(missing_packages, collapse = ", "),
-      ". Install them before running this formatting script.",
+      ". Install them before running this script.",
       call. = FALSE
     )
   }
+  
+  library(adegenet)
   library(dplyr)
   library(flextable)
+  library(hierfstat)
+  library(mmod)
   library(officer)
-  library(purrr)
+  library(poppr)
   library(readr)
-  library(stringr)
   library(tibble)
 }))
 
@@ -55,395 +68,154 @@ find_project_root <- function() {
 PROJECT_ROOT <- find_project_root()
 setwd(PROJECT_ROOT)
 
-# Clear file-path variables are intentionally kept near the top.
 OUTPUTS_DIR <- file.path(PROJECT_ROOT, "outputs")
 TABLES_DIR <- file.path(OUTPUTS_DIR, "tables")
 SUPPLEMENTARY_DIR <- file.path(TABLES_DIR, "supplementary")
-POP_STRUCTURE_DIR <- file.path(OUTPUTS_DIR, "population_structure")
-SEARCH_DIRS <- c(TABLES_DIR, SUPPLEMENTARY_DIR, POP_STRUCTURE_DIR, OUTPUTS_DIR)
+OBJECTS_DIR <- file.path(OUTPUTS_DIR, "v1", "objects")
+LOADER_SCRIPT <- file.path(PROJECT_ROOT, "scripts", "_load_objects.R")
+
 OUTPUT_CSV <- file.path(TABLES_DIR, "appendix_H_pairwise_differentiation.csv")
 OUTPUT_DOCX <- file.path(TABLES_DIR, "appendix_H_pairwise_differentiation.docx")
 JOST_MATRIX_CSV <- file.path(SUPPLEMENTARY_DIR, "jost_d_matrix_ordered.csv")
 FST_MATRIX_CSV <- file.path(SUPPLEMENTARY_DIR, "fst_matrix_ordered.csv")
 
-EXPECTED_SITES <- c("S1", "S2", "S3", "S4", "S5", "S6", "N1", "N2", "N3", "N4", "N5", "N6")
+EXPECTED_SITES <- c("AMC", "ALB", "IKJ", "IKO", "LGG", "LGR", "ML1", "ML2", "ML3", "CPF", "PLI", "LDF")
 TOLERANCE <- 1e-6
 TITLE_TEXT <- "Table H.1. Pairwise genetic differentiation among the 12 American beech (Fagus grandifolia Ehrh.) study sites based on clone-corrected microsatellite data."
-NOTE_TEXT <- "Note. Pairwise Jost's D values are presented below the diagonal and Weir and Cockerham's FST values above the diagonal. Sites are ordered from south to north. Diagonal cells represent within-site comparisons and are therefore omitted."
+NOTE_TEXT <- "Note. Pairwise Jost's D values are presented below the diagonal and Weir and Cockerham's FST values above the diagonal. Sites are ordered as AMC, ALB, IKJ, IKO, LGG, LGR, ML1, ML2, ML3, CPF, PLI, and LDF. Diagonal cells represent within-site comparisons and are therefore omitted."
 
 message_h <- function(...) message("[appendix_H] ", ...)
 
+for (d in c(TABLES_DIR, SUPPLEMENTARY_DIR)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
 # ----------------------------
-# Input discovery
+# Load final clone-corrected data
 # ----------------------------
-list_candidate_files <- function() {
-  dirs <- unique(normalizePath(SEARCH_DIRS[file.exists(SEARCH_DIRS)], mustWork = TRUE))
-  if (length(dirs) == 0) {
-    stop("[appendix_H] None of the expected output search directories exist: ", paste(SEARCH_DIRS, collapse = ", "), call. = FALSE)
-  }
-  files <- unlist(lapply(dirs, list.files, pattern = "\\.(csv|rds)$", recursive = TRUE, full.names = TRUE, ignore.case = TRUE), use.names = FALSE)
-  unique(normalizePath(files, mustWork = FALSE))
+if (!file.exists(LOADER_SCRIPT)) {
+  stop("[appendix_H] Missing loader script: ", LOADER_SCRIPT, call. = FALSE)
 }
 
-read_candidate <- function(path) {
-  ext <- tolower(tools::file_ext(path))
-  obj <- switch(
-    ext,
-    csv = suppressMessages(readr::read_csv(path, show_col_types = FALSE, progress = FALSE)),
-    rds = readRDS(path),
-    stop("Unsupported file extension: ", path, call. = FALSE)
-  )
-  if (is.matrix(obj)) obj <- as.data.frame(obj, check.names = FALSE)
-  obj
-}
-
-# Score candidate files using filenames and column names so existing outputs are reused.
-score_candidate <- function(path, statistic = c("jost", "fst")) {
-  statistic <- match.arg(statistic)
-  score <- 0
-  haystack <- tolower(basename(path))
-  path_text <- tolower(path)
-  obj <- tryCatch(read_candidate(path), error = function(e) NULL)
-  if (is.data.frame(obj)) haystack <- paste(haystack, tolower(paste(names(obj), collapse = " ")))
-  
-  score <- score + 2 * str_count(haystack, "pairwise|population differentiation|differentiation")
-  # Down-rank sensitivity/comparison summaries: their filenames may contain
-  # "differentiation", "Jost", or "FST", but they are not the pairwise 12 x 12
-  # result tables needed for Appendix H.
-  if (str_detect(path_text, "comparison|comparisons|full_vs|nosuspect|no_suspect|sensitivity")) {
-    score <- score - 20
-  }
-  if (statistic == "jost") {
-    score <- score + 5 * str_count(haystack, "jost|jost_d|dest|d_est")
-    score <- score - 3 * str_count(haystack, "fst|weir|cockerham")
-  } else {
-    score <- score + 5 * str_count(haystack, "fst|f_st|weir|cockerham")
-    score <- score - 3 * str_count(haystack, "jost|jost_d|dest|d_est")
-  }
-  score
-}
-
-select_input_file <- function(statistic) {
-  candidates <- list_candidate_files()
-  if (length(candidates) == 0) {
-    stop("[appendix_H] No CSV or RDS files were found under: ", paste(SEARCH_DIRS, collapse = ", "), call. = FALSE)
-  }
-  scored <- tibble(path = candidates, score = vapply(candidates, score_candidate, numeric(1), statistic = statistic)) |>
-    arrange(desc(score), path)
-  
-  # Do not select a file based on keywords alone. Try candidates in score order
-  # and accept only the first file that can actually be parsed and validated as
-  # a complete pairwise matrix for the requested statistic. This prevents
-  # high-scoring comparison summaries from being misidentified as pairwise
-  # Jost's D or FST inputs.
-  attempted <- character(0)
-  positive_candidates <- scored |> filter(score > 0)
-  if (nrow(positive_candidates) > 0) {
-    for (candidate_path in positive_candidates$path) {
-      parsed <- tryCatch({
-        mat <- read_pairwise_matrix(candidate_path, statistic)
-        validate_pairwise_matrix(mat, toupper(statistic))
-        TRUE
-      }, error = function(e) {
-        attempted <<- c(attempted, paste0(candidate_path, " -- ", conditionMessage(e)))
-        FALSE
-      })
-      if (isTRUE(parsed)) return(candidate_path)
-    }
-  }
-  
-  if (length(attempted) == 0) {
-    stop(
-      "[appendix_H] Could not identify a suitable ", statistic, " file. Searched CSV/RDS files under: ",
-      paste(SEARCH_DIRS, collapse = ", "),
-      ". Expected filename or column terms include jost, jost_d, dest, pairwise, fst, weir, cockerham, or population differentiation.",
-      call. = FALSE
-    )
-  }
-  
+required_object_files <- c("gi_mll.rds", "df_ids.rds", "meta.rds")
+missing_object_files <- required_object_files[!file.exists(file.path(OBJECTS_DIR, required_object_files))]
+if (length(missing_object_files) > 0) {
   stop(
-    "[appendix_H] Candidate files were found for ", statistic,
-    ", but none could be parsed and validated as a complete 12-site pairwise matrix. Attempted:\n- ",
-    paste(attempted, collapse = "\n- "),
+    "[appendix_H] Missing final thesis object file(s) in ", OBJECTS_DIR, ": ",
+    paste(missing_object_files, collapse = ", "),
+    ". Run scripts/00_master_pipeline.R first to regenerate the final clone-corrected objects.",
     call. = FALSE
   )
 }
 
+# _load_objects.R loads gi_mll and df_ids_mll and aligns pop(gi_mll) to Site.
+source(LOADER_SCRIPT)
+
+if (!exists("gi_mll")) {
+  stop("[appendix_H] _load_objects.R did not create gi_mll.", call. = FALSE)
+}
+if (!inherits(gi_mll, "genind")) {
+  stop("[appendix_H] gi_mll is not a genind/genclone object.", call. = FALSE)
+}
+
+message_h("Using final clone-corrected object: ", file.path(OBJECTS_DIR, "gi_mll.rds"))
+message_h("nInd(gi_mll) = ", adegenet::nInd(gi_mll), "; nLoc(gi_mll) = ", adegenet::nLoc(gi_mll))
+
 # ----------------------------
-# Site-label standardization and matrix conversion
+# Validation helpers
 # ----------------------------
 standardize_site <- function(x) {
-  raw <- toupper(trimws(as.character(x)))
-  raw[is.na(raw)] <- ""
-  
-  raw <- str_replace_all(raw, "SOUTH\\s*0?([1-6])", "S\\1")
-  raw <- str_replace_all(raw, "NORTH\\s*0?([1-6])", "N\\1")
-  
-  # Prefer an explicit site token anywhere in the label (e.g., "Site S1",
-  # "S1 clone-corrected", "pop_N03"). If no token is found, fall back to
-  # cleaning the whole string below.
-  token <- str_match(raw, "(^|[^A-Z0-9])([SN]0?[1-6])([^A-Z0-9]|$)")[, 3]
-  cleaned <- str_replace_all(raw, "[^A-Z0-9]", "")
-  cleaned <- str_replace(cleaned, "^SITE", "")
-  cleaned <- str_replace(cleaned, "^POPULATION", "")
-  cleaned <- str_replace(cleaned, "^POP", "")
-  cleaned <- str_replace(cleaned, "^S0([1-6])$", "S\\1")
-  cleaned <- str_replace(cleaned, "^N0([1-6])$", "N\\1")
-  
-  out <- ifelse(!is.na(token), token, cleaned)
-  numeric_site <- suppressWarnings(as.integer(out))
-  numeric_index <- !is.na(numeric_site) & numeric_site >= 1 & numeric_site <= length(EXPECTED_SITES)
-  out[numeric_index] <- EXPECTED_SITES[numeric_site[numeric_index]]
-  out <- str_replace(out, "^S0([1-6])$", "S\\1")
-  out <- str_replace(out, "^N0([1-6])$", "N\\1")
-  out
+  x <- toupper(trimws(as.character(x)))
+  x <- gsub("[^A-Z0-9]+", "", x)
+  x
 }
 
-extract_site_tokens <- function(x) {
-  raw <- toupper(trimws(as.character(x)))
-  raw[is.na(raw)] <- ""
-  raw <- str_replace_all(raw, "SOUTH\\s*0?([1-6])", "S\\1")
-  raw <- str_replace_all(raw, "NORTH\\s*0?([1-6])", "N\\1")
-  matches <- str_extract_all(raw, "(^|[^A-Z0-9])([SN]0?[1-6])(?=[^A-Z0-9]|$)")
-  out <- lapply(matches, function(m) {
-    tokens <- str_match(m, "([SN]0?[1-6])")[, 2]
-    tokens <- str_replace(tokens, "^S0([1-6])$", "S\\1")
-    tokens <- str_replace(tokens, "^N0([1-6])$", "N\\1")
-    tokens[tokens %in% EXPECTED_SITES]
-  })
-  needs_numeric <- vapply(out, length, integer(1)) < 2
-  if (any(needs_numeric)) {
-    numeric_matches <- str_extract_all(raw[needs_numeric], "(^|[^0-9])([1-9]|1[0-2])(?=[^0-9]|$)")
-    out[needs_numeric] <- lapply(numeric_matches, function(m) {
-      idx <- suppressWarnings(as.integer(str_match(m, "([1-9]|1[0-2])")[, 2]))
-      EXPECTED_SITES[idx[!is.na(idx) & idx >= 1 & idx <= length(EXPECTED_SITES)]]
-    })
-  }
-  out
-}
-
-parse_pairwise_value <- function(x) {
-  suppressWarnings(readr::parse_number(as.character(x), na = c("", "NA", "NaN", "—", "-", "NULL")))
-}
-
-find_long_columns <- function(df, statistic) {
-  nm <- names(df)
-  clean <- tolower(str_replace_all(nm, "[^A-Za-z0-9]+", "_"))
-  clean <- str_replace_all(clean, "^_|_$", "")
-  compact <- str_replace_all(clean, "_", "")
-  
-  pop1_candidates <- c(
-    "population1", "population_1", "pop1", "pop_1", "site1", "site_1",
-    "site_a", "site_i", "pop_a", "pop_i", "population_a", "population_i",
-    "from", "row", "var1", "x"
-  )
-  pop2_candidates <- c(
-    "population2", "population_2", "pop2", "pop_2", "site2", "site_2",
-    "site_b", "site_j", "pop_b", "pop_j", "population_b", "population_j",
-    "to", "column", "col", "var2", "y"
-  )
-  
-  pop1 <- which(clean %in% pop1_candidates | compact %in% pop1_candidates)[1]
-  pop2 <- which(clean %in% pop2_candidates | compact %in% pop2_candidates)[1]
-  
-  # If column names are non-standard, identify the two columns whose values look
-  # most like the expected site labels after standardization.
-  if (is.na(pop1) || is.na(pop2)) {
-    site_like_counts <- vapply(df, function(col) sum(standardize_site(col) %in% EXPECTED_SITES, na.rm = TRUE), integer(1))
-    site_like <- which(site_like_counts > 0)
-    if (length(site_like) >= 2) {
-      ordered_site_like <- site_like[order(site_like_counts[site_like], decreasing = TRUE)]
-      pop1 <- ordered_site_like[1]
-      pop2 <- ordered_site_like[2]
-    }
+validate_sites <- function(gobj) {
+  site_values <- standardize_site(adegenet::pop(gobj))
+  if (length(site_values) != adegenet::nInd(gobj)) {
+    stop("[appendix_H] pop(gi_mll) length does not match nInd(gi_mll).", call. = FALSE)
   }
   
-  value_patterns <- if (statistic == "jost") {
-    c("jost", "jostd", "jost_d", "josts_d", "josts", "dest", "d_est")
-  } else {
-    c("fst", "f_st", "wc_fst", "weir", "cockerham", "theta")
-  }
-  value <- which(map_lgl(seq_along(clean), function(i) {
-    any(str_detect(clean[i], value_patterns)) ||
-      any(str_detect(compact[i], value_patterns)) ||
-      (statistic == "jost" && clean[i] %in% c("d", "value")) ||
-      (statistic == "fst" && clean[i] %in% c("value"))
-  }))[1]
+  observed_sites <- unique(site_values)
+  missing_sites <- setdiff(EXPECTED_SITES, observed_sites)
+  extra_sites <- setdiff(observed_sites, EXPECTED_SITES)
   
-  # If there is only one numeric value column after the two population columns,
-  # use it as a final fallback. This covers simple long tables such as
-  # population_1, population_2, value.
-  if (is.na(value) && !any(is.na(c(pop1, pop2)))) {
-    excluded <- c(pop1, pop2)
-    numeric_candidates <- which(map_lgl(df, ~ !all(is.na(parse_pairwise_value(.x)))))
-    numeric_candidates <- setdiff(numeric_candidates, excluded)
-    if (length(numeric_candidates) == 1) value <- numeric_candidates[1]
-  }
-  
-  if (any(is.na(c(pop1, pop2, value)))) return(NULL)
-  list(pop1 = nm[pop1], pop2 = nm[pop2], value = nm[value])
-}
-
-find_pair_column <- function(df) {
-  token_counts <- vapply(df, function(col) {
-    tokens <- extract_site_tokens(col)
-    sum(vapply(tokens, length, integer(1)) >= 2)
-  }, integer(1))
-  pair_columns <- which(token_counts > 0)
-  if (length(pair_columns) == 0) return(NULL)
-  pair_columns[order(token_counts[pair_columns], decreasing = TRUE)][1]
-}
-
-find_value_column <- function(df, statistic, excluded = integer(0)) {
-  nm <- names(df)
-  clean <- tolower(str_replace_all(nm, "[^A-Za-z0-9]+", "_"))
-  clean <- str_replace_all(clean, "^_|_$", "")
-  compact <- str_replace_all(clean, "_", "")
-  value_patterns <- if (statistic == "jost") {
-    c("jost", "jostd", "jost_d", "josts_d", "josts", "dest", "d_est")
-  } else {
-    c("fst", "f_st", "wc_fst", "weir", "cockerham", "theta")
-  }
-  
-  candidates <- which(map_lgl(seq_along(clean), function(i) {
-    any(str_detect(clean[i], value_patterns)) ||
-      any(str_detect(compact[i], value_patterns)) ||
-      (statistic == "jost" && clean[i] %in% c("d", "value")) ||
-      (statistic == "fst" && clean[i] %in% c("value"))
-  }))
-  candidates <- setdiff(candidates, excluded)
-  if (length(candidates) > 0) return(candidates[1])
-  
-  numeric_candidates <- which(map_lgl(df, ~ !all(is.na(parse_pairwise_value(.x)))))
-  numeric_candidates <- setdiff(numeric_candidates, excluded)
-  if (length(numeric_candidates) == 1) return(numeric_candidates[1])
-  NA_integer_
-}
-
-matrix_from_square <- function(df) {
-  rn <- rownames(df)
-  # If the first column contains site labels, use it as row names.
-  first_col <- df[[1]]
-  first_sites <- standardize_site(first_col)
-  if (sum(first_sites %in% EXPECTED_SITES, na.rm = TRUE) >= length(EXPECTED_SITES) / 2) {
-    rn <- first_sites
-    df <- df[-1]
-  }
-  cn <- standardize_site(names(df))
-  if (length(rn) != nrow(df) || all(rn %in% as.character(seq_len(nrow(df))))) rn <- cn[seq_len(nrow(df))]
-  rn <- standardize_site(rn)
-  if (nrow(df) != ncol(df) || !all(EXPECTED_SITES %in% rn) || !all(EXPECTED_SITES %in% cn)) return(NULL)
-  mat <- as.matrix(df)
-  suppressWarnings(storage.mode(mat) <- "numeric")
-  rownames(mat) <- rn
-  colnames(mat) <- cn
-  mat[EXPECTED_SITES, EXPECTED_SITES, drop = FALSE]
-}
-
-matrix_from_long <- function(df, statistic) {
-  build_matrix <- function(long) {
-    long <- long |>
-      filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES, !is.na(value))
-    if (nrow(long) == 0) return(NULL)
-    mat <- matrix(NA_real_, length(EXPECTED_SITES), length(EXPECTED_SITES), dimnames = list(EXPECTED_SITES, EXPECTED_SITES))
-    for (i in seq_len(nrow(long))) {
-      mat[long$pop1[i], long$pop2[i]] <- long$value[i]
-      mat[long$pop2[i], long$pop1[i]] <- long$value[i]
-    }
-    diag(mat) <- ifelse(is.na(diag(mat)), 0, diag(mat))
-    mat
-  }
-  
-  is_complete <- function(mat) {
-    !is.null(mat) && !any(is.na(mat[row(mat) != col(mat)]))
-  }
-  
-  best_mat <- NULL
-  best_filled <- -1L
-  keep_best <- function(mat) {
-    if (is.null(mat)) return(invisible(NULL))
-    filled <- sum(!is.na(mat[row(mat) != col(mat)]))
-    if (filled > best_filled) {
-      best_mat <<- mat
-      best_filled <<- filled
-    }
-    invisible(NULL)
-  }
-  
-  # 1) Named two-population-column long table.
-  cols <- find_long_columns(df, statistic)
-  if (!is.null(cols)) {
-    long <- df |>
-      transmute(pop1 = standardize_site(.data[[cols$pop1]]), pop2 = standardize_site(.data[[cols$pop2]]), value = parse_pairwise_value(.data[[cols$value]]))
-    mat <- build_matrix(long)
-    if (is_complete(mat)) return(mat)
-    keep_best(mat)
-  }
-  
-  # 2) Single pair/comparison column long table (e.g., "S1-S2").
-  pair_col <- find_pair_column(df)
-  if (!is.null(pair_col)) {
-    value_col <- find_value_column(df, statistic, excluded = pair_col)
-    if (!is.na(value_col)) {
-      pair_tokens <- extract_site_tokens(df[[pair_col]])
-      long <- tibble(
-        pop1 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 1) tokens[1] else NA_character_, character(1)),
-        pop2 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 2) tokens[2] else NA_character_, character(1)),
-        value = parse_pairwise_value(df[[value_col]])
-      )
-      mat <- build_matrix(long)
-      if (is_complete(mat)) return(mat)
-      keep_best(mat)
-    }
-  }
-  
-  # 3) Last-resort inference: try every pair of site-like columns and every
-  # numeric/statistic-like value column. This is intentionally broad so simple
-  # exported pairwise tables with unexpected headers still parse.
-  site_like_counts <- vapply(df, function(col) sum(standardize_site(col) %in% EXPECTED_SITES, na.rm = TRUE), integer(1))
-  site_cols <- which(site_like_counts > 0)
-  if (length(site_cols) >= 2) {
-    value_cols <- unique(c(
-      find_value_column(df, statistic, excluded = integer(0)),
-      which(map_lgl(df, ~ !all(is.na(parse_pairwise_value(.x)))))
-    ))
-    value_cols <- value_cols[!is.na(value_cols)]
-    for (pop_cols in utils::combn(site_cols, 2, simplify = FALSE)) {
-      for (value_col in setdiff(value_cols, pop_cols)) {
-        long <- tibble(
-          pop1 = standardize_site(df[[pop_cols[1]]]),
-          pop2 = standardize_site(df[[pop_cols[2]]]),
-          value = parse_pairwise_value(df[[value_col]])
-        )
-        mat <- build_matrix(long)
-        if (is_complete(mat)) return(mat)
-        keep_best(mat)
-      }
-    }
-  }
-  
-  best_mat
-}
-
-read_pairwise_matrix <- function(path, statistic) {
-  obj <- read_candidate(path)
-  if (!is.data.frame(obj)) stop("[appendix_H] Input is not a data frame or matrix: ", path, call. = FALSE)
-  mat <- matrix_from_square(obj)
-  if (is.null(mat)) mat <- matrix_from_long(obj, statistic)
-  if (is.null(mat)) {
+  if (length(missing_sites) > 0 || length(extra_sites) > 0) {
     stop(
-      "[appendix_H] Could not parse ", statistic,
-      " input as either a square matrix or long pairwise table: ", path,
-      ". Available columns: ", paste(names(obj), collapse = ", "),
+      "[appendix_H] Site labels in gi_mll do not match the 12 expected thesis sites.",
+      "\nMissing expected site(s): ", ifelse(length(missing_sites) == 0, "none", paste(missing_sites, collapse = ", ")),
+      "\nUnexpected site(s): ", ifelse(length(extra_sites) == 0, "none", paste(extra_sites, collapse = ", ")),
+      "\nObserved site labels: ", paste(sort(observed_sites), collapse = ", "),
       call. = FALSE
     )
   }
-  mat[EXPECTED_SITES, EXPECTED_SITES, drop = FALSE]
+  
+  site_counts <- table(factor(site_values, levels = EXPECTED_SITES))
+  if (any(site_counts == 0)) {
+    stop("[appendix_H] At least one expected site has zero individuals after clone correction.", call. = FALSE)
+  }
+  
+  adegenet::pop(gobj) <- factor(site_values, levels = EXPECTED_SITES)
+  gobj
+}
+
+coerce_numeric_matrix <- function(x, label) {
+  if (inherits(x, "dist")) {
+    mat <- as.matrix(x)
+  } else if (is.matrix(x)) {
+    mat <- x
+  } else if (is.data.frame(x)) {
+    mat <- as.matrix(x)
+  } else {
+    mat <- tryCatch(as.matrix(x), error = function(e) NULL)
+  }
+  
+  if (is.null(mat) || !is.matrix(mat)) {
+    stop("[appendix_H] Could not coerce ", label, " result to a matrix.", call. = FALSE)
+  }
+  
+  suppressWarnings(storage.mode(mat) <- "numeric")
+  if (!is.numeric(mat)) {
+    stop("[appendix_H] ", label, " matrix is not numeric after coercion.", call. = FALSE)
+  }
+  mat
+}
+
+order_matrix <- function(mat, label) {
+  if (nrow(mat) != ncol(mat)) {
+    stop("[appendix_H] ", label, " result is not a square matrix.", call. = FALSE)
+  }
+  
+  rn <- standardize_site(rownames(mat))
+  cn <- standardize_site(colnames(mat))
+  
+  if (length(rn) == nrow(mat) && length(cn) == ncol(mat) &&
+      all(EXPECTED_SITES %in% rn) && all(EXPECTED_SITES %in% cn)) {
+    rownames(mat) <- rn
+    colnames(mat) <- cn
+    mat <- mat[EXPECTED_SITES, EXPECTED_SITES, drop = FALSE]
+  } else if (nrow(mat) == length(EXPECTED_SITES)) {
+    # Some genetics functions return matrices in population-level order without
+    # useful labels. Because pop(gi_mll) is explicitly factored with EXPECTED_SITES,
+    # the function output order is expected to follow that population order.
+    rownames(mat) <- EXPECTED_SITES
+    colnames(mat) <- EXPECTED_SITES
+  } else {
+    stop(
+      "[appendix_H] Could not align ", label, " matrix to the 12 expected sites.",
+      "\nRow names: ", paste(rownames(mat), collapse = ", "),
+      "\nColumn names: ", paste(colnames(mat), collapse = ", "),
+      call. = FALSE
+    )
+  }
+  
+  mat
 }
 
 validate_pairwise_matrix <- function(mat, label) {
-  missing_sites <- setdiff(EXPECTED_SITES, rownames(mat))
-  if (length(missing_sites) > 0) stop("[appendix_H] ", label, " matrix is missing site(s): ", paste(missing_sites, collapse = ", "), call. = FALSE)
+  if (!identical(rownames(mat), EXPECTED_SITES) || !identical(colnames(mat), EXPECTED_SITES)) {
+    stop("[appendix_H] ", label, " matrix is not ordered with the expected site labels.", call. = FALSE)
+  }
   if (!isTRUE(all.equal(mat, t(mat), tolerance = TOLERANCE, check.attributes = FALSE))) {
     stop("[appendix_H] ", label, " matrix is not symmetric within tolerance ", TOLERANCE, ".", call. = FALSE)
   }
@@ -452,15 +224,16 @@ validate_pairwise_matrix <- function(mat, label) {
     stop("[appendix_H] ", label, " diagonal must be zero or NA before formatting.", call. = FALSE)
   }
   off_diag <- mat[row(mat) != col(mat)]
-  if (any(is.na(off_diag))) stop("[appendix_H] ", label, " matrix has missing off-diagonal pairwise values.", call. = FALSE)
+  if (any(is.na(off_diag))) {
+    stop("[appendix_H] ", label, " matrix has missing off-diagonal pairwise values.", call. = FALSE)
+  }
   invisible(TRUE)
 }
 
 format_matrix_for_csv <- function(mat) {
-  out <- as.data.frame(mat, check.names = FALSE) |>
+  as.data.frame(mat, check.names = FALSE) |>
     mutate(across(everything(), ~ ifelse(is.na(.x), NA_character_, sprintf("%.3f", round(.x, 3))))) |>
     tibble::rownames_to_column("Site")
-  out
 }
 
 make_combined_table <- function(jost_mat, fst_mat) {
@@ -486,15 +259,14 @@ write_appendix_docx <- function(combined_tbl, path) {
     bold(part = "header") |>
     bold(j = 1, part = "body") |>
     align(align = "center", part = "all") |>
-    align(j = 1, align = "center", part = "all") |>
     bg(part = "header", bg = "#F2F2F2") |>
     border_remove() |>
     hline_top(part = "header", border = fp_border(color = "#666666", width = 1)) |>
     hline_bottom(part = "header", border = fp_border(color = "#666666", width = 0.75)) |>
     hline_bottom(part = "body", border = fp_border(color = "#666666", width = 1)) |>
     padding(padding = 1.5, part = "all") |>
-    width(j = 1, width = 0.45) |>
-    width(j = 2:ncol(combined_tbl), width = 0.47) |>
+    width(j = 1, width = 0.55) |>
+    width(j = 2:ncol(combined_tbl), width = 0.48) |>
     set_table_properties(layout = "fixed", width = 0.98)
   
   doc <- read_docx() |>
@@ -509,22 +281,38 @@ write_appendix_docx <- function(combined_tbl, path) {
 }
 
 # ----------------------------
-# Main workflow
+# Recompute pairwise statistics from gi_mll
 # ----------------------------
-dir.create(TABLES_DIR, recursive = TRUE, showWarnings = FALSE)
-dir.create(SUPPLEMENTARY_DIR, recursive = TRUE, showWarnings = FALSE)
+gi_mll <- validate_sites(gi_mll)
+site_counts <- table(adegenet::pop(gi_mll))
+message_h("Validated expected sites exactly: ", paste(EXPECTED_SITES, collapse = ", "))
+message_h("Clone-corrected individuals per site: ", paste(paste(names(site_counts), site_counts, sep = "="), collapse = ", "))
 
-jost_file <- select_input_file("jost")
-fst_file <- select_input_file("fst")
-message_h("Jost's D input file: ", jost_file)
-message_h("FST input file: ", fst_file)
-
-jost_mat <- read_pairwise_matrix(jost_file, "jost")
-fst_mat <- read_pairwise_matrix(fst_file, "fst")
+message_h("Computing pairwise Jost's D with mmod::pairwise_D(linearized = FALSE).")
+jost_raw <- mmod::pairwise_D(gi_mll, linearized = FALSE)
+jost_mat <- coerce_numeric_matrix(jost_raw, "Jost's D") |>
+  order_matrix("Jost's D")
+diag(jost_mat) <- 0
 validate_pairwise_matrix(jost_mat, "Jost's D")
+
+message_h("Computing pairwise Weir and Cockerham's FST with hierfstat::pairwise.WCfst().")
+hf <- hierfstat::genind2hierfstat(gi_mll)
+if (!is.data.frame(hf) || ncol(hf) < 2) {
+  stop("[appendix_H] hierfstat::genind2hierfstat returned an invalid data frame.", call. = FALSE)
+}
+if (!is.numeric(hf[[1]])) hf[[1]] <- as.integer(factor(hf[[1]], levels = EXPECTED_SITES))
+
+fst_raw <- hierfstat::pairwise.WCfst(hf)
+fst_mat <- coerce_numeric_matrix(fst_raw, "FST") |>
+  order_matrix("FST")
+diag(fst_mat) <- 0
 validate_pairwise_matrix(fst_mat, "FST")
 
+# ----------------------------
+# Save outputs
+# ----------------------------
 combined_tbl <- make_combined_table(jost_mat, fst_mat)
+
 readr::write_csv(combined_tbl, OUTPUT_CSV, na = "")
 readr::write_csv(format_matrix_for_csv(jost_mat), JOST_MATRIX_CSV, na = "")
 readr::write_csv(format_matrix_for_csv(fst_mat), FST_MATRIX_CSV, na = "")

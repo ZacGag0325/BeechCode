@@ -191,6 +191,9 @@ standardize_site <- function(x) {
   cleaned <- str_replace(cleaned, "^N0([1-6])$", "N\\1")
   
   out <- ifelse(!is.na(token), token, cleaned)
+  numeric_site <- suppressWarnings(as.integer(out))
+  numeric_index <- !is.na(numeric_site) & numeric_site >= 1 & numeric_site <= length(EXPECTED_SITES)
+  out[numeric_index] <- EXPECTED_SITES[numeric_site[numeric_index]]
   out <- str_replace(out, "^S0([1-6])$", "S\\1")
   out <- str_replace(out, "^N0([1-6])$", "N\\1")
   out
@@ -202,12 +205,21 @@ extract_site_tokens <- function(x) {
   raw <- str_replace_all(raw, "SOUTH\\s*0?([1-6])", "S\\1")
   raw <- str_replace_all(raw, "NORTH\\s*0?([1-6])", "N\\1")
   matches <- str_extract_all(raw, "(^|[^A-Z0-9])([SN]0?[1-6])(?=[^A-Z0-9]|$)")
-  lapply(matches, function(m) {
+  out <- lapply(matches, function(m) {
     tokens <- str_match(m, "([SN]0?[1-6])")[, 2]
     tokens <- str_replace(tokens, "^S0([1-6])$", "S\\1")
     tokens <- str_replace(tokens, "^N0([1-6])$", "N\\1")
     tokens[tokens %in% EXPECTED_SITES]
   })
+  needs_numeric <- vapply(out, length, integer(1)) < 2
+  if (any(needs_numeric)) {
+    numeric_matches <- str_extract_all(raw[needs_numeric], "(^|[^0-9])([1-9]|1[0-2])(?=[^0-9]|$)")
+    out[needs_numeric] <- lapply(numeric_matches, function(m) {
+      idx <- suppressWarnings(as.integer(str_match(m, "([1-9]|1[0-2])")[, 2]))
+      EXPECTED_SITES[idx[!is.na(idx) & idx >= 1 & idx <= length(EXPECTED_SITES)]]
+    })
+  }
+  out
 }
 
 parse_pairwise_value <- function(x) {
@@ -329,32 +341,88 @@ matrix_from_square <- function(df) {
 }
 
 matrix_from_long <- function(df, statistic) {
+  build_matrix <- function(long) {
+    long <- long |>
+      filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES, !is.na(value))
+    if (nrow(long) == 0) return(NULL)
+    mat <- matrix(NA_real_, length(EXPECTED_SITES), length(EXPECTED_SITES), dimnames = list(EXPECTED_SITES, EXPECTED_SITES))
+    for (i in seq_len(nrow(long))) {
+      mat[long$pop1[i], long$pop2[i]] <- long$value[i]
+      mat[long$pop2[i], long$pop1[i]] <- long$value[i]
+    }
+    diag(mat) <- ifelse(is.na(diag(mat)), 0, diag(mat))
+    mat
+  }
+  
+  is_complete <- function(mat) {
+    !is.null(mat) && !any(is.na(mat[row(mat) != col(mat)]))
+  }
+  
+  best_mat <- NULL
+  best_filled <- -1L
+  keep_best <- function(mat) {
+    if (is.null(mat)) return(invisible(NULL))
+    filled <- sum(!is.na(mat[row(mat) != col(mat)]))
+    if (filled > best_filled) {
+      best_mat <<- mat
+      best_filled <<- filled
+    }
+    invisible(NULL)
+  }
+  
+  # 1) Named two-population-column long table.
   cols <- find_long_columns(df, statistic)
   if (!is.null(cols)) {
     long <- df |>
-      transmute(pop1 = standardize_site(.data[[cols$pop1]]), pop2 = standardize_site(.data[[cols$pop2]]), value = parse_pairwise_value(.data[[cols$value]])) |>
-      filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES)
-  } else {
-    pair_col <- find_pair_column(df)
-    if (is.null(pair_col)) return(NULL)
+      transmute(pop1 = standardize_site(.data[[cols$pop1]]), pop2 = standardize_site(.data[[cols$pop2]]), value = parse_pairwise_value(.data[[cols$value]]))
+    mat <- build_matrix(long)
+    if (is_complete(mat)) return(mat)
+    keep_best(mat)
+  }
+  
+  # 2) Single pair/comparison column long table (e.g., "S1-S2").
+  pair_col <- find_pair_column(df)
+  if (!is.null(pair_col)) {
     value_col <- find_value_column(df, statistic, excluded = pair_col)
-    if (is.na(value_col)) return(NULL)
-    pair_tokens <- extract_site_tokens(df[[pair_col]])
-    long <- tibble(
-      pop1 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 1) tokens[1] else NA_character_, character(1)),
-      pop2 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 2) tokens[2] else NA_character_, character(1)),
-      value = parse_pairwise_value(df[[value_col]])
-    ) |>
-      filter(pop1 %in% EXPECTED_SITES, pop2 %in% EXPECTED_SITES)
+    if (!is.na(value_col)) {
+      pair_tokens <- extract_site_tokens(df[[pair_col]])
+      long <- tibble(
+        pop1 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 1) tokens[1] else NA_character_, character(1)),
+        pop2 = vapply(pair_tokens, function(tokens) if (length(tokens) >= 2) tokens[2] else NA_character_, character(1)),
+        value = parse_pairwise_value(df[[value_col]])
+      )
+      mat <- build_matrix(long)
+      if (is_complete(mat)) return(mat)
+      keep_best(mat)
+    }
   }
-  mat <- matrix(NA_real_, length(EXPECTED_SITES), length(EXPECTED_SITES), dimnames = list(EXPECTED_SITES, EXPECTED_SITES))
-  if (nrow(long) == 0) return(NULL)
-  for (i in seq_len(nrow(long))) {
-    mat[long$pop1[i], long$pop2[i]] <- long$value[i]
-    mat[long$pop2[i], long$pop1[i]] <- long$value[i]
+  
+  # 3) Last-resort inference: try every pair of site-like columns and every
+  # numeric/statistic-like value column. This is intentionally broad so simple
+  # exported pairwise tables with unexpected headers still parse.
+  site_like_counts <- vapply(df, function(col) sum(standardize_site(col) %in% EXPECTED_SITES, na.rm = TRUE), integer(1))
+  site_cols <- which(site_like_counts > 0)
+  if (length(site_cols) >= 2) {
+    value_cols <- unique(c(
+      find_value_column(df, statistic, excluded = integer(0)),
+      which(map_lgl(df, ~ !all(is.na(parse_pairwise_value(.x)))))
+    ))
+    value_cols <- value_cols[!is.na(value_cols)]
+    for (pop_cols in utils::combn(site_cols, 2, simplify = FALSE)) {
+      for (value_col in setdiff(value_cols, pop_cols)) {
+        long <- tibble(
+          pop1 = standardize_site(df[[pop_cols[1]]]),
+          pop2 = standardize_site(df[[pop_cols[2]]]),
+          value = parse_pairwise_value(df[[value_col]])
+        )
+        mat <- build_matrix(long)
+        if (is_complete(mat)) return(mat)
+        keep_best(mat)
+      }
+    }
   }
-  diag(mat) <- ifelse(is.na(diag(mat)), 0, diag(mat))
-  mat
+  
+  best_mat
 }
 
 read_pairwise_matrix <- function(path, statistic) {

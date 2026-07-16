@@ -45,21 +45,82 @@ suppressPackageStartupMessages({
 
 source("scripts/_load_objects.R")
 
+SITE_LEVELS <- c(
+  "S1", "S2", "S3", "S4", "S5", "S6",
+  "N1", "N2", "N3", "N4", "N5", "N6"
+)
+
+site_lookup <- c(
+  AMC = "S1",
+  ALB = "S2",
+  IKJ = "S3",
+  IKO = "S4",
+  LGG = "S5",
+  LGR = "S6",
+  ML1 = "N1",
+  ML2 = "N2",
+  ML3 = "N3",
+  CPF = "N4",
+  PLI = "N5",
+  LDF = "N6"
+)
+
+standardize_site_label <- function(x) {
+  x <- trimws(as.character(x))
+  mapped <- unname(site_lookup[x])
+  mapped[is.na(mapped)] <- x[is.na(mapped)]
+  factor(mapped, levels = SITE_LEVELS, ordered = TRUE)
+}
+
+site_region <- function(site) {
+  site <- as.character(site)
+  dplyr::case_when(
+    site %in% paste0("S", 1:6) ~ "South",
+    site %in% paste0("N", 1:6) ~ "North",
+    TRUE ~ NA_character_
+  )
+}
+
+site_display_label <- function(site) {
+  as.character(site)
+}
+
 message("[05_pca_dapc] Running PCA and DAPC on gi_mll...")
 
 if (!inherits(gi_mll, "genind")) {
   stop("[05_pca_dapc] gi_mll must be a genind object. Run scripts/00_master_pipeline.R first.")
 }
 
+# Standardize the analysis metadata after loading. Raw metadata files and raw
+# sample identifiers remain unchanged.
 validate_columns(df_ids_mll, c("ind_id", "Site"), df_name = "[05_pca_dapc] df_ids_mll")
+df_ids_mll <- df_ids_mll %>%
+  mutate(
+    Site = standardize_site_label(Site),
+    Region = site_region(Site)
+  )
+
+if (any(is.na(df_ids_mll$Site))) {
+  stop(
+    "[05_pca_dapc] One or more Site values could not be standardized to SITE_LEVELS. Raw input files were not modified."
+  )
+}
+
 if (!all(adegenet::indNames(gi_mll) == df_ids_mll$ind_id)) {
   stop("[05_pca_dapc] gi_mll and df_ids_mll are not aligned.")
 }
+
+adegenet::pop(gi_mll) <- factor(
+  as.character(df_ids_mll$Site),
+  levels = SITE_LEVELS,
+  ordered = TRUE
+)
+
 if (!identical(as.character(adegenet::pop(gi_mll)), as.character(df_ids_mll$Site))) {
   stop("[05_pca_dapc] pop(gi_mll) must match df_ids_mll$Site for consistent grouping.")
 }
 
-site_factor <- droplevels(factor(as.character(df_ids_mll$Site)))
+site_factor <- droplevels(factor(as.character(df_ids_mll$Site), levels = SITE_LEVELS, ordered = TRUE))
 site_counts <- table(site_factor)
 
 if (nlevels(site_factor) < 2) {
@@ -124,13 +185,15 @@ n_pc <- ncol(scores_mat)
 
 pca_scores <- data.frame(
   Individual = rownames(scores_mat),
-  Site = as.character(site_factor),
+  Site = factor(as.character(site_factor), levels = SITE_LEVELS, ordered = TRUE),
+  Region = site_region(site_factor),
   PC1 = if (n_pc >= 1) scores_mat[, 1] else NA_real_,
   PC2 = if (n_pc >= 2) scores_mat[, 2] else NA_real_,
   PC3 = if (n_pc >= 3) scores_mat[, 3] else NA_real_,
   stringsAsFactors = FALSE
 ) %>%
-  filter(!is.na(Site), nzchar(Site))
+  filter(!is.na(Site), nzchar(as.character(Site))) %>%
+  arrange(Site, Individual)
 
 pca_scores_file <- file.path(TABLES_DIR, "pca_scores.csv")
 write.csv(pca_scores, pca_scores_file, row.names = FALSE)
@@ -187,6 +250,8 @@ pca_plot_12 <- ggplot(plot_12_df, aes(PC1, PC2, color = Site)) +
     }
   } +
   geom_point(size = 2.4, alpha = 0.92) +
+  scale_color_discrete(limits = SITE_LEVELS, labels = site_display_label, drop = TRUE) +
+  scale_fill_discrete(limits = SITE_LEVELS, labels = site_display_label, drop = TRUE) +
   plot_theme +
   labs(
     title = "PCA (PC1 vs PC2)",
@@ -206,6 +271,7 @@ if (n_pc >= 3) {
   if (nrow(plot_13_df) > 0) {
     pca_plot_13 <- ggplot(plot_13_df, aes(PC1, PC3, color = Site)) +
       geom_point(size = 2.3, alpha = 0.9) +
+      scale_color_discrete(limits = SITE_LEVELS, labels = site_display_label, drop = TRUE) +
       plot_theme +
       labs(
         title = "PCA (PC1 vs PC3)",
@@ -224,6 +290,7 @@ if (n_pc >= 3) {
   if (nrow(plot_23_df) > 0) {
     pca_plot_23 <- ggplot(plot_23_df, aes(PC2, PC3, color = Site)) +
       geom_point(size = 2.3, alpha = 0.9) +
+      scale_color_discrete(limits = SITE_LEVELS, labels = site_display_label, drop = TRUE) +
       plot_theme +
       labs(
         title = "PCA (PC2 vs PC3)",
@@ -378,12 +445,14 @@ colnames(dapc_coords)[1:2] <- c("LD1", "LD2")
 
 dapc_coordinates <- data.frame(
   Individual = adegenet::indNames(gi_mll),
-  Site = as.character(site_factor),
+  Site = factor(as.character(site_factor), levels = SITE_LEVELS, ordered = TRUE),
+  Region = site_region(site_factor),
   LD1 = as.numeric(dapc_coords$LD1),
   LD2 = as.numeric(dapc_coords$LD2),
   stringsAsFactors = FALSE
 ) %>%
-  filter(!is.na(Site), nzchar(Site), is.finite(LD1), is.finite(LD2))
+  filter(!is.na(Site), nzchar(as.character(Site)), is.finite(LD1), is.finite(LD2)) %>%
+  arrange(Site, Individual)
 
 if (nrow(dapc_coordinates) == 0) {
   stop("[05_pca_dapc] No valid rows available for DAPC outputs after filtering.")
@@ -396,11 +465,13 @@ message("[05_pca_dapc] Saved: ", dapc_coord_file)
 dapc_centroids <- dapc_coordinates %>%
   group_by(Site) %>%
   summarise(
+    Region = dplyr::first(Region),
     n_clone_corrected = n(),
     LD1_centroid = mean(LD1, na.rm = TRUE),
     LD2_centroid = mean(LD2, na.rm = TRUE),
     .groups = "drop"
   ) %>%
+  mutate(Site = factor(as.character(Site), levels = SITE_LEVELS, ordered = TRUE)) %>%
   arrange(Site)
 
 centroids_file <- file.path(TABLES_DIR, "dapc_group_centroids.csv")
@@ -413,16 +484,36 @@ posterior_df <- if (!is.null(dapc_fit$posterior)) {
   data.frame(matrix(nrow = adegenet::nInd(gi_mll), ncol = 0))
 }
 
+if (ncol(posterior_df) > 0) {
+  posterior_sites <- as.character(standardize_site_label(colnames(posterior_df)))
+  if (any(is.na(posterior_sites))) {
+    stop("[05_pca_dapc] DAPC posterior columns contain unrecognized Site labels.")
+  }
+  colnames(posterior_df) <- posterior_sites
+  posterior_order <- SITE_LEVELS[SITE_LEVELS %in% colnames(posterior_df)]
+  posterior_df <- posterior_df[, posterior_order, drop = FALSE]
+}
+
+assigned_site <- if (!is.null(dapc_fit$assign)) {
+  standardize_site_label(dapc_fit$assign)
+} else {
+  factor(rep(NA_character_, adegenet::nInd(gi_mll)), levels = SITE_LEVELS, ordered = TRUE)
+}
+
 assignment_summary <- data.frame(
   Individual = adegenet::indNames(gi_mll),
-  observed_site = as.character(site_factor),
-  assigned_site = if (!is.null(dapc_fit$assign)) as.character(dapc_fit$assign) else NA_character_,
+  observed_site = factor(as.character(site_factor), levels = SITE_LEVELS, ordered = TRUE),
+  observed_region = site_region(site_factor),
+  assigned_site = assigned_site,
+  assigned_region = site_region(assigned_site),
   max_posterior = if (ncol(posterior_df) > 0) apply(as.matrix(posterior_df), 1, max, na.rm = TRUE) else NA_real_,
   stringsAsFactors = FALSE
-)
+) %>%
+  arrange(observed_site, Individual)
 
 if (ncol(posterior_df) > 0) {
-  colnames(posterior_df) <- paste0("posterior_", make.names(colnames(posterior_df), unique = TRUE))
+  colnames(posterior_df) <- paste0("posterior_", colnames(posterior_df))
+  posterior_df <- posterior_df[match(assignment_summary$Individual, adegenet::indNames(gi_mll)), , drop = FALSE]
   assignment_summary <- cbind(assignment_summary, posterior_df)
 }
 
@@ -514,6 +605,8 @@ dapc_plot <- ggplot(dapc_coordinates, aes(LD1, LD2, color = Site)) +
     vjust = -0.7,
     check_overlap = TRUE
   ) +
+  scale_color_discrete(limits = SITE_LEVELS, labels = site_display_label, drop = TRUE) +
+  scale_fill_discrete(limits = SITE_LEVELS, labels = site_display_label, drop = TRUE) +
   plot_theme +
   labs(
     title = "DAPC by Site (clone-corrected microsatellite data)",

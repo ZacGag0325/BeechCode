@@ -22,7 +22,7 @@
 # - Builds ONE final individual plot per K (no per-run figures)
 # - Builds ONE combined all-K figure
 # - Computes mean latitude / longitude centroids per site from per-individual GPS
-# - Orders sites strictly SOUTH -> NORTH by mean latitude
+# - Orders sites strictly as S1-S6, then N1-N6
 # - Reorders individuals so they are grouped by site in that same order
 # - Adds separator lines and site labels for publication-ready readability
 # - Exports site-level mean Q summaries to support biological interpretation
@@ -47,6 +47,90 @@ suppressPackageStartupMessages({
 })
 
 source("scripts/_load_objects.R")
+
+SITE_LEVELS <- c(
+  "S1", "S2", "S3", "S4", "S5", "S6",
+  "N1", "N2", "N3", "N4", "N5", "N6"
+)
+
+site_lookup <- c(
+  AMC = "S1",
+  ALB = "S2",
+  IKJ = "S3",
+  IKO = "S4",
+  LGG = "S5",
+  LGR = "S6",
+  ML1 = "N1",
+  ML2 = "N2",
+  ML3 = "N3",
+  CPF = "N4",
+  PLI = "N5",
+  LDF = "N6"
+)
+
+standardize_site_label <- function(x) {
+  x <- trimws(as.character(x))
+  mapped <- unname(site_lookup[x])
+  mapped[is.na(mapped)] <- x[is.na(mapped)]
+  factor(mapped, levels = SITE_LEVELS, ordered = TRUE)
+}
+
+site_region <- function(site) {
+  site <- as.character(site)
+  dplyr::case_when(
+    site %in% paste0("S", 1:6) ~ "South",
+    site %in% paste0("N", 1:6) ~ "North",
+    TRUE ~ NA_character_
+  )
+}
+
+site_display_label <- function(site) {
+  as.character(site)
+}
+
+# Standardize loaded analysis objects after import. Raw metadata files,
+# STRUCTURE Q files, source genotype files, and raw sample IDs remain unchanged.
+if (exists("df_ids", inherits = FALSE)) {
+  df_ids_cols_standardize <- resolve_df_ids_columns(df_ids, context = "[03_structure standardization]", require = TRUE)
+  df_ids[[df_ids_cols_standardize$site_col]] <- standardize_site_label(df_ids[[df_ids_cols_standardize$site_col]])
+  if (any(is.na(df_ids[[df_ids_cols_standardize$site_col]]))) {
+    stop("[03_structure] One or more df_ids Site values could not be standardized to SITE_LEVELS.", call. = FALSE)
+  }
+  df_ids$Region <- site_region(df_ids[[df_ids_cols_standardize$site_col]])
+}
+
+if (exists("df_ids_mll", inherits = FALSE)) {
+  df_ids_mll_cols_standardize <- resolve_df_ids_columns(df_ids_mll, context = "[03_structure standardization]", require = TRUE)
+  df_ids_mll[[df_ids_mll_cols_standardize$site_col]] <- standardize_site_label(df_ids_mll[[df_ids_mll_cols_standardize$site_col]])
+  if (any(is.na(df_ids_mll[[df_ids_mll_cols_standardize$site_col]]))) {
+    stop("[03_structure] One or more df_ids_mll Site values could not be standardized to SITE_LEVELS.", call. = FALSE)
+  }
+  df_ids_mll$Region <- site_region(df_ids_mll[[df_ids_mll_cols_standardize$site_col]])
+}
+
+if (exists("gi", inherits = FALSE) && exists("df_ids", inherits = FALSE) && inherits(gi, "genind")) {
+  gi_site_map_standardize <- setNames(
+    as.character(df_ids[[df_ids_cols_standardize$site_col]]),
+    normalize_id(df_ids[[df_ids_cols_standardize$id_col]])
+  )
+  gi_sites_standardized <- gi_site_map_standardize[normalize_id(adegenet::indNames(gi))]
+  if (any(is.na(gi_sites_standardized))) {
+    stop("[03_structure] Could not align all gi individuals to standardized df_ids Site labels.", call. = FALSE)
+  }
+  adegenet::pop(gi) <- factor(gi_sites_standardized, levels = SITE_LEVELS, ordered = TRUE)
+}
+
+if (exists("gi_mll", inherits = FALSE) && exists("df_ids_mll", inherits = FALSE) && inherits(gi_mll, "genind")) {
+  gi_mll_site_map_standardize <- setNames(
+    as.character(df_ids_mll[[df_ids_mll_cols_standardize$site_col]]),
+    normalize_id(df_ids_mll[[df_ids_mll_cols_standardize$id_col]])
+  )
+  gi_mll_sites_standardized <- gi_mll_site_map_standardize[normalize_id(adegenet::indNames(gi_mll))]
+  if (any(is.na(gi_mll_sites_standardized))) {
+    stop("[03_structure] Could not align all gi_mll individuals to standardized df_ids_mll Site labels.", call. = FALSE)
+  }
+  adegenet::pop(gi_mll) <- factor(gi_mll_sites_standardized, levels = SITE_LEVELS, ordered = TRUE)
+}
 
 STRUCTURE_Q_FOLDER_NAME <- "Q_Files_2"
 STRUCTURE_RESULTS_FOLDER_NAME <- "HEG_ZG_run2"
@@ -118,7 +202,8 @@ normalize_site <- function(x) {
   x <- gsub("\\uFEFF", "", x, fixed = TRUE)
   x <- gsub("[[:cntrl:]]", "", x)
   x <- gsub("\\s+", " ", x)
-  toupper(x)
+  x <- toupper(x)
+  as.character(standardize_site_label(x))
 }
 
 normalize_name <- function(x) {
@@ -400,9 +485,21 @@ resolve_individual_coordinate_table <- function(reference_ids, canonical_site_ma
   message("[03_structure] Coordinate metadata sheet: ", ifelse(is.na(selected$sheet), "<file>", selected$sheet))
   message("[03_structure] Coordinate metadata columns: ID=", sm$id_col, ", Site=", sm$site_col, ", Latitude=", sm$lat_col, ", Longitude=", sm$lon_col)
   
+  raw_site_values <- trimws(as.character(df[[sm$site_col]]))
+  standardized_site_values <- standardize_site_label(raw_site_values)
+  if (any(is.na(standardized_site_values) & nzchar(raw_site_values))) {
+    bad_values <- unique(raw_site_values[is.na(standardized_site_values) & nzchar(raw_site_values)])
+    stop(
+      "[03_structure] Coordinate metadata contains Site values outside site_lookup/SITE_LEVELS: ",
+      paste(head(bad_values, 20), collapse = ", "),
+      call. = FALSE
+    )
+  }
+
   coord_tbl <- data.frame(
     ind_id = trimws(as.character(df[[sm$id_col]])),
-    Site = trimws(as.character(df[[sm$site_col]])),
+    Site = factor(as.character(standardized_site_values), levels = SITE_LEVELS, ordered = TRUE),
+    Region = site_region(standardized_site_values),
     Latitude = coerce_numeric_strict(df[[sm$lat_col]], sm$lat_col, "[03_structure]"),
     Longitude = coerce_numeric_strict(df[[sm$lon_col]], sm$lon_col, "[03_structure]"),
     stringsAsFactors = FALSE
@@ -477,7 +574,7 @@ resolve_individual_coordinate_table <- function(reference_ids, canonical_site_ma
     )
   }
   
-  exact_mismatch <- which(joined$Site_structure != joined$Site)
+  exact_mismatch <- which(as.character(joined$Site_structure) != as.character(joined$Site))
   if (length(exact_mismatch) > 0) {
     bad_rows <- joined[exact_mismatch[seq_len(min(10, length(exact_mismatch)))], , drop = FALSE]
     stop(
@@ -493,7 +590,8 @@ resolve_individual_coordinate_table <- function(reference_ids, canonical_site_ma
   joined %>%
     transmute(
       ind_id = ind_id_structure,
-      Site = Site_structure,
+      Site = factor(as.character(standardize_site_label(Site_structure)), levels = SITE_LEVELS, ordered = TRUE),
+      Region = site_region(Site_structure),
       Site_norm = normalize_site(Site_structure),
       Latitude = Latitude,
       Longitude = Longitude
@@ -508,14 +606,18 @@ build_site_coordinate_table <- function(individual_coord_tbl) {
   site_tbl <- individual_coord_tbl %>%
     group_by(Site_norm) %>%
     summarise(
-      Site = dplyr::first(Site),
+      Site = dplyr::first(as.character(Site)),
+      Region = dplyr::first(Region),
       mean_latitude = mean(Latitude, na.rm = TRUE),
       mean_longitude = mean(Longitude, na.rm = TRUE),
       n_individuals = n(),
       .groups = "drop"
     ) %>%
-    arrange(mean_latitude, Site) %>%
-    mutate(site_order_south_to_north = seq_len(n()))
+    mutate(
+      Site = factor(Site, levels = SITE_LEVELS, ordered = TRUE),
+      site_order_south_to_north = match(as.character(Site), SITE_LEVELS)
+    ) %>%
+    arrange(Site)
   
   if (any(!is.finite(site_tbl$mean_latitude) | !is.finite(site_tbl$mean_longitude))) {
     bad_sites <- site_tbl$Site[!is.finite(site_tbl$mean_latitude) | !is.finite(site_tbl$mean_longitude)]
@@ -550,12 +652,17 @@ build_site_coordinate_table <- function(individual_coord_tbl) {
 build_base_order <- function(ids_vec, site_map_final, site_coord_tbl) {
   out <- data.frame(
     Individual = ids_vec,
-    Site = unname(site_map_final[normalize_id(ids_vec)]),
+    Site = factor(
+      as.character(standardize_site_label(unname(site_map_final[normalize_id(ids_vec)]))),
+      levels = SITE_LEVELS,
+      ordered = TRUE
+    ),
     stringsAsFactors = FALSE
   )
+  out$Region <- site_region(out$Site)
   
-  if (any(is.na(out$Site) | !nzchar(out$Site))) {
-    missing_ids <- out$Individual[is.na(out$Site) | !nzchar(out$Site)]
+  if (any(is.na(out$Site) | !nzchar(as.character(out$Site)))) {
+    missing_ids <- out$Individual[is.na(out$Site) | !nzchar(as.character(out$Site))]
     stop(
       "[03_structure] Could not assign Site labels to all STRUCTURE individuals. Example IDs: ",
       paste(head(unique(missing_ids), 10), collapse = ", "),
@@ -577,7 +684,7 @@ build_base_order <- function(ids_vec, site_map_final, site_coord_tbl) {
     )
   }
   out <- out %>%
-    arrange(SiteOrder, SiteLat, Site, Individual)
+    arrange(SiteOrder, Site, Individual)
   
   out$PlotIndex <- seq_len(nrow(out))
   out
@@ -888,10 +995,12 @@ build_structure_mean_q_table <- function(per_k_q_list, site_summary_tbl) {
       mutate(K = x$K)
   })) %>%
     left_join(site_summary_tbl, by = c("Site", "Site_norm")) %>%
-    relocate(K, site_order_south_to_north, Site, mean_latitude, mean_longitude, n_individuals)
+    relocate(K, site_order_south_to_north, Site, Region, mean_latitude, mean_longitude, n_individuals)
   
+  out$Site <- factor(as.character(out$Site), levels = SITE_LEVELS, ordered = TRUE)
+  out$Region <- site_region(out$Site)
   out$interpretation_note <- STRUCTURE_INTERPRETATION_NOTE
-  out %>% arrange(K, site_order_south_to_north, Site)
+  out %>% arrange(K, Site)
 }
 
 validate_qgis_site_table <- function(site_q_tbl, k_num, tol = 1e-4) {
@@ -906,7 +1015,7 @@ validate_qgis_site_table <- function(site_q_tbl, k_num, tol = 1e-4) {
     )
   }
   
-  if (any(!nzchar(site_q_tbl$Site) | is.na(site_q_tbl$Site))) {
+  if (any(!nzchar(as.character(site_q_tbl$Site)) | is.na(site_q_tbl$Site))) {
     stop("[03_structure] QGIS export table for K=", k_num, " has blank Site values.", call. = FALSE)
   }
   if (any(is.na(site_q_tbl$Latitude) | is.na(site_q_tbl$Longitude))) {
@@ -1003,7 +1112,8 @@ export_qgis_site_mean_q <- function(per_k_q_list, site_summary_tbl, export_k_val
       left_join(site_summary_tbl, by = c("Site", "Site_norm")) %>%
       arrange(site_order_south_to_north, Site) %>%
       transmute(
-        Site = Site,
+        Site = as.character(Site),
+        Region = Region,
         Latitude = mean_latitude,
         Longitude = mean_longitude,
         n_individuals = n_individuals,
@@ -1022,7 +1132,12 @@ export_qgis_site_mean_q <- function(per_k_q_list, site_summary_tbl, export_k_val
     }
     
     site_q_tbl <- site_q_tbl %>%
-      select(-n_individuals_from_q)
+      select(-n_individuals_from_q) %>%
+      mutate(
+        Site = factor(as.character(Site), levels = SITE_LEVELS, ordered = TRUE),
+        Region = site_region(Site)
+      ) %>%
+      arrange(Site)
     
     validate_qgis_site_table(site_q_tbl, k_num = k_num, tol = 1e-4)
     
@@ -1033,7 +1148,7 @@ export_qgis_site_mean_q <- function(per_k_q_list, site_summary_tbl, export_k_val
   }
   
   message("[03_structure] Exported QGIS K values: ", paste(export_k_values, collapse = ", "))
-  message("[03_structure] Ordered site list used for QGIS exports: ", paste(site_summary_tbl$Site, collapse = " -> "))
+  message("[03_structure] Ordered site list used for QGIS exports: ", paste(as.character(site_summary_tbl$Site), collapse = " -> "))
   
   invisible(exported_files)
 }
@@ -1062,6 +1177,8 @@ build_optional_site_diagnostic <- function(site_summary_tbl, structure_mean_q) {
     warning("[03_structure] Optional diagnostic summary skipped: amova_site_region_groups.csv lacks required Site/Region columns.")
     return(NULL)
   }
+  amova_tbl$Site <- standardize_site_label(amova_tbl$Site)
+  amova_tbl$Region <- site_region(amova_tbl$Site)
   
   dapc_tbl <- read.csv(dapc_centroids_path, stringsAsFactors = FALSE, check.names = FALSE)
   required_dapc_cols <- c("Site", "LD1_centroid", "LD2_centroid")
@@ -1069,17 +1186,20 @@ build_optional_site_diagnostic <- function(site_summary_tbl, structure_mean_q) {
     warning("[03_structure] Optional diagnostic summary skipped: dapc_group_centroids.csv lacks required centroid columns.")
     return(NULL)
   }
+  dapc_tbl$Site <- standardize_site_label(dapc_tbl$Site)
   
   jost_df <- read.csv(jost_path, row.names = 1, check.names = FALSE, stringsAsFactors = FALSE)
   jost_mat <- as.matrix(jost_df)
   suppressWarnings(storage.mode(jost_mat) <- "numeric")
+  rownames(jost_mat) <- as.character(standardize_site_label(rownames(jost_mat)))
+  colnames(jost_mat) <- as.character(standardize_site_label(colnames(jost_mat)))
   if (!is.matrix(jost_mat) || nrow(jost_mat) != ncol(jost_mat)) {
     warning("[03_structure] Optional diagnostic summary skipped: pairwise_jostD.csv is not a square numeric matrix.")
     return(NULL)
   }
   
   mean_jost <- data.frame(
-    Site = rownames(jost_mat),
+    Site = factor(rownames(jost_mat), levels = SITE_LEVELS, ordered = TRUE),
     mean_pairwise_JostD_to_other_sites = apply(jost_mat, 1, function(x) {
       x <- as.numeric(x)
       mean(x[is.finite(x) & x != 0], na.rm = TRUE)
@@ -1092,7 +1212,7 @@ build_optional_site_diagnostic <- function(site_summary_tbl, structure_mean_q) {
   assert_site_alignment(site_summary_tbl$Site, rownames(jost_mat), "[03_structure diagnostic]")
   
   structure_wide <- structure_mean_q %>%
-    select(-interpretation_note) %>%
+    select(site_order_south_to_north, Site, K, starts_with("mean_Q")) %>%
     pivot_longer(
       cols = starts_with("mean_Q"),
       names_to = "cluster",
@@ -1105,12 +1225,13 @@ build_optional_site_diagnostic <- function(site_summary_tbl, structure_mean_q) {
   out <- site_summary_tbl %>%
     transmute(
       site_order_south_to_north = site_order_south_to_north,
-      Site = Site,
+      Site = factor(as.character(Site), levels = SITE_LEVELS, ordered = TRUE),
+      Region = Region,
       mean_latitude = mean_latitude,
       mean_longitude = mean_longitude,
       n_individuals = n_individuals
     ) %>%
-    left_join(amova_tbl %>% select(Site, Region), by = "Site") %>%
+    left_join(amova_tbl %>% select(Site) %>% distinct(), by = "Site") %>%
     left_join(structure_wide, by = c("Site", "site_order_south_to_north")) %>%
     left_join(dapc_tbl %>% select(Site, LD1_centroid, LD2_centroid), by = "Site") %>%
     left_join(mean_jost, by = "Site") %>%
@@ -1129,7 +1250,10 @@ site_col_dfids <- df_ids_cols$site_col
 
 ids_dfids <- trimws(as.character(df_ids[[id_col_dfids]]))
 ids_dfids <- ids_dfids[nzchar(ids_dfids)]
-site_map_dfids <- setNames(as.character(df_ids[[site_col_dfids]]), normalize_id(ids_dfids))
+site_map_dfids <- setNames(
+  as.character(standardize_site_label(df_ids[[site_col_dfids]])),
+  normalize_id(ids_dfids)
+)
 
 load_ids_order_from_raw <- function() {
   ids_path <- file.path(PROJECT_ROOT, "data", "structure", "ids_order_from_raw.csv")
@@ -1381,14 +1505,14 @@ if (length(scan$files) == 0) {
     if (length(ids_results$ids) > 0 && length(ids_results$pop) == length(ids_results$ids)) {
       lab_pop <- data.frame(Individual = ids_results$ids, PopIdx = ids_results$pop, stringsAsFactors = FALSE)
       known <- lab_pop %>%
-        mutate(Site = site_map_dfids[normalize_id(Individual)]) %>%
+        mutate(Site = as.character(standardize_site_label(site_map_dfids[normalize_id(Individual)]))) %>%
         filter(!is.na(Site), !is.na(PopIdx))
       
       if (nrow(known) > 0) {
         pop_to_site <- known %>%
           count(PopIdx, Site, name = "n") %>%
           group_by(PopIdx) %>%
-          arrange(desc(n), Site, .by_group = TRUE) %>%
+          arrange(desc(n), match(Site, SITE_LEVELS), .by_group = TRUE) %>%
           slice(1) %>%
           ungroup() %>%
           select(PopIdx, Site)
@@ -1441,7 +1565,7 @@ if (length(scan$files) == 0) {
     }
     
     site_blocks <- base_order_df %>%
-      group_by(Site, Site_norm) %>%
+      group_by(Site, Region, Site_norm) %>%
       summarise(
         n = n(),
         SiteLat = dplyr::first(SiteLat),
@@ -1449,21 +1573,32 @@ if (length(scan$files) == 0) {
         SiteOrder = dplyr::first(SiteOrder),
         .groups = "drop"
       ) %>%
-      arrange(SiteOrder, SiteLat, Site) %>%
+      arrange(SiteOrder, Site) %>%
       mutate(
         xmin = cumsum(dplyr::lag(n, default = 0)) + 0.5,
         xmax = cumsum(n) + 0.5,
         xmid = (xmin + xmax) / 2
       )
     
-    final_site_order <- site_blocks$Site
+    final_site_order <- as.character(site_blocks$Site)
+    expected_site_order <- SITE_LEVELS[SITE_LEVELS %in% final_site_order]
+    if (!identical(final_site_order, expected_site_order)) {
+      stop(
+        "[03_structure] Internal site-order error. Expected: ",
+        paste(expected_site_order, collapse = " -> "),
+        "; observed: ",
+        paste(final_site_order, collapse = " -> "),
+        call. = FALSE
+      )
+    }
     message("[03_structure] Final ordered site list (south -> north):")
     message("[03_structure] ", paste(final_site_order, collapse = " -> "))
     
     site_summary_tbl <- site_blocks %>%
       transmute(
         site_order_south_to_north = SiteOrder,
-        Site = Site,
+        Site = factor(as.character(Site), levels = SITE_LEVELS, ordered = TRUE),
+        Region = Region,
         Site_norm = Site_norm,
         mean_latitude = SiteLat,
         mean_longitude = SiteLon,
@@ -1547,7 +1682,7 @@ if (length(scan$files) == 0) {
         scale_fill_manual(values = cluster_colors[q_cols], breaks = q_cols, drop = FALSE) +
         scale_x_continuous(
           breaks = site_blocks$xmid,
-          labels = site_blocks$Site,
+          labels = site_display_label(site_blocks$Site),
           expand = c(0, 0)
         ) +
         scale_y_continuous(expand = c(0, 0)) +
@@ -1563,10 +1698,10 @@ if (length(scan$files) == 0) {
         labs(
           title = sprintf("STRUCTURE ancestry barplot (K=%d)", k_num),
           subtitle = paste(
-            "Individuals grouped by site; sites ordered left-to-right from south to north by mean site latitude.",
+            "Individuals grouped by site in the required geographical order S1-S6, then N1-N6.",
             STRUCTURE_INTERPRETATION_NOTE
           ),
-          x = "Site blocks (south -> north)",
+          x = "Site blocks (S1-S6, then N1-N6)",
           y = "Ancestry proportion"
         )
       
@@ -1610,7 +1745,7 @@ if (length(scan$files) == 0) {
         scale_fill_manual(values = cluster_colors[combined_clusters], breaks = combined_clusters, drop = FALSE) +
         scale_x_continuous(
           breaks = site_blocks$xmid,
-          labels = site_blocks$Site,
+          labels = site_display_label(site_blocks$Site),
           expand = c(0, 0)
         ) +
         scale_y_continuous(expand = c(0, 0)) +
@@ -1630,7 +1765,7 @@ if (length(scan$files) == 0) {
             "The same individual and site order is used for every K so spatial comparisons are direct.",
             STRUCTURE_INTERPRETATION_NOTE
           ),
-          x = "Site blocks (south -> north)",
+          x = "Site blocks (S1-S6, then N1-N6)",
           y = "Ancestry proportion"
         )
       

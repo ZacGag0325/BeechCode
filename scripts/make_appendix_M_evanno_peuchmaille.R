@@ -4,41 +4,62 @@
 # ---- Configuration -----------------------------------------------------------
 PROJECT_ROOT <- path.expand("~/Desktop/BeechCode")
 VERBOSE_FILE_LISTING <- FALSE
+VERBOSE_PARSING <- FALSE
+
 EXPECTED_K <- 1:12
 EXPECTED_REPLICATES <- 20L
-SITE_LEVELS <- c("S1", "S2", "S3", "S4", "S5", "S6", "N1", "N2", "N3", "N4", "N5", "N6")
-SITE_KEY <- c(AMC="S1", ALB="S2", IKJ="S3", IKO="S4", LGG="S5", LGR="S6", ML1="N1", ML2="N2", ML3="N3", CPF="N4", PLI="N5", LDF="N6")
-required <- c("dplyr", "tidyr", "readr", "stringr", "purrr", "tibble", "ggplot2", "fs", "officer", "flextable")
-missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+
+SITE_LEVELS <- c(
+  "S1", "S2", "S3", "S4", "S5", "S6",
+  "N1", "N2", "N3", "N4", "N5", "N6"
+)
+
+SITE_KEY <- c(
+  AMC = "S1", ALB = "S2", IKJ = "S3", IKO = "S4",
+  LGG = "S5", LGR = "S6", ML1 = "N1", ML2 = "N2",
+  ML3 = "N3", CPF = "N4", PLI = "N5", LDF = "N6"
+)
+
+required <- c(
+  "dplyr", "tidyr", "readr", "stringr", "purrr", "tibble",
+  "ggplot2", "fs", "officer", "flextable"
+)
+
+missing <- required[
+  !vapply(required, requireNamespace, logical(1), quietly = TRUE)
+]
 
 if (length(missing)) {
   stop(
     "[appendix_M] Missing required R package(s): ",
-    paste(missing, collapse=", "),
+    paste(missing, collapse = ", "),
     ". Install them before running this script.",
-    call.=FALSE
+    call. = FALSE
   )
 }
 
-invisible(lapply(required, library, character.only=TRUE))
+invisible(lapply(required, library, character.only = TRUE))
 
 if (!dir.exists(PROJECT_ROOT)) {
   stop(
     "[appendix_M] Project root does not exist: ",
     PROJECT_ROOT,
-    call.=FALSE
+    call. = FALSE
   )
 }
 
 abort_m <- function(...) {
-  stop("[appendix_M] ", paste0(..., collapse=""), call.=FALSE)
+  stop("[appendix_M] ", paste0(..., collapse = ""), call. = FALSE)
 }
 
 out_tables <- fs::path(PROJECT_ROOT, "outputs/tables/supplementary")
 out_figures <- fs::path(PROJECT_ROOT, "outputs/figures/supplementary")
 out_derived <- fs::path(PROJECT_ROOT, "outputs/derived")
 
-fs::dir_create(c(out_tables, out_figures, out_derived), recurse=TRUE)
+fs::dir_create(
+  c(out_tables, out_figures, out_derived),
+  recurse = TRUE
+)
 
 num_re <- "[-+]?(?:[0-9]*\\.?[0-9]+|[0-9]+\\.?)(?:[eE][-+]?[0-9]+)?"
 
@@ -68,29 +89,29 @@ integer_after <- function(x, label) {
   ifelse(is.finite(z), as.integer(z), NA_integer_)
 }
 
-save_plot <- function(p, stem, width=6.5, height=4.2) {
+save_plot <- function(p, stem, width = 6.5, height = 4.2) {
   ggplot2::ggsave(
     fs::path(out_figures, paste0(stem, ".png")),
     p,
-    width=width,
-    height=height,
-    units="in",
-    dpi=600
+    width = width,
+    height = height,
+    units = "in",
+    dpi = 600
   )
   
   ggplot2::ggsave(
     fs::path(out_figures, paste0(stem, ".pdf")),
     p,
-    width=width,
-    height=height,
-    units="in"
+    width = width,
+    height = height,
+    units = "in"
   )
 }
 
-theme_m <- ggplot2::theme_bw(base_size=10) +
+theme_m <- ggplot2::theme_bw(base_size = 10) +
   ggplot2::theme(
-    panel.grid.minor=ggplot2::element_blank(),
-    panel.grid.major.x=ggplot2::element_blank()
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.x = ggplot2::element_blank()
   )
 
 # ---- Find only final-run inputs ---------------------------------------------
@@ -108,28 +129,33 @@ if (dir.exists(final_dir)) {
 }
 
 if (file.exists(zip_file)) {
-  extracted <- fs::path(out_derived, "HEG_ZG_run2_logs_extracted")
+  extracted <- fs::path(
+    out_derived,
+    "HEG_ZG_run2_logs_extracted"
+  )
   
-  fs::dir_create(extracted, recurse=TRUE)
+  fs::dir_create(extracted, recurse = TRUE)
   
   utils::unzip(
     zip_file,
-    exdir=extracted,
-    overwrite=FALSE
+    exdir = extracted,
+    overwrite = FALSE
   )
   
   search_roots <- c(search_roots, extracted)
   
-  message("[appendix_M] Extracted read-only archive to: ", extracted)
+  if (VERBOSE_PARSING) {
+    message("[appendix_M] Extracted read-only archive to: ", extracted)
+  }
 }
 
 if (!length(search_roots)) {
   # Deliberately exclude old first-run, Q_Files, and literature-review material.
   all_dirs <- fs::dir_ls(
     structure_dir,
-    recurse=TRUE,
-    type="directory",
-    fail=FALSE
+    recurse = TRUE,
+    type = "directory",
+    fail = FALSE
   )
   
   search_roots <- all_dirs[
@@ -144,33 +170,12 @@ if (!length(search_roots)) {
   abort_m("No final HEG_ZG_run2 STRUCTURE outputs were found.")
 }
 
-message(
-  "[appendix_M] Final STRUCTURE directory/archive: ",
-  paste(
-    unique(c(
-      search_roots,
-      if (file.exists(zip_file)) zip_file
-    )),
-    collapse="; "
-  )
-)
-
-message(
-  "[appendix_M] StructureSelector TSV paths: ",
-  paste(
-    c(medk_file, sum_file, delta_file)[
-      file.exists(c(medk_file, sum_file, delta_file))
-    ],
-    collapse="; "
-  )
-)
-
 # ---- Parse and validate final STRUCTURE outputs -----------------------------
 parse_ids <- function(path) {
   s <- paste(
     fs::path_file(path),
-    fs::path_rel(path, start=PROJECT_ROOT),
-    sep=" "
+    fs::path_rel(path, start = PROJECT_ROOT),
+    sep = " "
   )
   
   # Do not interpret the final-analysis name HEG_ZG_run2 as replicate 2.
@@ -180,12 +185,13 @@ parse_ids <- function(path) {
     ""
   )
   
-  k <- stringr::str_match(
+  k_matches <- stringr::str_match(
     s,
     "(?i)(?:^|[_ .-])K[_ .-]?([0-9]{1,2})(?:[_ .-]|$)|K=([0-9]{1,2})"
   )
   
-  k <- k[!is.na(k)][2]
+  k_values <- k_matches[!is.na(k_matches)]
+  k <- if (length(k_values) >= 2) k_values[[2]] else NA_character_
   
   r <- stringr::str_match(
     s_rep,
@@ -207,15 +213,15 @@ parse_ids <- function(path) {
   }
   
   list(
-    K=suppressWarnings(as.integer(k)),
-    replicate=r
+    K = suppressWarnings(as.integer(k)),
+    replicate = r
   )
 }
 
 parse_structure <- function(path) {
   x <- tryCatch(
-    readLines(path, warn=FALSE, encoding="UTF-8"),
-    error=function(e) character()
+    readLines(path, warn = FALSE, encoding = "UTF-8"),
+    error = function(e) character()
   )
   
   if (!length(x)) {
@@ -240,34 +246,34 @@ parse_structure <- function(path) {
   }
   
   tibble::tibble(
-    K=id$K,
-    replicate=id$replicate,
-    LnP=lnp,
-    mean_ln_likelihood=number_after(
+    K = id$K,
+    replicate = id$replicate,
+    LnP = lnp,
+    mean_ln_likelihood = number_after(
       x,
       "mean\\s+value\\s+of\\s+ln\\s+likelihood"
     ),
-    variance_ln_likelihood=number_after(
+    variance_ln_likelihood = number_after(
       x,
       "variance\\s+of\\s+ln\\s+likelihood"
     ),
-    n_individuals=integer_after(
+    n_individuals = integer_after(
       x,
       "(?:number\\s+of\\s+individuals|numind|individuals)"
     ),
-    n_loci=integer_after(
+    n_loci = integer_after(
       x,
       "(?:number\\s+of\\s+loci|numloci|loci)"
     ),
-    burnin=integer_after(
+    burnin = integer_after(
       x,
       "(?:burnin|burn-in)"
     ),
-    mcmc_iterations=integer_after(
+    mcmc_iterations = integer_after(
       x,
       "(?:numreps|mcmc(?:\\s+iterations)?)"
     ),
-    path=path
+    path = path
   )
 }
 
@@ -275,13 +281,13 @@ output_files <- unique(unlist(
   lapply(search_roots, function(x) {
     fs::dir_ls(
       x,
-      recurse=TRUE,
-      type="file",
-      fail=FALSE,
-      regexp="(?i)(?:_f$|\\.out$|\\.txt$|\\.log$|result|structure)"
+      recurse = TRUE,
+      type = "file",
+      fail = FALSE,
+      regexp = "(?i)(?:_f$|\\.out$|\\.txt$|\\.log$|result|structure)"
     )
   }),
-  use.names=FALSE
+  use.names = FALSE
 ))
 
 if (VERBOSE_FILE_LISTING) {
@@ -319,22 +325,17 @@ if (nrow(dupes)) {
         "K=", dupes$K,
         ", replicate=", dupes$replicate
       ),
-      collapse="; "
+      collapse = "; "
     )
   )
 }
 
 counts <- replicates |>
-  dplyr::count(K, name="n") |>
+  dplyr::count(K, name = "n") |>
   tidyr::complete(
-    K=EXPECTED_K,
-    fill=list(n=0L)
+    K = EXPECTED_K,
+    fill = list(n = 0L)
   )
-
-message(
-  "[appendix_M] Files/replicates by K: ",
-  paste0(counts$K, "=", counts$n, collapse=", ")
-)
 
 bad <- dplyr::filter(
   counts,
@@ -348,7 +349,7 @@ if (nrow(bad)) {
       " files: ",
       paste(
         replicates$path[replicates$K == k],
-        collapse="; "
+        collapse = "; "
       )
     )
   }
@@ -382,23 +383,23 @@ n_individuals <- n_individuals[[1]]
 evanno <- replicates |>
   dplyr::group_by(K) |>
   dplyr::summarise(
-    n_replicates=dplyr::n(),
-    mean_LnP_K=mean(LnP),
-    sd_LnP_K=stats::sd(LnP),
-    se_LnP_K=sd_LnP_K / sqrt(n_replicates),
-    min_LnP_K=min(LnP),
-    max_LnP_K=max(LnP),
-    .groups="drop"
+    n_replicates = dplyr::n(),
+    mean_LnP_K = mean(LnP),
+    sd_LnP_K = stats::sd(LnP),
+    se_LnP_K = sd_LnP_K / sqrt(n_replicates),
+    min_LnP_K = min(LnP),
+    max_LnP_K = max(LnP),
+    .groups = "drop"
   ) |>
   dplyr::arrange(K) |>
   dplyr::mutate(
-    L_prime_K=dplyr::lead(mean_LnP_K) - mean_LnP_K,
-    L_double_prime_K=abs(
+    L_prime_K = dplyr::lead(mean_LnP_K) - mean_LnP_K,
+    L_double_prime_K = abs(
       dplyr::lead(mean_LnP_K) -
         2 * mean_LnP_K +
         dplyr::lag(mean_LnP_K)
     ),
-    DeltaK=dplyr::if_else(
+    DeltaK = dplyr::if_else(
       is.finite(L_double_prime_K) & sd_LnP_K > 0,
       L_double_prime_K / sd_LnP_K,
       NA_real_
@@ -409,8 +410,8 @@ max_delta <- evanno |>
   dplyr::filter(is.finite(DeltaK)) |>
   dplyr::slice_max(
     DeltaK,
-    n=1,
-    with_ties=FALSE
+    n = 1,
+    with_ties = FALSE
   )
 
 if (!nrow(max_delta)) {
@@ -436,17 +437,17 @@ p_lnp <- ggplot2::ggplot(
 ) +
   ggplot2::geom_errorbar(
     ggplot2::aes(
-      ymin=mean_LnP_K - sd_LnP_K,
-      ymax=mean_LnP_K + sd_LnP_K
+      ymin = mean_LnP_K - sd_LnP_K,
+      ymax = mean_LnP_K + sd_LnP_K
     ),
-    width=0.16
+    width = 0.16
   ) +
-  ggplot2::geom_line(linewidth=0.45) +
-  ggplot2::geom_point(size=2) +
-  ggplot2::scale_x_continuous(breaks=EXPECTED_K) +
+  ggplot2::geom_line(linewidth = 0.45) +
+  ggplot2::geom_point(size = 2) +
+  ggplot2::scale_x_continuous(breaks = EXPECTED_K) +
   ggplot2::labs(
-    x="Number of genetic clusters (K)",
-    y="Mean LnP(K)"
+    x = "Number of genetic clusters (K)",
+    y = "Mean LnP(K)"
   ) +
   theme_m
 
@@ -455,39 +456,37 @@ p_delta <- ggplot2::ggplot(
   ggplot2::aes(K, DeltaK)
 ) +
   ggplot2::geom_line(
-    linewidth=0.45,
-    na.rm=TRUE
+    linewidth = 0.45,
+    na.rm = TRUE
   ) +
   ggplot2::geom_point(
-    size=2,
-    na.rm=TRUE
+    size = 2,
+    na.rm = TRUE
   ) +
   ggplot2::geom_point(
-    data=max_delta,
-    shape=21,
-    fill="white",
-    colour="#9A4D3E",
-    size=3.5,
-    stroke=0.8
+    data = max_delta,
+    shape = 21,
+    fill = "white",
+    colour = "#9A4D3E",
+    size = 3.5,
+    stroke = 0.8
   ) +
-  ggplot2::scale_x_continuous(breaks=EXPECTED_K) +
+  ggplot2::scale_x_continuous(breaks = EXPECTED_K) +
   ggplot2::labs(
-    x="Number of genetic clusters (K)",
-    y="ΔK"
+    x = "Number of genetic clusters (K)",
+    y = expression(Delta * K)
   ) +
   theme_m
 
 save_plot(p_lnp, "appendix_M_mean_LnPK")
 save_plot(p_delta, "appendix_M_evanno_deltaK")
 
-message("[appendix_M] Evanno outputs written successfully.")
-
 # ---- StructureSelector Puechmaille parsing ----------------------------------
 clean_table <- function(x) {
   x <- as.data.frame(
     x,
-    check.names=FALSE,
-    stringsAsFactors=FALSE
+    check.names = FALSE,
+    stringsAsFactors = FALSE
   )
   
   x <- x[
@@ -502,7 +501,7 @@ clean_table <- function(x) {
       }
     ),
     ,
-    drop=FALSE
+    drop = FALSE
   ]
   
   if (nrow(x) > 1) {
@@ -518,13 +517,13 @@ clean_table <- function(x) {
         }
       ),
       ,
-      drop=FALSE
+      drop = FALSE
     ]
   }
   
   tibble::as_tibble(
     x,
-    .name_repair="minimal"
+    .name_repair = "minimal"
   )
 }
 
@@ -542,83 +541,89 @@ show_attempt <- function(label, x) {
     " rows x ",
     ncol(x),
     " columns; names: ",
-    paste(names(x), collapse=" | ")
+    paste(names(x), collapse = " | ")
   )
   
   print(utils::head(x, 10))
 }
 
 inspect_tsv <- function(path) {
-  message(
-    "[appendix_M] Inspecting StructureSelector TSV: ",
-    path
-  )
-  
   raw <- readLines(
     path,
-    warn=FALSE,
-    n=30,
-    encoding="UTF-8"
+    warn = FALSE,
+    encoding = "UTF-8"
   )
   
-  message(
-    paste(
-      sprintf("%02d: %s", seq_along(raw), raw),
-      collapse="\n"
+  if (VERBOSE_PARSING) {
+    message("[appendix_M] Inspecting StructureSelector TSV: ", path)
+    
+    message(
+      paste(
+        sprintf(
+          "%02d: %s",
+          seq_len(min(30, length(raw))),
+          raw[seq_len(min(30, length(raw)))]
+        ),
+        collapse = "\n"
+      )
+    )
+  }
+  
+  # Do not submit StructureSelector comments/metadata to readr. The only
+  # rectangular data block in a MedK file starts at its K/MedMed header.
+  header_i <- which(
+    stringr::str_detect(
+      raw,
+      "^K\\tMedMed\\tMedMean\\tMaxMed\\tMaxMean\\tReps\\s*$"
     )
   )
   
-  attempts <- list(
-    readr_tsv=tryCatch(
-      readr::read_tsv(
-        path,
-        show_col_types=FALSE,
-        name_repair="minimal"
-      ),
-      error=function(e) NULL
-    ),
-    read_delim=tryCatch(
-      utils::read.delim(
-        path,
-        check.names=FALSE,
-        stringsAsFactors=FALSE
-      ),
-      error=function(e) NULL
-    ),
-    table_header=tryCatch(
-      utils::read.table(
-        path,
-        header=TRUE,
-        sep="\t",
-        fill=TRUE,
-        check.names=FALSE,
-        comment.char="",
-        stringsAsFactors=FALSE
-      ),
-      error=function(e) NULL
-    ),
-    table_no_header=tryCatch(
-      utils::read.table(
-        path,
-        header=FALSE,
-        sep="\t",
-        fill=TRUE,
-        check.names=FALSE,
-        comment.char="",
-        stringsAsFactors=FALSE
-      ),
-      error=function(e) NULL
+  summary_i <- which(
+    stringr::str_detect(
+      raw,
+      "^\\s*(?:MedMedK|MedMed)\\t"
     )
   )
   
-  purrr::iwalk(
-    attempts,
-    function(x, label) show_attempt(label, x)
-  )
+  attempts <- list()
+  
+  if (length(header_i)) {
+    end_i <- summary_i[
+      summary_i > header_i[[1]]
+    ][1]
+    
+    if (is.na(end_i)) {
+      end_i <- length(raw) + 1L
+    }
+    
+    table_text <- paste(
+      raw[header_i[[1]]:(end_i - 1L)],
+      collapse = "\n"
+    )
+    
+    attempts$medk_table <- readr::read_tsv(
+      I(table_text),
+      show_col_types = FALSE,
+      name_repair = "minimal",
+      progress = FALSE
+    )
+  } else if (VERBOSE_PARSING) {
+    message(
+      "[appendix_M] No valid tabular MedK block identified in: ",
+      path
+    )
+  }
+  
+  if (VERBOSE_PARSING) {
+    purrr::iwalk(
+      attempts,
+      function(x, label) show_attempt(label, x)
+    )
+  }
   
   list(
-    raw=raw,
-    attempts=attempts
+    raw = raw,
+    attempts = attempts
   )
 }
 
@@ -669,7 +674,10 @@ parse_medk_summary_rows <- function(raw, path, threshold) {
   }
   
   header_i <- header_i[[length(header_i)]]
-  all_i <- all_i[all_i > header_i][1]
+  
+  all_i <- all_i[
+    all_i > header_i
+  ][1]
   
   if (is.na(all_i)) {
     return(NULL)
@@ -688,32 +696,32 @@ parse_medk_summary_rows <- function(raw, path, threshold) {
   n <- min(length(headers), length(values))
   
   ans <- tibble::tibble(
-    Method=method_name(headers[seq_len(n)]),
-    Selected_K=numeric_k(values[seq_len(n)])
+    Method = method_name(headers[seq_len(n)]),
+    Selected_K = numeric_k(values[seq_len(n)])
   ) |>
     dplyr::filter(
       !is.na(Method),
       is.finite(Selected_K),
       Selected_K %in% EXPECTED_K
     ) |>
-    dplyr::distinct(Method, .keep_all=TRUE)
+    dplyr::distinct(Method, .keep_all = TRUE)
   
   if (!nrow(ans)) {
     return(NULL)
   }
   
   list(
-    results=dplyr::mutate(
+    results = dplyr::mutate(
       ans,
-      Threshold=threshold,
-      Source=paste0(
+      Threshold = threshold,
+      Source = paste0(
         "StructureSelector: ",
         fs::path_file(path)
       ),
-      Input_file=path,
-      Parsing_layout="StructureSelector ALL summary row"
+      Input_file = path,
+      Parsing_layout = "StructureSelector ALL summary row"
     ),
-    raw=tibble::tibble(raw_line=raw)
+    raw = tibble::tibble(raw_line = raw)
   )
 }
 
@@ -735,13 +743,13 @@ parse_puech_table <- function(inspected, path, threshold) {
     }
     
     tab <- clean_table(tab)
-    names(tab) <- make.unique(names(tab), sep="_")
+    names(tab) <- make.unique(names(tab), sep = "_")
     
     norm <- normalise_name(names(tab))
     
     raw_out <- tibble::as_tibble(
       tab,
-      .name_repair="minimal"
+      .name_repair = "minimal"
     )
     
     # Wide format: estimator columns contain selected K values.
@@ -752,8 +760,8 @@ parse_puech_table <- function(inspected, path, threshold) {
         which(!is.na(meth_cols)),
         function(j) {
           tibble::tibble(
-            Method=meth_cols[[j]],
-            Selected_K=numeric_k(tab[[j]])
+            Method = meth_cols[[j]],
+            Selected_K = numeric_k(tab[[j]])
           )
         }
       ) |>
@@ -761,21 +769,21 @@ parse_puech_table <- function(inspected, path, threshold) {
           is.finite(Selected_K),
           Selected_K %in% EXPECTED_K
         ) |>
-        dplyr::distinct(Method, .keep_all=TRUE)
+        dplyr::distinct(Method, .keep_all = TRUE)
       
       if (nrow(rows)) {
         return(list(
-          results=dplyr::mutate(
+          results = dplyr::mutate(
             rows,
-            Threshold=threshold,
-            Source=paste0(
+            Threshold = threshold,
+            Source = paste0(
               "StructureSelector: ",
               fs::path_file(path)
             ),
-            Input_file=path,
-            Parsing_layout="wide estimator columns"
+            Input_file = path,
+            Parsing_layout = "wide estimator columns"
           ),
-          raw=raw_out
+          raw = raw_out
         ))
       }
     }
@@ -803,29 +811,29 @@ parse_puech_table <- function(inspected, path, threshold) {
     
     if (length(est_i) && length(k_i)) {
       rows <- tibble::tibble(
-        Method=method_name(tab[[est_i[[1]]]]),
-        Selected_K=numeric_k(tab[[k_i[[1]]]])
+        Method = method_name(tab[[est_i[[1]]]]),
+        Selected_K = numeric_k(tab[[k_i[[1]]]])
       ) |>
         dplyr::filter(
           !is.na(Method),
           is.finite(Selected_K),
           Selected_K %in% EXPECTED_K
         ) |>
-        dplyr::distinct(Method, .keep_all=TRUE)
+        dplyr::distinct(Method, .keep_all = TRUE)
       
       if (nrow(rows)) {
         return(list(
-          results=dplyr::mutate(
+          results = dplyr::mutate(
             rows,
-            Threshold=threshold,
-            Source=paste0(
+            Threshold = threshold,
+            Source = paste0(
               "StructureSelector: ",
               fs::path_file(path)
             ),
-            Input_file=path,
-            Parsing_layout="long estimator/selected-K rows"
+            Input_file = path,
+            Parsing_layout = "long estimator/selected-K rows"
           ),
-          raw=raw_out
+          raw = raw_out
         ))
       }
     }
@@ -839,29 +847,29 @@ parse_puech_table <- function(inspected, path, threshold) {
         }
         
         rows <- tibble::tibble(
-          Method=method_name(tab[[j]]),
-          Selected_K=numeric_k(tab[[i]])
+          Method = method_name(tab[[j]]),
+          Selected_K = numeric_k(tab[[i]])
         ) |>
           dplyr::filter(
             !is.na(Method),
             is.finite(Selected_K),
             Selected_K %in% EXPECTED_K
           ) |>
-          dplyr::distinct(Method, .keep_all=TRUE)
+          dplyr::distinct(Method, .keep_all = TRUE)
         
         if (nrow(rows) >= 2) {
           return(list(
-            results=dplyr::mutate(
+            results = dplyr::mutate(
               rows,
-              Threshold=threshold,
-              Source=paste0(
+              Threshold = threshold,
+              Source = paste0(
                 "StructureSelector: ",
                 fs::path_file(path)
               ),
-              Input_file=path,
-              Parsing_layout="summary rows/columns"
+              Input_file = path,
+              Parsing_layout = "summary rows/columns"
             ),
-            raw=raw_out
+            raw = raw_out
           ))
         }
       }
@@ -871,10 +879,10 @@ parse_puech_table <- function(inspected, path, threshold) {
   NULL
 }
 
-threshold_from <- function(path, raw, default=0.5) {
+threshold_from <- function(path, raw, default = 0.5) {
   x <- paste(
     c(fs::path_file(path), raw),
-    collapse=" "
+    collapse = " "
   )
   
   z <- number_after(
@@ -999,15 +1007,9 @@ for (m in c("MedMedK", "MedMeanK", "MaxMedK", "MaxMeanK")) {
 # scientifically preferable to falsely representing selected values as curves.
 figure_type <- "horizontal selected-K point plot"
 
-message(
-  "[appendix_M] Puechmaille figure type: ",
-  figure_type,
-  " (the TSV contains selected K values, not continuous estimator curves)."
-)
-
 puech$Method_display <- factor(
   puech$Method,
-  levels=rev(c(
+  levels = rev(c(
     "MedMedK",
     "MedMeanK",
     "MaxMedK",
@@ -1020,45 +1022,45 @@ p_puech <- ggplot2::ggplot(
   ggplot2::aes(
     Selected_K,
     Method_display,
-    colour=Method
+    colour = Method
   )
 ) +
   ggplot2::geom_segment(
     ggplot2::aes(
-      x=0,
-      xend=Selected_K,
-      y=Method_display,
-      yend=Method_display
+      x = 0,
+      xend = Selected_K,
+      y = Method_display,
+      yend = Method_display
     ),
-    colour="grey70"
+    colour = "grey70"
   ) +
-  ggplot2::geom_point(size=3) +
+  ggplot2::geom_point(size = 3) +
   ggplot2::scale_x_continuous(
-    breaks=EXPECTED_K,
-    limits=c(0, 12)
+    breaks = EXPECTED_K,
+    limits = c(0, 12)
   ) +
   ggplot2::scale_colour_manual(
-    values=c(
-      MedMedK="#4C78A8",
-      MedMeanK="#72A5A1",
-      MaxMedK="#9A7D4F",
-      MaxMeanK="#805D93"
+    values = c(
+      MedMedK = "#4C78A8",
+      MedMeanK = "#72A5A1",
+      MaxMedK = "#9A7D4F",
+      MaxMeanK = "#805D93"
     ),
-    drop=FALSE
+    drop = FALSE
   ) +
   ggplot2::labs(
-    x="Selected number of genetic clusters (K)",
-    y="Estimator",
-    colour="Estimator"
+    x = "Selected number of genetic clusters (K)",
+    y = "Estimator",
+    colour = "Estimator"
   ) +
   theme_m +
-  ggplot2::theme(legend.position="none")
+  ggplot2::theme(legend.position = "none")
 
 save_plot(
   p_puech,
   "appendix_M_puechmaille_estimators",
-  width=6.5,
-  height=3.8
+  width = 6.5,
+  height = 3.8
 )
 
 # ---- Combined summary and captions ------------------------------------------
@@ -1070,7 +1072,7 @@ methods <- c(
 )
 
 puech_rows <- tibble::tibble(
-  Method=methods
+  Method = methods
 ) |>
   dplyr::left_join(
     puech |>
@@ -1080,15 +1082,15 @@ puech_rows <- tibble::tibble(
         Threshold,
         Source
       ),
-    by="Method"
+    by = "Method"
   ) |>
   dplyr::transmute(
     Method,
-    `Selected K`=Selected_K,
-    Criterion=Method,
+    `Selected K` = Selected_K,
+    Criterion = Method,
     Threshold,
-    `Replicates per K`=EXPECTED_REPLICATES,
-    Source=ifelse(
+    `Replicates per K` = EXPECTED_REPLICATES,
+    Source = ifelse(
       is.na(Source),
       "Not available in parsed StructureSelector TSV",
       Source
@@ -1097,12 +1099,12 @@ puech_rows <- tibble::tibble(
 
 combined <- dplyr::bind_rows(
   tibble::tibble(
-    Method="Evanno Delta K",
-    `Selected K`=max_delta$K,
-    Criterion="Maximum finite Delta K",
-    Threshold=NA_real_,
-    `Replicates per K`=EXPECTED_REPLICATES,
-    Source="HEG_ZG_run2 STRUCTURE outputs"
+    Method = "Evanno Delta K",
+    `Selected K` = max_delta$K,
+    Criterion = "Maximum finite Delta K",
+    Threshold = NA_real_,
+    `Replicates per K` = EXPECTED_REPLICATES,
+    Source = "HEG_ZG_run2 STRUCTURE outputs"
   ),
   puech_rows
 )
@@ -1120,21 +1122,21 @@ combined_docx <- fs::path(
 readr::write_csv(
   combined,
   combined_csv,
-  na=""
+  na = ""
 )
 
 ft <- flextable::flextable(combined) |>
-  flextable::bold(part="header") |>
-  flextable::fontsize(size=9, part="all") |>
+  flextable::bold(part = "header") |>
+  flextable::fontsize(size = 9, part = "all") |>
   flextable::theme_booktabs() |>
   flextable::autofit()
 
 doc <- officer::read_docx() |>
   officer::body_add_par(
     "Table M.1. Summary of the criteria used to identify the number of genetic clusters in STRUCTURE analyses.",
-    style="Normal"
+    style = "Normal"
   ) |>
-  flextable::body_add_flextable(value=ft) |>
+  flextable::body_add_flextable(value = ft) |>
   officer::body_add_par(
     paste0(
       "Note. The Evanno method is based on the second-order rate of change ",
@@ -1142,10 +1144,10 @@ doc <- officer::read_docx() |>
       "Puechmaille estimators use population-level assignment patterns and ",
       "the ancestry-membership threshold reported in the table."
     ),
-    style="Normal"
+    style = "Normal"
   )
 
-print(doc, target=combined_docx)
+print(doc, target = combined_docx)
 
 caption_M1 <- paste0(
   "Figure M.1. Mean STRUCTURE log probability of the data across tested values of K. ",
@@ -1166,24 +1168,27 @@ caption_M3 <- paste0(
   "coefficients using the membership threshold reported in Table M.1."
 )
 
-cat(
-  "\n",
-  caption_M1,
-  "\n",
-  caption_M2,
-  "\n",
-  caption_M3,
-  "\n",
-  sep=""
-)
+if (VERBOSE_PARSING) {
+  cat(
+    "\n",
+    caption_M1,
+    "\n",
+    caption_M2,
+    "\n",
+    caption_M3,
+    "\n",
+    sep = ""
+  )
+  
+  message(
+    "[appendix_M] Puechmaille figure type: ",
+    figure_type
+  )
+}
 
 message(
   "[appendix_M] Evanno selected K: ",
   max_delta$K
-)
-
-message(
-  "[appendix_M] Existing results parsed; Q matrices were not recomputed."
 )
 
 message(
@@ -1208,11 +1213,13 @@ message(
         )
       )
     ),
-    collapse="; "
+    collapse = "; "
   )
 )
 
-print(evanno)
-print(puech)
+if (VERBOSE_PARSING) {
+  print(evanno)
+  print(puech)
+}
 
 message("[appendix_M] All Appendix M outputs written successfully.")

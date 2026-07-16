@@ -210,6 +210,14 @@ parse_k_replicate <- function(path) {
     sep = " "
   )
   
+  # The analysis name itself contains "run2". Remove it before extracting a
+  # replicate identifier so that HEG_ZG_run2 is never misread as replicate 2.
+  text_for_replicate <- stringr::str_replace_all(
+    text,
+    "(?i)HEG[_ .-]?ZG[_ .-]?run2",
+    ""
+  )
+  
   k <- stringr::str_match(
     text,
     "(?i)(?:^|[_ .-])K[_ .-]?([0-9]{1,2})(?:[_ .-]|$)"
@@ -223,13 +231,20 @@ parse_k_replicate <- function(path) {
   }
   
   r <- stringr::str_match(
-    text,
-    "(?i)(?:rep(?:licate)?|run)[_ .-]?([0-9]+)"
+    text_for_replicate,
+    "(?i)rep(?:licate)?[_ .-]?([0-9]+)"
   )[, 2]
   
   if (is.na(r)) {
     r <- stringr::str_match(
-      text,
+      text_for_replicate,
+      "(?i)(?:^|[_ .-])run[_ .-]?([0-9]+)(?:[_ .-]|$)"
+    )[, 2]
+  }
+  
+  if (is.na(r)) {
+    r <- stringr::str_match(
+      text_for_replicate,
       "(?i)K[_ .-]?[0-9]+[_ .-]+([0-9]+)(?:[_ .-]|$)"
     )[, 2]
   }

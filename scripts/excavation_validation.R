@@ -30,11 +30,43 @@ suppressPackageStartupMessages({
   library(flextable)
 })
 
-FIELD_FILE <- file.path("data", "raw", "donnees_modifiees_west_summer2024 copie.xlsx")
+# Resolve all project files from the location of this script rather than from
+# R's current working directory. This allows the script to be sourced from any
+# directory, for example:
+# source("~/Desktop/BeechCode/scripts/excavation_validation.R")
+get_script_file <- function() {
+  frame_files <- vapply(
+    sys.frames(),
+    function(frame) {
+      if (is.null(frame$ofile)) NA_character_ else as.character(frame$ofile)[1]
+    },
+    character(1)
+  )
+  frame_files <- frame_files[!is.na(frame_files) & nzchar(frame_files)]
+  if (length(frame_files) > 0) {
+    return(normalizePath(path.expand(tail(frame_files, 1)), mustWork = TRUE))
+  }
+  
+  file_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+  if (length(file_arg) > 0) {
+    return(normalizePath(path.expand(sub("^--file=", "", file_arg[1])), mustWork = TRUE))
+  }
+  
+  stop(
+    "Could not determine the location of excavation_validation.R. Source the script from a file or run it with Rscript.",
+    call. = FALSE
+  )
+}
+
+SCRIPT_FILE <- get_script_file()
+SCRIPT_DIR <- dirname(SCRIPT_FILE)
+PROJECT_DIR <- normalizePath(file.path(SCRIPT_DIR, ".."), mustWork = TRUE)
+
+FIELD_FILE <- file.path(PROJECT_DIR, "data", "raw", "donnees_modifiees_west_summer2024 copie.xlsx")
 FIELD_SHEET <- "genetic_excavation"
-GENO_FILE <- file.path("data", "raw", "poppr_excavation.xlsx")
+GENO_FILE <- file.path(PROJECT_DIR, "data", "raw", "poppr_excavation.xlsx")
 GENO_SHEET <- "Excav_Sample"
-OUTPUT_DIR <- file.path("outputs", "excavation")
+OUTPUT_DIR <- file.path(PROJECT_DIR, "outputs", "excavation")
 MAPPING_TEMPLATE_FILE <- file.path(OUTPUT_DIR, "excavation_field_to_lab_id_mapping_TEMPLATE.csv")
 AVAILABLE_LAB_IDS_FILE <- file.path(OUTPUT_DIR, "excavation_available_lab_ids.csv")
 MISSINGNESS_THRESHOLD <- 0.35
@@ -519,13 +551,24 @@ write_summaries <- function(results) {
 print_console_summary <- function(field, id_check, results) {
   connected <- results %>% filter(connection_observed == "yes")
   unconnected <- results %>% filter(connection_observed == "no")
+  unclear_connection <- results %>% filter(connection_observed == "unclear")
+  genetically_resolved <- results %>% filter(clone_call %in% c("clone", "not_clone"))
+  resolved_connected <- genetically_resolved %>% filter(connection_observed == "yes")
+  resolved_unconnected <- genetically_resolved %>% filter(connection_observed == "no")
+  resolved_unclear_connection <- genetically_resolved %>% filter(connection_observed == "unclear")
   
   cat("\n[excavation_validation] Summary\n")
   cat("Field-to-lab mapping source: ", attr(field, "mapping_source"), "\n", sep = "")
   cat("Number of excavation field pairs: ", nrow(field), "\n", sep = "")
   cat("Number of pairs with both lab IDs mapped: ", sum(!is.na(field$lab_id_1) & !is.na(field$lab_id_2)), "\n", sep = "")
   cat("Number of pairs with both lab IDs found in genotype file: ", sum(id_check$id_check_status == "both_lab_ids_found"), "\n", sep = "")
+  cat("Number of pairs with a resolved genetic result: ", nrow(genetically_resolved), "\n", sep = "")
   cat("Number of connected pairs: ", nrow(connected), "\n", sep = "")
+  cat("Number of unconnected pairs: ", nrow(unconnected), "\n", sep = "")
+  cat("Number of pairs with unclear connection status: ", nrow(unclear_connection), "\n", sep = "")
+  cat("Resolved pairs recorded as connected: ", nrow(resolved_connected), "\n", sep = "")
+  cat("Resolved pairs recorded as unconnected: ", nrow(resolved_unconnected), "\n", sep = "")
+  cat("Resolved pairs with unclear connection status: ", nrow(resolved_unclear_connection), "\n", sep = "")
   cat("Number of connected pairs confirmed as clones: ", sum(connected$clone_call == "clone", na.rm = TRUE), "\n", sep = "")
   cat("Number of connected pairs genetically distinct: ", sum(connected$clone_call == "not_clone", na.rm = TRUE), "\n", sep = "")
   cat("Number of unconnected pairs confirmed as clones: ", sum(unconnected$clone_call == "clone", na.rm = TRUE), "\n", sep = "")

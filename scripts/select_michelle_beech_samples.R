@@ -13,25 +13,63 @@ if (length(missing_packages) > 0) {
   )
 }
 
-library(dplyr)
+suppressPackageStartupMessages(library(dplyr))
 
-possible_input_paths <- c(
+# source() does not change the working directory. Find the folder containing
+# this script so the workbook can be stored beside the script if desired.
+get_sourced_script_path <- function() {
+  frame_paths <- vapply(
+    sys.frames(),
+    function(frame) {
+      if (is.null(frame$ofile)) NA_character_ else as.character(frame$ofile)[1]
+    },
+    character(1)
+  )
+  frame_paths <- frame_paths[!is.na(frame_paths) & nzchar(frame_paths)]
+  if (length(frame_paths) == 0) {
+    NA_character_
+  } else {
+    normalizePath(tail(frame_paths, 1), winslash = "/", mustWork = FALSE)
+  }
+}
+
+script_path <- get_sourced_script_path()
+script_dir <- if (is.na(script_path)) getwd() else dirname(script_path)
+project_root <- if (basename(script_dir) == "scripts") dirname(script_dir) else script_dir
+
+possible_input_paths <- unique(c(
   Sys.getenv("BEECH_METADATA_FILE", unset = ""),
-  file.path("genetique", "donnees_F.grandifolia_2024.xlsx"),
-  file.path("data", "donnees_F.grandifolia_2024.xlsx"),
-  "donnees_F.grandifolia_2024.xlsx"
-)
+  file.path(script_dir, "donnees_F.grandifolia_2024.xlsx"),
+  file.path(project_root, "donnees_F.grandifolia_2024.xlsx"),
+  file.path(project_root, "genetique", "donnees_F.grandifolia_2024.xlsx"),
+  file.path(project_root, "data", "donnees_F.grandifolia_2024.xlsx"),
+  file.path(getwd(), "donnees_F.grandifolia_2024.xlsx"),
+  file.path(getwd(), "genetique", "donnees_F.grandifolia_2024.xlsx"),
+  file.path(getwd(), "data", "donnees_F.grandifolia_2024.xlsx")
+))
 possible_input_paths <- possible_input_paths[nzchar(possible_input_paths)]
-input_file <- possible_input_paths[file.exists(possible_input_paths)][1]
+matching_input_paths <- possible_input_paths[file.exists(possible_input_paths)]
 
-if (is.na(input_file)) {
+if (length(matching_input_paths) == 0) {
   stop(
-    "Could not find donnees_F.grandifolia_2024.xlsx. ",
-    "Put it in the project root or genetique/ folder, or set BEECH_METADATA_FILE."
+    "Could not find donnees_F.grandifolia_2024.xlsx.\n",
+    "The script searched:\n- ",
+    paste(possible_input_paths, collapse = "\n- "),
+    "\n\nPut the workbook beside this script or set BEECH_METADATA_FILE."
   )
 }
 
-output_file <- file.path("outputs", "michelle_beech_sample_selection.xlsx")
+input_file <- normalizePath(
+  matching_input_paths[1],
+  winslash = "/",
+  mustWork = TRUE
+)
+
+output_file <- file.path(
+  project_root,
+  "outputs",
+  "michelle_beech_sample_selection.xlsx"
+)
 dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
 
 dbh_threshold_cm <- 10

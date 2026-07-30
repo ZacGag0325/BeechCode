@@ -1,273 +1,386 @@
-#!/usr/bin/env Rscript
+# Select one mature American beech sample per site for Michelle's landscape project.
+# Rules: DBH > 10 cm, at least 8 km between selected trees, one tree per site.
 
-# Select spatially separated Fagus grandifolia trees for Michelle's samples.
-# Run with Rscript from the BeechCode project root, or source it from anywhere.
-# The project can also be specified with BEECHCODE_ROOT=/path/to/beechcode.
-
-required_packages <- c("readxl", "openxlsx")
+required_packages <- c("readxl", "dplyr", "writexl")
 missing_packages <- required_packages[
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
-if (length(missing_packages)) {
-  stop("Install required package(s): ", paste(missing_packages, collapse = ", "), call. = FALSE)
-}
 
-workbook_relative_path <- file.path("data", "raw", "donnees_F.grandifolia_2024.xlsx")
-input_sheet <- "genetique"
-minimum_dbh_cm <- 10
-minimum_distance_km <- 8
-
-ancestor_paths <- function(path) {
-  path <- normalizePath(path, winslash = "/", mustWork = FALSE)
-  out <- character()
-  repeat {
-    out <- c(out, path)
-    parent <- dirname(path)
-    if (identical(parent, path)) break
-    path <- parent
-  }
-  out
-}
-
-source_file <- tryCatch(sys.frame(1)$ofile, error = function(e) NULL)
-source_dir <- if (!is.null(source_file) && length(source_file) == 1L && nzchar(source_file)) {
-  dirname(normalizePath(source_file, winslash = "/", mustWork = FALSE))
-} else character()
-desktop_dir <- file.path(path.expand("~"), "Desktop")
-desktop_projects <- if (dir.exists(desktop_dir)) {
-  children <- list.dirs(desktop_dir, recursive = FALSE, full.names = TRUE)
-  children[tolower(basename(children)) == "beechcode"]
-} else character()
-
-configured_root <- Sys.getenv("BEECHCODE_ROOT", unset = "")
-if (nzchar(configured_root)) {
-  root_candidates <- configured_root
-} else {
-  # Search in a documented order. In particular, check ~/Desktop/beechcode
-  # before the working directory so source("~/Desktop/...") works even when R
-  # was launched from another project.
-  root_candidates <- c(
-    desktop_projects,
-    if (length(source_dir)) ancestor_paths(source_dir) else character(),
-    ancestor_paths(getwd()),
-    file.path(getwd(), c("beechcode", "BeechCode"))
-  )
-}
-root_candidates <- root_candidates[nzchar(root_candidates)]
-root_candidates <- unique(normalizePath(root_candidates, winslash = "/", mustWork = FALSE))
-workbook_candidates <- file.path(root_candidates, workbook_relative_path)
-matches <- which(file.exists(workbook_candidates))
-
-if (!length(matches)) {
+if (length(missing_packages) > 0) {
   stop(
-    "Input workbook not found. Expected 'data/raw/donnees_F.grandifolia_2024.xlsx' ",
-    "under the BeechCode project. Checked:\n- ",
-    paste(workbook_candidates, collapse = "\n- "),
-    "\nSet BEECHCODE_ROOT to the project directory if it is elsewhere.",
-    call. = FALSE
+    "Install the missing package(s) before running this script: ",
+    paste(missing_packages, collapse = ", ")
   )
 }
 
-# The first match follows the precedence above; the resolved path is printed at
-# the end so the selected input is always visible rather than silent.
-match_index <- matches[1L]
-project_root <- normalizePath(root_candidates[match_index], winslash = "/", mustWork = TRUE)
-input_path <- normalizePath(workbook_candidates[match_index], winslash = "/", mustWork = TRUE)
-output_dir <- file.path(project_root, "genetique", "outputs", "michelle_beech_samples")
-output_path <- file.path(output_dir, "michelle_beech_sample_selection.xlsx")
+library(dplyr)
 
-sheets <- readxl::excel_sheets(input_path)
-if (!(input_sheet %in% sheets)) {
+possible_input_paths <- c(
+  Sys.getenv("BEECH_METADATA_FILE", unset = ""),
+  file.path("genetique", "donnees_F.grandifolia_2024.xlsx"),
+  file.path("data", "donnees_F.grandifolia_2024.xlsx"),
+  "donnees_F.grandifolia_2024.xlsx"
+)
+possible_input_paths <- possible_input_paths[nzchar(possible_input_paths)]
+input_file <- possible_input_paths[file.exists(possible_input_paths)][1]
+
+if (is.na(input_file)) {
   stop(
-    "Required worksheet '", input_sheet, "' not found. Available worksheets: ",
-    paste(sheets, collapse = ", "), call. = FALSE
+    "Could not find donnees_F.grandifolia_2024.xlsx. ",
+    "Put it in the project root or genetique/ folder, or set BEECH_METADATA_FILE."
   )
 }
 
-raw <- as.data.frame(
-  readxl::read_excel(input_path, sheet = input_sheet, .name_repair = "minimal"),
-  stringsAsFactors = FALSE, check.names = FALSE
-)
+output_file <- file.path("outputs", "michelle_beech_sample_selection.xlsx")
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
 
-# Normalization is used only to match column headings. Data values are preserved.
-heading_key <- function(x) {
-  x <- iconv(x, from = "", to = "ASCII//TRANSLIT")
-  tolower(gsub("[^a-z0-9]+", "", x))
+dbh_threshold_cm <- 10
+minimum_spacing_km <- 8
+
+as_numeric_clean <- function(x) {
+  suppressWarnings(as.numeric(gsub(",", ".", as.character(x), fixed = TRUE)))
 }
 
-resolve_column <- function(aliases, label) {
-  keys <- heading_key(names(raw))
-  hits <- which(keys %in% heading_key(aliases))
-  if (length(hits) != 1L) {
-    stop(
-      "Expected exactly one ", label, " column; matched ", length(hits),
-      ". Available columns: ", paste(names(raw), collapse = ", "),
-      call. = FALSE
-    )
-  }
-  names(raw)[hits]
+median_or_na <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) NA_real_ else median(x)
 }
 
-site_col <- resolve_column(c("site", "site_id", "code_site", "population", "pop"), "site")
-id_col <- resolve_column(
-  c("id", "id_tige", "identifiant", "individual", "individual_id", "individu",
-    "numero", "numero_arbre", "numero_individu", "sample", "sample_id", "tree"),
-  "tree identifier"
-)
-dbh_col <- resolve_column(c("Dhp_tige", "dbh", "dbh_cm", "dhp", "diametre", "diametre_cm"), "DBH")
-lat_col <- resolve_column(c("latitude", "lat", "y_wgs84"), "latitude")
-lon_col <- resolve_column(c("longitude", "lon", "long", "x_wgs84"), "longitude")
-
-numeric_exact <- function(x) suppressWarnings(as.numeric(as.character(x)))
-site_value <- as.character(raw[[site_col]])
-id_value <- as.character(raw[[id_col]])
-dbh_value <- numeric_exact(raw[[dbh_col]])
-lat_value <- numeric_exact(raw[[lat_col]])
-lon_value <- numeric_exact(raw[[lon_col]])
-
-flag_rows <- function(issue, test, severity = "warning") {
-  rows <- which(test %in% TRUE)
-  if (!length(rows)) return(NULL)
-  data.frame(
-    source_row = rows + 1L,
-    tree_identifier = id_value[rows],
-    site = site_value[rows],
-    severity = severity,
-    issue = issue,
-    stringsAsFactors = FALSE
+add_flag <- function(current, condition, flag) {
+  ifelse(
+    condition,
+    ifelse(current == "", flag, paste(current, flag, sep = "; ")),
+    current
   )
 }
-
-qa_flags <- do.call(rbind, Filter(Negate(is.null), list(
-  flag_rows("missing site", is.na(site_value) | site_value == "", "error"),
-  flag_rows("missing tree identifier", is.na(id_value) | id_value == "", "error"),
-  flag_rows("identifier has leading/trailing whitespace (not corrected)",
-            !is.na(id_value) & id_value != trimws(id_value)),
-  flag_rows("identifier contains a control character (not corrected)",
-            !is.na(id_value) & grepl("[[:cntrl:]]", id_value)),
-  flag_rows("duplicate tree identifier (not corrected)",
-            !is.na(id_value) & (duplicated(id_value) | duplicated(id_value, fromLast = TRUE))),
-  flag_rows("DBH is missing or non-numeric", is.na(dbh_value)),
-  flag_rows("latitude is missing/non-numeric or outside [-90, 90] (not corrected)",
-            is.na(lat_value) | lat_value < -90 | lat_value > 90, "error"),
-  flag_rows("longitude is missing/non-numeric or outside [-180, 180] (not corrected)",
-            is.na(lon_value) | lon_value < -180 | lon_value > 180, "error")
-)))
-if (is.null(qa_flags)) {
-  qa_flags <- data.frame(source_row = integer(), tree_identifier = character(),
-                         site = character(), severity = character(), issue = character())
-}
-
-candidate_index <- which(!is.na(dbh_value) & dbh_value > minimum_dbh_cm)
-candidates <- raw[candidate_index, , drop = FALSE]
-candidates$source_row <- candidate_index + 1L
-candidates$.site <- site_value[candidate_index]
-candidates$.tree_identifier <- id_value[candidate_index]
-candidates$.dbh_cm <- dbh_value[candidate_index]
-candidates$.latitude <- lat_value[candidate_index]
-candidates$.longitude <- lon_value[candidate_index]
-
-if (!nrow(candidates)) stop("No rows have DBH strictly greater than 10 cm.", call. = FALSE)
-
-# Retain every DBH-qualified row in all_candidates. Rows whose exact, unaltered
-# site/coordinate values cannot support spacing are retained there and flagged,
-# but cannot be considered for selection.
-selectable <- candidates[
-  !is.na(candidates$.site) & candidates$.site != "" &
-    !is.na(candidates$.latitude) & candidates$.latitude >= -90 & candidates$.latitude <= 90 &
-    !is.na(candidates$.longitude) & candidates$.longitude >= -180 & candidates$.longitude <= 180,
-  , drop = FALSE
-]
-if (!nrow(selectable)) stop("No DBH-qualified rows have a site and valid coordinates.", call. = FALSE)
-
-# Pick the largest valid-DBH tree at each site. Exact source order is the explicit
-# deterministic tie-break, without changing identifiers or coordinates.
-candidate_order <- order(selectable$.site, -selectable$.dbh_cm, selectable$source_row)
-ranked <- selectable[candidate_order, , drop = FALSE]
-representatives <- ranked[!duplicated(ranked$.site), , drop = FALSE]
-row.names(representatives) <- NULL
 
 haversine_km <- function(lat1, lon1, lat2, lon2) {
-  rad <- pi / 180
-  dlat <- (lat2 - lat1) * rad
-  dlon <- (lon2 - lon1) * rad
-  a <- sin(dlat / 2)^2 + cos(lat1 * rad) * cos(lat2 * rad) * sin(dlon / 2)^2
-  6371.0088 * 2 * atan2(sqrt(a), sqrt(pmax(0, 1 - a)))
+  radius_km <- 6371.0088
+  to_radians <- pi / 180
+  dlat <- (lat2 - lat1) * to_radians
+  dlon <- (lon2 - lon1) * to_radians
+  a <- sin(dlat / 2)^2 +
+    cos(lat1 * to_radians) * cos(lat2 * to_radians) * sin(dlon / 2)^2
+  2 * radius_km * asin(sqrt(a))
 }
 
-n_sites <- nrow(representatives)
-distances <- matrix(0, n_sites, n_sites,
-                    dimnames = list(representatives$.site, representatives$.site))
-if (n_sites > 1L) {
-  for (i in seq_len(n_sites - 1L)) for (j in (i + 1L):n_sites) {
-    distances[i, j] <- distances[j, i] <- haversine_km(
-      representatives$.latitude[i], representatives$.longitude[i],
-      representatives$.latitude[j], representatives$.longitude[j]
-    )
+genetique <- readxl::read_excel(input_file, sheet = "genetique") |>
+  mutate(
+    id_tige = as_numeric_clean(id_tige),
+    dhp_tige = as_numeric_clean(dhp_tige),
+    Latitude = as_numeric_clean(Latitude),
+    Longitude = as_numeric_clean(Longitude),
+    Elevation = as_numeric_clean(Elevation),
+    valid_coordinate = !is.na(Latitude) &
+      !is.na(Longitude) &
+      dplyr::between(Latitude, 40, 85) &
+      dplyr::between(Longitude, -145, -45),
+    name_prefix_matches = startsWith(as.character(Name), paste0(site, "-")),
+    name_suffix = ifelse(
+      grepl("-[0-9]+$", as.character(Name)),
+      as_numeric_clean(sub(".*-([0-9]+)$", "\\1", as.character(Name))),
+      NA_real_
+    ),
+    qa_flag = ""
+  )
+
+genetique$qa_flag <- add_flag(
+  genetique$qa_flag,
+  is.na(genetique$dhp_tige),
+  "Missing/non-numeric DBH"
+)
+genetique$qa_flag <- add_flag(
+  genetique$qa_flag,
+  !genetique$valid_coordinate,
+  "Coordinate outside expected Canadian bounds"
+)
+genetique$qa_flag <- add_flag(
+  genetique$qa_flag,
+  !genetique$name_prefix_matches,
+  "Site and tree-name prefix do not match"
+)
+genetique$qa_flag <- add_flag(
+  genetique$qa_flag,
+  !is.na(genetique$name_suffix) &
+    !is.na(genetique$id_tige) &
+    genetique$name_suffix != genetique$id_tige,
+  "Tree-name number and id_tige do not match"
+)
+
+all_candidates <- genetique |>
+  filter(!is.na(dhp_tige), dhp_tige > dbh_threshold_cm) |>
+  arrange(site, desc(dhp_tige), id_tige) |>
+  group_by(site) |>
+  mutate(rank_within_site = row_number()) |>
+  ungroup()
+
+candidate_counts <- all_candidates |>
+  group_by(site) |>
+  summarise(
+    trees_dbh_gt_10 = n(),
+    valid_spatial_candidates = sum(valid_coordinate),
+    maximum_dbh_cm = max(dhp_tige),
+    .groups = "drop"
+  )
+
+best_choices <- all_candidates |>
+  filter(valid_coordinate) |>
+  group_by(site) |>
+  arrange(desc(dhp_tige), id_tige, .by_group = TRUE) |>
+  slice_head(n = 1) |>
+  ungroup() |>
+  left_join(
+    candidate_counts |> select(site, trees_dbh_gt_10),
+    by = "site"
+  )
+
+n_choices <- nrow(best_choices)
+conflict_matrix <- matrix(FALSE, n_choices, n_choices)
+
+if (n_choices > 1) {
+  for (i in seq_len(n_choices - 1)) {
+    for (j in (i + 1):n_choices) {
+      distance <- haversine_km(
+        best_choices$Latitude[i],
+        best_choices$Longitude[i],
+        best_choices$Latitude[j],
+        best_choices$Longitude[j]
+      )
+      conflict_matrix[i, j] <- distance < minimum_spacing_km
+      conflict_matrix[j, i] <- conflict_matrix[i, j]
+    }
   }
 }
-conflicts <- distances < minimum_distance_km & row(distances) != col(distances)
 
-# Exact branch-and-bound maximum independent set. Thus a conflict never causes
-# a greedy, order-dependent loss of a compatible site.
-best <- integer()
-search_independent_set <- function(available, chosen = integer()) {
-  if (length(chosen) + length(available) <= length(best)) return(invisible(NULL))
-  if (!length(available)) {
-    if (length(chosen) > length(best)) best <<- chosen
+# Exact branch-and-bound search: maximize the number of compatible sites.
+# If several solutions use the same number of sites, prefer the larger total DBH.
+best_indices <- integer(0)
+best_total_dbh <- -Inf
+
+search_compatible_sets <- function(position, chosen) {
+  remaining <- n_choices - position + 1
+  if (length(chosen) + max(remaining, 0) < length(best_indices)) return(invisible(NULL))
+  
+  if (position > n_choices) {
+    total_dbh <- sum(best_choices$dhp_tige[chosen])
+    if (
+      length(chosen) > length(best_indices) ||
+      (length(chosen) == length(best_indices) && total_dbh > best_total_dbh)
+    ) {
+      best_indices <<- chosen
+      best_total_dbh <<- total_dbh
+    }
     return(invisible(NULL))
   }
-  vertex <- available[1L]
-  search_independent_set(available[!conflicts[vertex, available] & available != vertex],
-                         c(chosen, vertex))
-  search_independent_set(available[-1L], chosen)
+  
+  compatible <- length(chosen) == 0 || all(!conflict_matrix[position, chosen])
+  if (compatible) search_compatible_sets(position + 1, c(chosen, position))
+  search_compatible_sets(position + 1, chosen)
   invisible(NULL)
 }
-search_independent_set(seq_len(n_sites))
-selected <- representatives[best, , drop = FALSE]
 
-selected_sites <- selected$.site
-site_summary <- data.frame(
-  site = sort(unique(candidates$.site)),
+if (n_choices > 0) search_compatible_sets(1, integer(0))
+selected <- best_choices[best_indices, , drop = FALSE] |>
+  arrange(site)
+
+selected$key <- paste(selected$site, selected$Name, selected$id_tige, sep = "|")
+selected_keys <- selected$key
+selected_site_codes <- selected$site
+all_candidates$key <- paste(
+  all_candidates$site,
+  all_candidates$Name,
+  all_candidates$id_tige,
+  sep = "|"
+)
+
+if (nrow(selected) > 1) {
+  selected_distance_matrix <- outer(
+    seq_len(nrow(selected)),
+    seq_len(nrow(selected)),
+    Vectorize(function(i, j) {
+      if (i == j) return(0)
+      haversine_km(
+        selected$Latitude[i],
+        selected$Longitude[i],
+        selected$Latitude[j],
+        selected$Longitude[j]
+      )
+    })
+  )
+  dimnames(selected_distance_matrix) <- list(selected$site, selected$site)
+  
+  selected$nearest_selected_site <- vapply(
+    seq_len(nrow(selected)),
+    function(i) {
+      distances <- selected_distance_matrix[i, ]
+      distances[i] <- Inf
+      names(which.min(distances))
+    },
+    character(1)
+  )
+  selected$nearest_distance_km <- vapply(
+    seq_len(nrow(selected)),
+    function(i) {
+      distances <- selected_distance_matrix[i, ]
+      distances[i] <- Inf
+      min(distances)
+    },
+    numeric(1)
+  )
+} else {
+  selected_distance_matrix <- matrix(
+    0,
+    nrow = nrow(selected),
+    ncol = nrow(selected),
+    dimnames = list(selected$site, selected$site)
+  )
+  selected$nearest_selected_site <- NA_character_
+  selected$nearest_distance_km <- NA_real_
+}
+
+selected_samples <- selected |>
+  transmute(
+    site,
+    selected_tree = Name,
+    id_tige,
+    dbh_cm = dhp_tige,
+    latitude = Latitude,
+    longitude = Longitude,
+    elevation_m = Elevation,
+    candidate_count_at_site = trees_dbh_gt_10,
+    nearest_selected_site,
+    nearest_distance_km,
+    spacing_pass = is.na(nearest_distance_km) |
+      nearest_distance_km >= minimum_spacing_km,
+    qa_flag
+  )
+
+all_candidates_output <- all_candidates |>
+  mutate(
+    selected = key %in% .env$selected_keys,
+    selection_note = case_when(
+      selected ~ "Largest valid-DBH tree at selected site",
+      !valid_coordinate ~ "Coordinate must be corrected before spatial selection",
+      TRUE ~ "Alternate candidate at same site"
+    )
+  ) |>
+  transmute(
+    site,
+    rank_within_site,
+    id_tige,
+    tree_name = Name,
+    dbh_cm = dhp_tige,
+    latitude = Latitude,
+    longitude = Longitude,
+    elevation_m = Elevation,
+    valid_coordinate,
+    selected,
+    selection_note,
+    qa_flag
+  )
+
+site_summary <- genetique |>
+  group_by(site) |>
+  summarise(
+    sampled_trees = n(),
+    site_latitude_median = median_or_na(Latitude[valid_coordinate]),
+    site_longitude_median = median_or_na(Longitude[valid_coordinate]),
+    .groups = "drop"
+  ) |>
+  left_join(candidate_counts, by = "site") |>
+  mutate(
+    across(
+      c(trees_dbh_gt_10, valid_spatial_candidates),
+      ~ ifelse(is.na(.x), 0L, .x)
+    ),
+    selected = site %in% .env$selected_site_codes,
+    reason = case_when(
+      selected ~ "Selected",
+      trees_dbh_gt_10 == 0 ~ "No sampled tree with DBH >10 cm",
+      TRUE ~ "No valid-coordinate candidate or excluded by spacing"
+    )
+  ) |>
+  select(
+    site,
+    sampled_trees,
+    trees_dbh_gt_10,
+    valid_spatial_candidates,
+    maximum_dbh_cm,
+    site_latitude_median,
+    site_longitude_median,
+    selected,
+    reason
+  ) |>
+  arrange(site)
+
+spacing_matrix <- if (nrow(selected) > 0) {
+  data.frame(
+    site = rownames(selected_distance_matrix),
+    round(selected_distance_matrix, 3),
+    check.names = FALSE,
+    row.names = NULL
+  )
+} else {
+  data.frame(site = character(0))
+}
+
+qa_flags <- genetique |>
+  filter(qa_flag != "") |>
+  transmute(
+    site,
+    id_tige,
+    tree_name = Name,
+    dbh_cm = dhp_tige,
+    latitude = Latitude,
+    longitude = Longitude,
+    qa_flag,
+    dbh_candidate = !is.na(dhp_tige) & dhp_tige > dbh_threshold_cm
+  )
+
+readme <- data.frame(
+  item = c(
+    "Source",
+    "Worksheet",
+    "DBH threshold",
+    "Spacing threshold",
+    "Selection rule",
+    "Sites in source",
+    "Trees with DBH >10 cm",
+    "Selected sites",
+    "Closest selected pair (km)",
+    "Important limitation"
+  ),
+  value = c(
+    input_file,
+    "genetique",
+    "Strictly greater than 10 cm",
+    "At least 8 km",
+    "One tree per site; maximize sites, then prefer larger DBH",
+    dplyr::n_distinct(genetique$site),
+    nrow(all_candidates),
+    nrow(selected_samples),
+    if (nrow(selected_samples) > 1) {
+      round(min(selected_samples$nearest_distance_km), 3)
+    } else {
+      NA
+    },
+    "Spacing was checked only among these proposed trees; Michelle's existing coordinates were not supplied."
+  ),
   stringsAsFactors = FALSE
 )
-site_summary$candidate_trees <- as.integer(table(candidates$.site)[site_summary$site])
-site_summary$largest_valid_dbh_cm <- vapply(site_summary$site, function(s) {
-  max(candidates$.dbh_cm[candidates$.site == s])
-}, numeric(1))
-site_summary$preferred_tree_identifier <- representatives$.tree_identifier[
-  match(site_summary$site, representatives$.site)
-]
-site_summary$selected <- site_summary$site %in% selected_sites
 
-spacing_matrix <- data.frame(site = rownames(distances), round(distances, 3),
-                             check.names = FALSE, row.names = NULL)
-drop_helpers <- function(x) x[, !startsWith(names(x), "."), drop = FALSE]
-
-dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
-openxlsx::write.xlsx(
+writexl::write_xlsx(
   list(
-    selected_samples = drop_helpers(selected),
-    all_candidates = drop_helpers(candidates),
-    site_summary = site_summary,
-    spacing_km = spacing_matrix,
-    qa_flags = qa_flags
+    README = readme,
+    Selected_samples = selected_samples,
+    All_candidates = all_candidates_output,
+    Site_summary = site_summary,
+    Spacing_matrix = spacing_matrix,
+    QA_flags = qa_flags
   ),
-  file = output_path, overwrite = TRUE
+  path = output_file
 )
 
-selected_minimum <- if (nrow(selected) > 1L) {
-  min(distances[best, best][upper.tri(distances[best, best])])
-} else {
-  NA_real_
-}
-stopifnot(!any(duplicated(selected$.site)))
-stopifnot(is.na(selected_minimum) || selected_minimum >= minimum_distance_km)
-
-message("Input: ", input_path, " [worksheet: ", input_sheet, "]")
-message("Candidate trees (DBH > ", minimum_dbh_cm, " cm): ", nrow(candidates))
-message("Eligible sites: ", n_sites)
-message("Selected trees/sites: ", nrow(selected))
-message("Minimum selected-tree distance: ", round(selected_minimum, 3), " km")
-message("QA flags (values were not corrected): ", nrow(qa_flags))
-message("Output: ", output_path)
+message("Saved: ", normalizePath(output_file, winslash = "/", mustWork = FALSE))
+message("Selected sites: ", nrow(selected_samples))
+message("All DBH >10 cm candidates: ", nrow(all_candidates_output))
